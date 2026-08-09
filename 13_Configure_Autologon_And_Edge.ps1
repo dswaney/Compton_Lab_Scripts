@@ -17,7 +17,7 @@ param(
     [string]$DefaultUserName = 'CC-Student',
 
     [ValidateNotNullOrEmpty()]
-    [string]$DefaultPasswordBase64 = 'Q0MkdHVkM250IQ==',
+    [string]$DefaultPasswordBase64 = '',
 
     [string]$DefaultDomainName = 'Compton.edu',
 

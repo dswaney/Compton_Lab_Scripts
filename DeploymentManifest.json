@@ -1,0 +1,122 @@
+{
+  "SchemaVersion": 1,
+  "ManifestVersion": "2.2.0",
+  "PackageVersion": "2.2.0",
+  "GeneratedUtc": "2026-07-27T00:00:00Z",
+  "Files": [
+    {
+      "Name": "00_Update-Scripts-FromShare.ps1",
+      "Role": "Updater",
+      "Version": "4.1.0",
+      "SHA256": "2706BBD2EDD36692E4B13AB19DE32684EF289EA17D4D161968A85DFE499800DC"
+    },
+    {
+      "Name": "01_Enable_Windows_Update_Services.ps1",
+      "Role": "ManagedFile",
+      "Version": "2.6.0",
+      "SHA256": "7935DDA8CBDAE3ECF1EF5931A17AFC2A5A4279FD7335336D02E05379E0E331E0"
+    },
+    {
+      "Name": "02_Remove_User_Profiles.ps1",
+      "Role": "ManagedFile",
+      "Version": "2.1.0",
+      "SHA256": "BBF762E5EAB0CDED33D1580AC652DBBEC34F33E1D4487F09C44D6C655FEF6158"
+    },
+    {
+      "Name": "03_Weekend_Apps_Update.ps1",
+      "Role": "ManagedFile",
+      "Version": "2.1.0",
+      "SHA256": "6266574A140913BCAFAE83DBFA7BCFBA9D0031237D5AC3D361AAFA925B243B1D"
+    },
+    {
+      "Name": "05_Weekend_HP_Drivers_Update.ps1",
+      "Role": "ManagedFile",
+      "Version": "2.9.0",
+      "SHA256": "E041F8F5F4D0B2CBAC86260A03C8FF4734908101BC6002370C42C5A951F79A09"
+    },
+    {
+      "Name": "06_Weekend_Windows_Updates.ps1",
+      "Role": "ManagedFile",
+      "Version": "2.1.0",
+      "SHA256": "F530D217E696976E5F60E993D333ECCE8D9E238C31E6FF4A9CBB9C46500921DC"
+    },
+    {
+      "Name": "07_Force_Reboot_Install_Updates.ps1",
+      "Role": "ManagedFile",
+      "Version": "2.0.0",
+      "SHA256": "53BFAEBF68FEC976452D5CF89B2030A97A5B1E2493FE9D8CDD95A1071E8B47C2"
+    },
+    {
+      "Name": "08_System_Repair.ps1",
+      "Role": "ManagedFile",
+      "Version": "4.3.0",
+      "SHA256": "C673B30FB8E608BE58000C217A796D5EA7246D2E857B11A09B12E4CE8BD54236"
+    },
+    {
+      "Name": "09_Disable_Windows_Update_Services.ps1",
+      "Role": "ManagedFile",
+      "Version": "2.0.1",
+      "SHA256": "1A1C0A42AA7969B2391D312FD2A469330B9A3AD5BBCFC117E0D74F4852B58C84"
+    },
+    {
+      "Name": "10_Sync_System_Time.ps1",
+      "Role": "ManagedFile",
+      "Version": "1.0.0",
+      "SHA256": "FA27A40464DFB818B832C9AFA6F382E3B6594B62A2D3371EFC44D93772D53EFA"
+    },
+    {
+      "Name": "11_Install_SharpDriver_And_PaperCut.ps1",
+      "Role": "ManagedFile",
+      "Version": "1.0.0",
+      "SHA256": "859DE0A2B9E308E9754F3A74626F3A317CE6B14BB9D605BB7AD3E01FA2AEE0BF"
+    },
+    {
+      "Name": "12_Enable-SystemRestore-And-Create-RestorePoint.ps1",
+      "Role": "ManagedFile",
+      "Version": "2.0.0",
+      "SHA256": "3082DE2E78C4EFA95F69B6D6B0C1165D435F319566EE799D5D62B77A21C44814"
+    },
+    {
+      "Name": "13_Configure_Autologon_And_Edge.ps1",
+      "Role": "ManagedFile",
+      "Version": "2.1.0",
+      "SHA256": "CFCCDD56C213C7264BB6F5D823D1BE9CFDDB9D6B7A0F37AC93C9F73304C12ED1"
+    },
+    {
+      "Name": "14_Endpoint_Health_Inventory.ps1",
+      "Role": "ManagedFile",
+      "Version": "1.1.0",
+      "SHA256": "8F04BDD945209C78C90F7195AFCDEE5F2162C8033FD93AFFDB05A517511AFB47"
+    },
+    {
+      "Name": "Get-MaintenanceFleetStatus.ps1",
+      "Role": "ManagedFile",
+      "Version": "1.0.0",
+      "SHA256": "071ED09BE35D47CCD03B0A15B5F337E88F9C03EC43A273FD46820099F061EFE3"
+    },
+    {
+      "Name": "Invoke-MaintenanceScript.ps1",
+      "Role": "Launcher",
+      "Version": "1.0.0",
+      "SHA256": "B8EBDFD4DDFA0E271A4572EEA973F3FDC9E2A14E3A449A5A9B8CAE61CA2795B4"
+    },
+    {
+      "Name": "Maintenance.Framework.psm1",
+      "Role": "Framework",
+      "Version": "2.2.0",
+      "SHA256": "2DBFE113E5F3E6464F8C5271D718AFE07EF73514C5D883164174F7D2723FB4A9"
+    },
+    {
+      "Name": "Maintenance.Policy.json",
+      "Role": "Policy",
+      "Version": "1.0.0",
+      "SHA256": "3D44DB4ACA1EDF5C9B9CAA34FECF238A686CDA5FCF1F383B25B80F4725B6C316"
+    },
+    {
+      "Name": "Register-Tasks_SYSTEM.ps1",
+      "Role": "TaskRegistration",
+      "Version": "4.2.0",
+      "SHA256": "3A1B998F11CDC30585AE3D3CDD92EF9EFCE7C987ECF1729A65B50F8E92B1274A"
+    }
+  ]
+}

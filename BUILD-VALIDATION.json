@@ -1,0 +1,10 @@
+{
+  "PackageVersion": "2.2.0",
+  "PowerShellParserExecuted": false,
+  "StructuralChecks": [
+    "Manifest hashes generated",
+    "Approved exported verbs preserved",
+    "Launcher and policy included"
+  ],
+  "RequiresWindowsPowerShellValidation": true
+}

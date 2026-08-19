@@ -1,14 +1,16 @@
-﻿# =====================================================================
+# =====================================================================
 # ScriptName: 01_Enable_Windows_Update_Services.ps1
-# ScriptVersion: 2.6.0
-# LastUpdated: 2026-07-27
+# ScriptVersion: 2.8.4
+# LastUpdated: 2026-08-18
 # Purpose: Restore Windows Update services, tasks, policy settings,
 #          Windows 11 UI preferences, and classic right-click context menu behavior for all users;
 #          verify required services are running, retry startup failures
 #          up to 4 total attempts, and force a reboot if critical
 #          services still refuse to start.
+# Changes:  v2.8.4 guarantees structured failure telemetry for bootstrap/framework/privilege/runtime failures.
+#           Adds FailureStage and FailureMessage fields and ensures service-recovery reboot failures pass through finally.
+#           v2.8.3 uses Maintenance.Framework v2.4 staged text logging so Elastic only sees the completed immutable log.
 # Fix:      Removed StartWhenAvailable from task creation and added direct
-#          enforcement to clear missed-run behavior from maintenance tasks.
 # =====================================================================
 
 [CmdletBinding()]
@@ -17,7 +19,7 @@ param()
 $ErrorActionPreference = 'Stop'
 
 $script:ScriptName       = '01_Enable_Windows_Update_Services.ps1'
-$script:ScriptVersion    = '2.6.0'
+$script:ScriptVersion    = '2.8.4'
 $script:ExecutionStart   = Get-Date
 $script:WarningCount     = 0
 $script:ErrorCount       = 0
@@ -33,12 +35,386 @@ $script:PolicyConflictsBefore = @()
 $script:TelemetryDirectory = 'C:\Logs'
 $script:NdjsonPath = Join-Path $script:TelemetryDirectory 'Maintenance-Telemetry.ndjson'
 $script:LatestJsonPath = Join-Path $script:TelemetryDirectory '01_Enable_Windows_Update_Services.latest.json'
+$script:LogPath = $null
+$script:PublishedLogPath = $null
+$script:LogSession = $null
+$script:FailureStage = $null
+$script:FailureMessage = $null
+$script:BootstrapExitCode = $null
 
 
 # Load the shared framework from the same directory as this script.
-$MaintenanceFrameworkPath = 'C:\Scripts\Maintenance.Framework.psm1'
-Import-Module -Name $MaintenanceFrameworkPath -Force -ErrorAction Stop
-$MaintenanceConfig = Initialize-MaintenanceEnvironment -ScriptRoot 'C:\Scripts' -LogRoot 'C:\Logs'
+# ============================================================================
+# BOOTSTRAP THE LATEST 00 UPDATER BEFORE IMPORTING MAINTENANCE.FRAMEWORK
+# ============================================================================
+# Older lab computers may have an incomplete updater or may not yet have
+# Maintenance.Framework.psm1. Refresh and run 00 first so C:\Scripts is
+# synchronized before script 01 depends on any shared maintenance components.
+
+
+function Stop-ServiceWithTimeout {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$Name,
+        [int]$TimeoutSeconds = $ServiceStopTimeoutSeconds,
+        [int]$KillWaitSeconds = $ServiceKillWaitSeconds
+    )
+
+    $service = Get-Service -Name $Name -ErrorAction SilentlyContinue
+
+    if (-not $service) {
+        Write-Status -Level INFO -Message "Service not found: $Name"
+        return $true
+    }
+
+    if ($service.Status -eq 'Stopped') {
+        Write-Status -Level INFO -Message "Service is already stopped: $Name"
+        return $true
+    }
+
+    Write-Status -Level INFO -Message "Stopping service $Name with a timeout of $TimeoutSeconds second(s)..."
+
+    try {
+        Stop-Service -Name $Name -Force -ErrorAction SilentlyContinue
+    }
+    catch {
+        Write-Status -Level WARN -Message "Initial Stop-Service request failed for $Name : $($_.Exception.Message)"
+    }
+
+    $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+
+    do {
+        Start-Sleep -Seconds 1
+        $service = Get-Service -Name $Name -ErrorAction SilentlyContinue
+
+        if (-not $service -or $service.Status -eq 'Stopped') {
+            Write-Status -Level OK -Message "Service stopped successfully: $Name"
+            return $true
+        }
+    }
+    while ((Get-Date) -lt $deadline)
+
+    Write-Status -Level WARN -Message "Service $Name did not stop within $TimeoutSeconds second(s). Attempting forced process termination."
+
+    try {
+        $serviceInfo = Get-CimInstance Win32_Service -Filter "Name='$Name'" -ErrorAction Stop
+        $servicePid = [int]$serviceInfo.ProcessId
+
+        if ($servicePid -gt 0) {
+            $process = Get-Process -Id $servicePid -ErrorAction SilentlyContinue
+
+            if ($process) {
+                Write-Status -Level WARN -Message "Terminating PID $servicePid hosting service $Name."
+                Stop-Process -Id $servicePid -Force -ErrorAction Stop
+            }
+            else {
+                Write-Status -Level INFO -Message "Service $Name reported PID $servicePid, but the process is already gone."
+            }
+        }
+        else {
+            Write-Status -Level WARN -Message "Service $Name has no active process ID to terminate."
+        }
+    }
+    catch {
+        Write-Status -Level WARN -Message "Forced process termination failed for service $Name : $($_.Exception.Message)"
+    }
+
+    $killDeadline = (Get-Date).AddSeconds($KillWaitSeconds)
+
+    do {
+        Start-Sleep -Seconds 1
+        $service = Get-Service -Name $Name -ErrorAction SilentlyContinue
+
+        if (-not $service -or $service.Status -eq 'Stopped') {
+            Write-Status -Level OK -Message "Service stopped after forced termination: $Name"
+            return $true
+        }
+    }
+    while ((Get-Date) -lt $killDeadline)
+
+    Write-Status -Level ERROR -Message "Service $Name is still not stopped after timeout and forced termination."
+    return $false
+}
+
+function Write-EarlyFailureTelemetry {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$FailureStage,
+        [Parameter(Mandatory)][string]$FailureMessage,
+        [int]$ExitCode = 1
+    )
+
+    try {
+        if (-not (Test-Path -LiteralPath $script:TelemetryDirectory -PathType Container)) {
+            New-Item -Path $script:TelemetryDirectory -ItemType Directory -Force -ErrorAction Stop | Out-Null
+        }
+
+        $end = Get-Date
+        $duration = [math]::Round(($end - $script:ExecutionStart).TotalSeconds, 3)
+        $domain = $env:USERDNSDOMAIN
+        if ([string]::IsNullOrWhiteSpace($domain)) {
+            try { $domain = (Get-CimInstance Win32_ComputerSystem -ErrorAction Stop).Domain } catch { $domain = $null }
+        }
+
+        # Keep the same top-level schema already used by Script 01 so the existing
+        # compton-maintenance-json pipeline and mappings can ingest the failure.
+        $event = [ordered]@{
+            EventType                = 'maintenance.execution'
+            ComputerName             = $env:COMPUTERNAME
+            Domain                   = $domain
+            ScriptName               = $script:ScriptName
+            ScriptVersion            = $script:ScriptVersion
+            Status                   = 'Failed'
+            ExitCode                 = $ExitCode
+            StartTime                = $script:ExecutionStart.ToString('o')
+            EndTime                  = $end.ToString('o')
+            DurationSeconds          = $duration
+            ErrorCount               = 1
+            WarningCount             = $script:WarningCount
+            Timestamp                = (Get-Date).ToUniversalTime().ToString('o')
+            FailureStage             = $FailureStage
+            FailureMessage           = $FailureMessage
+            RebootInitiated          = $false
+            RebootReason             = $null
+            TaskReconciliationStatus = 'NotRun'
+            PolicyConflictDetected   = $false
+            ServicesChecked          = 0
+            ServicesRepairedCount    = 0
+            ApprovedServiceState     = $false
+            TextLogPath              = $null
+        }
+
+        $jsonCompact = $event | ConvertTo-Json -Depth 8 -Compress
+        $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+        $line = $jsonCompact + [Environment]::NewLine
+
+        # Retry because Elastic/file readers can briefly hold the telemetry file.
+        $written = $false
+        $lastError = $null
+        for ($attempt = 1; $attempt -le 10; $attempt++) {
+            try {
+                [System.IO.File]::AppendAllText($script:NdjsonPath, $line, $utf8NoBom)
+                $written = $true
+                break
+            }
+            catch {
+                $lastError = $_.Exception.Message
+                Start-Sleep -Milliseconds 250
+            }
+        }
+
+        if (-not $written) {
+            throw "Unable to append early failure telemetry after 10 attempts: $lastError"
+        }
+
+        try {
+            [System.IO.File]::WriteAllText(
+                $script:LatestJsonPath,
+                ($event | ConvertTo-Json -Depth 8),
+                $utf8NoBom
+            )
+        }
+        catch {
+            Write-Host "Early failure latest.json write failed: $($_.Exception.Message)" -ForegroundColor Yellow
+        }
+
+        Write-Host ("Early failure telemetry written. Stage={0}; ExitCode={1}" -f $FailureStage, $ExitCode) -ForegroundColor Yellow
+    }
+    catch {
+        Write-Host "CRITICAL: Early failure telemetry could not be written: $($_.Exception.Message)" -ForegroundColor Red
+    }
+}
+
+
+function Invoke-LatestUpdaterBootstrap {
+    [CmdletBinding()]
+    param()
+
+    $localScriptsRoot = 'C:\Scripts'
+    $localUpdaterPath = Join-Path $localScriptsRoot '00_Update-Scripts-FromShare.ps1'
+
+    $sourceRoots = @(
+        '\\filesvr\Labscripts',
+        '\\10.2.3.30\Labscripts'
+    )
+
+    $sourceRoot = $null
+
+    foreach ($candidate in $sourceRoots) {
+        try {
+            if (Test-Path -LiteralPath $candidate -PathType Container -ErrorAction Stop) {
+                $sourceRoot = $candidate
+                break
+            }
+        }
+        catch {
+            # Try the next source.
+        }
+    }
+
+    if ([string]::IsNullOrWhiteSpace($sourceRoot)) {
+        throw 'Updater bootstrap failed because neither \\filesvr\Labscripts nor \\10.2.3.30\Labscripts is available.'
+    }
+
+    $sourceUpdaterPath = Join-Path $sourceRoot '00_Update-Scripts-FromShare.ps1'
+
+    if (-not (Test-Path -LiteralPath $sourceUpdaterPath -PathType Leaf)) {
+        throw "Updater bootstrap failed because the source updater does not exist: $sourceUpdaterPath"
+    }
+
+    if (-not (Test-Path -LiteralPath $localScriptsRoot -PathType Container)) {
+        New-Item -Path $localScriptsRoot -ItemType Directory -Force -ErrorAction Stop | Out-Null
+    }
+
+    # Refuse to replace a working local updater with a syntactically broken source copy.
+    $tokens = $null
+    $parseErrors = $null
+    [void][System.Management.Automation.Language.Parser]::ParseFile(
+        $sourceUpdaterPath,
+        [ref]$tokens,
+        [ref]$parseErrors
+    )
+
+    if ($parseErrors -and $parseErrors.Count -gt 0) {
+        $summary = @(
+            $parseErrors |
+            ForEach-Object { "Line $($_.Extent.StartLineNumber): $($_.Message)" }
+        ) -join ' | '
+
+        throw "Updater bootstrap source failed PowerShell parser validation. $summary"
+    }
+
+    $sourceHash = (Get-FileHash -LiteralPath $sourceUpdaterPath -Algorithm SHA256 -ErrorAction Stop).Hash
+    $localHash = $null
+
+    if (Test-Path -LiteralPath $localUpdaterPath -PathType Leaf) {
+        try {
+            $localHash = (Get-FileHash -LiteralPath $localUpdaterPath -Algorithm SHA256 -ErrorAction Stop).Hash
+        }
+        catch {
+            $localHash = $null
+        }
+    }
+
+    if ($localHash -ne $sourceHash) {
+        Write-Host "[BOOTSTRAP] Updating local 00 updater from $sourceRoot" -ForegroundColor Yellow
+
+        Copy-Item -LiteralPath $sourceUpdaterPath -Destination $localUpdaterPath -Force -ErrorAction Stop
+        Unblock-File -LiteralPath $localUpdaterPath -ErrorAction SilentlyContinue
+
+        $copiedHash = (Get-FileHash -LiteralPath $localUpdaterPath -Algorithm SHA256 -ErrorAction Stop).Hash
+
+        if ($copiedHash -ne $sourceHash) {
+            throw 'Updater bootstrap copy verification failed: the local 00 updater does not match the source copy.'
+        }
+
+        Write-Host '[BOOTSTRAP] Latest 00 updater copied successfully.' -ForegroundColor Green
+    }
+    else {
+        Write-Host '[BOOTSTRAP] Local 00 updater already matches the deployment share.' -ForegroundColor Green
+    }
+
+    Write-Host '[BOOTSTRAP] Running 00 updater before continuing script 01...' -ForegroundColor Cyan
+
+    $arguments = @(
+        '-NoLogo',
+        '-NoProfile',
+        '-NonInteractive',
+        '-ExecutionPolicy', 'Bypass',
+        '-File', ('"{0}"' -f $localUpdaterPath)
+    )
+
+    $bootstrapProcess = Start-Process `
+        -FilePath "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe" `
+        -ArgumentList $arguments `
+        -WorkingDirectory $localScriptsRoot `
+        -Wait `
+        -PassThru `
+        -WindowStyle Hidden
+
+    if ($bootstrapProcess.ExitCode -ne 0) {
+        $script:BootstrapExitCode = [int]$bootstrapProcess.ExitCode
+        throw "Latest 00 updater returned exit code $($bootstrapProcess.ExitCode). Script 01 will stop because C:\Scripts may be incomplete."
+    }
+
+    $frameworkPath = Join-Path $localScriptsRoot 'Maintenance.Framework.psm1'
+    if (-not (Test-Path -LiteralPath $frameworkPath -PathType Leaf)) {
+        throw "00 updater completed but Maintenance.Framework.psm1 is still missing: $frameworkPath"
+    }
+
+    Write-Host '[BOOTSTRAP] 00 updater completed and Maintenance.Framework.psm1 is present. Continuing script 01.' -ForegroundColor Green
+}
+
+try {
+    Invoke-LatestUpdaterBootstrap
+}
+catch {
+    $script:FinalStatus = 'Failed'
+    $script:FailureStage = 'Bootstrap'
+    $script:FailureMessage = $_.Exception.Message
+    $script:ExitCode = if ($null -ne $script:BootstrapExitCode -and $script:BootstrapExitCode -ne 0) {
+        [int]$script:BootstrapExitCode
+    }
+    else {
+        1
+    }
+
+    Write-Host ("Script 01 bootstrap failed: {0}" -f $script:FailureMessage) -ForegroundColor Red
+    Write-EarlyFailureTelemetry `
+        -FailureStage $script:FailureStage `
+        -FailureMessage $script:FailureMessage `
+        -ExitCode $script:ExitCode
+
+    exit $script:ExitCode
+}
+
+try {
+    $MaintenanceFrameworkPath = 'C:\Scripts\Maintenance.Framework.psm1'
+    [int]$ServiceStopTimeoutSeconds = 30
+    [int]$ServiceKillWaitSeconds = 10
+    Import-Module -Name $MaintenanceFrameworkPath -Force -DisableNameChecking -ErrorAction Stop
+    $MaintenanceConfig = Initialize-MaintenanceEnvironment -ScriptRoot 'C:\Scripts' -LogRoot 'C:\Logs'
+
+    $requiredFrameworkVersion = [version]'2.4.0'
+    $currentFrameworkVersion = [version](Get-MaintenanceFrameworkVersion)
+
+    if ($currentFrameworkVersion -lt $requiredFrameworkVersion) {
+        throw "Script 01 requires Maintenance.Framework.psm1 version $requiredFrameworkVersion or newer. Installed version: $currentFrameworkVersion"
+    }
+
+    Archive-MaintenanceLogs `
+        -ScriptName $script:ScriptName `
+        -LogRoot $script:TelemetryDirectory `
+        -AdditionalPatterns @(
+            '01_Enable_Windows_Update_Services.log',
+            '*-01_Enable_Windows_Update_Services-*.log'
+        ) | Out-Null
+
+    $script:LogSession = New-MaintenanceStagedLog `
+        -ScriptName $script:ScriptName `
+        -LogRoot $script:TelemetryDirectory `
+        -StagingRoot $MaintenanceConfig.LogStagingRoot `
+        -ComputerName $env:COMPUTERNAME `
+        -Timestamp $script:ExecutionStart
+
+    $script:LogPath = [string]$script:LogSession.WorkingPath
+    $script:PublishedLogPath = [string]$script:LogSession.PublishedPath
+}
+catch {
+    $script:FinalStatus = 'Failed'
+    $script:ExitCode = 1
+    $script:FailureStage = 'FrameworkInitialization'
+    $script:FailureMessage = $_.Exception.Message
+
+    Write-Host ("Script 01 framework initialization failed: {0}" -f $script:FailureMessage) -ForegroundColor Red
+    Write-EarlyFailureTelemetry `
+        -FailureStage $script:FailureStage `
+        -FailureMessage $script:FailureMessage `
+        -ExitCode $script:ExitCode
+
+    exit $script:ExitCode
+}
+
 
 function Write-Status {
     param(
@@ -50,11 +426,32 @@ function Write-Status {
     $timestamp = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
     if ($Level -eq 'WARN') { $script:WarningCount++ }
     if ($Level -eq 'ERROR') { $script:ErrorCount++ }
-    switch ($Level) {
-        'INFO'  { Write-Host "[$timestamp] [INFO ] $Message" -ForegroundColor Cyan }
-        'OK'    { Write-Host "[$timestamp] [ OK  ] $Message" -ForegroundColor Green }
-        'WARN'  { Write-Host "[$timestamp] [WARN ] $Message" -ForegroundColor Yellow }
-        'ERROR' { Write-Host "[$timestamp] [ERROR] $Message" -ForegroundColor Red }
+
+    $elasticLevel = switch ($Level) {
+        'OK'    { 'SUCCESS' }
+        'WARN'  { 'WARNING' }
+        default { $Level }
+    }
+
+    $line = '{0} [{1}] [{2}] {3}' -f $timestamp, $env:COMPUTERNAME, $elasticLevel, $Message
+    $color = switch ($Level) {
+        'INFO'  { 'Cyan' }
+        'OK'    { 'Green' }
+        'WARN'  { 'Yellow' }
+        'ERROR' { 'Red' }
+    }
+
+    Write-Host $line -ForegroundColor $color
+
+    try {
+        $activeLogDirectory = Split-Path -Parent $script:LogPath
+        if (-not (Test-Path -LiteralPath $activeLogDirectory -PathType Container)) {
+            New-Item -Path $activeLogDirectory -ItemType Directory -Force -ErrorAction Stop | Out-Null
+        }
+        Add-Content -LiteralPath $script:LogPath -Value $line -Encoding UTF8 -ErrorAction Stop
+    }
+    catch {
+        Write-Host "Unable to write maintenance log: $($_.Exception.Message)" -ForegroundColor Yellow
     }
 }
 
@@ -72,75 +469,6 @@ function Get-FileSha256Safe {
 
     return $null
 }
-
-function Invoke-UpdaterBootstrap {
-    [CmdletBinding()]
-    param()
-
-    $preferredUpdater = '\\filesvr\Labscripts\00_Update-Scripts-FromShare.ps1'
-    $fallbackUpdater  = '\\10.2.3.30\Labscripts\00_Update-Scripts-FromShare.ps1'
-    $localUpdater     = 'C:\Scripts\00_Update-Scripts-FromShare.ps1'
-    $powershellExe    = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
-
-    $remoteUpdater = @($preferredUpdater, $fallbackUpdater) |
-        Where-Object { Test-Path -LiteralPath $_ -PathType Leaf } |
-        Select-Object -First 1
-
-    if (-not $remoteUpdater) {
-        Write-Status 'Updater bootstrap skipped because neither network source is available.' 'WARN'
-        return
-    }
-
-    try {
-        $remoteHash = Get-FileSha256Safe -Path $remoteUpdater
-        $localHash = Get-FileSha256Safe -Path $localUpdater
-        $updaterChanged = $remoteHash -ne $localHash -or $null -eq $localHash
-
-        if ($updaterChanged) {
-            Write-Status "A newer or different 00 updater was found: $remoteUpdater" 'WARN'
-
-            $localDirectory = Split-Path -Path $localUpdater -Parent
-            if (-not (Test-Path -LiteralPath $localDirectory -PathType Container)) {
-                New-Item -Path $localDirectory -ItemType Directory -Force | Out-Null
-            }
-
-            $temporaryUpdater = "$localUpdater.new"
-            Copy-Item -LiteralPath $remoteUpdater -Destination $temporaryUpdater -Force
-            Move-Item -LiteralPath $temporaryUpdater -Destination $localUpdater -Force
-
-            if ((Get-FileSha256Safe -Path $localUpdater) -ne $remoteHash) {
-                throw 'The copied updater failed SHA-256 verification.'
-            }
-
-            Write-Status 'The local 00 updater was refreshed successfully.' 'OK'
-        }
-        else {
-            Write-Status 'The local 00 updater is already current.' 'OK'
-        }
-
-        # Run 00 now so any newly introduced scripts and task definitions are
-        # deployed during this same maintenance window.
-        Write-Status 'Running the current 00 updater to synchronize scripts and tasks.' 'INFO'
-
-        $process = Start-Process `
-            -FilePath $powershellExe `
-            -ArgumentList "-NoProfile -ExecutionPolicy Bypass -File `"$localUpdater`"" `
-            -Wait `
-            -PassThru `
-            -WindowStyle Hidden
-
-        if ($process.ExitCode -eq 0) {
-            Write-Status 'Updater synchronization completed successfully.' 'OK'
-        }
-        else {
-            Write-Status "Updater synchronization returned exit code $($process.ExitCode)." 'WARN'
-        }
-    }
-    catch {
-        Write-Status "Updater bootstrap failed: $($_.Exception.Message)" 'WARN'
-    }
-}
-
 
 function Get-ServiceTelemetrySnapshot {
     [CmdletBinding()]
@@ -255,6 +583,8 @@ function Write-ExecutionTelemetry {
             ErrorCount                = $script:ErrorCount
             WarningCount              = $script:WarningCount
             Timestamp                 = (Get-Date).ToUniversalTime().ToString('o')
+            FailureStage              = $script:FailureStage
+            FailureMessage            = $script:FailureMessage
             RebootInitiated           = $script:RebootInitiated
             RebootReason              = $script:RebootReason
             TaskReconciliationStatus  = $script:TaskReconcileStatus
@@ -269,6 +599,7 @@ function Write-ExecutionTelemetry {
             ServiceStateBefore        = @($script:ServiceStateBefore)
             ServiceStateAfter         = @($script:ServiceStateAfter)
             ApprovedServiceState      = ($servicesFailed.Count -eq 0)
+            TextLogPath                = $script:PublishedLogPath
         }
 
         $jsonCompact = $event | ConvertTo-Json -Depth 8 -Compress
@@ -446,6 +777,8 @@ function Force-RebootNow {
     $script:RebootReason = $Reason
     $script:FinalStatus = 'FailedRebootScheduled'
     $script:ExitCode = 1
+    $script:FailureStage = 'ServiceRecovery'
+    $script:FailureMessage = $Reason
     Write-Status "FORCING REBOOT: $Reason" 'ERROR'
 
     try {
@@ -456,7 +789,9 @@ function Force-RebootNow {
         Write-Status "Failed to issue shutdown.exe reboot command: $($_.Exception.Message)" 'ERROR'
     }
 
-    exit 1
+    # Throw instead of exiting so the script-level catch/finally can publish
+    # structured failure telemetry before the scheduled reboot occurs.
+    throw $Reason
 }
 
 function Enable-ScheduledTaskSafe {
@@ -536,317 +871,6 @@ function Set-RegistryDwordSafe {
         Write-Status "Failed to set $Path\$Name : $($_.Exception.Message)" 'ERROR'
     }
 }
-
-function Set-ClassicRightClickMenuForHive {
-    [CmdletBinding()]
-    param(
-        [Parameter(Mandatory)]
-        [string]$RegistryRoot,
-
-        [Parameter(Mandatory)]
-        [string]$DisplayName
-    )
-
-    $clsid = '{86ca1aa0-34aa-4e8b-a509-50c905bae2a2}'
-    $basePath = "$RegistryRoot\Software\Classes\CLSID\$clsid"
-    $subPath  = "$basePath\InprocServer32"
-
-    try {
-        if (-not (Test-Path -LiteralPath $basePath)) {
-            New-Item -Path $basePath -Force -ErrorAction Stop | Out-Null
-            Write-Status "Created classic right-click menu CLSID key for $DisplayName" 'OK'
-        }
-        else {
-            Write-Status "Classic right-click menu CLSID key already exists for $DisplayName" 'INFO'
-        }
-
-        if (-not (Test-Path -LiteralPath $subPath)) {
-            New-Item -Path $subPath -Force -ErrorAction Stop | Out-Null
-            Write-Status "Created classic right-click menu InprocServer32 key for $DisplayName" 'OK'
-        }
-        else {
-            Write-Status "Classic right-click menu InprocServer32 key already exists for $DisplayName" 'INFO'
-        }
-
-        Set-Item -Path $subPath -Value '' -ErrorAction Stop
-        Write-Status "Enabled Windows 11 classic right-click menu for $DisplayName." 'OK'
-        return $true
-    }
-    catch {
-        Write-Status "Failed to enable Windows 11 classic right-click menu for $DisplayName : $($_.Exception.Message)" 'WARN'
-        return $false
-    }
-}
-
-function Invoke-WithLoadedUserHive {
-    [CmdletBinding()]
-    param(
-        [Parameter(Mandatory)]
-        [string]$HiveFile,
-
-        [Parameter(Mandatory)]
-        [string]$DisplayName,
-
-        [Parameter(Mandatory)]
-        [scriptblock]$Action
-    )
-
-    if (-not (Test-Path -LiteralPath $HiveFile)) {
-        Write-Status "User hive file not found for $DisplayName : $HiveFile" 'WARN'
-        return $false
-    }
-
-    $tempHiveName = "TempClassicContextMenu_$([guid]::NewGuid().ToString('N'))"
-    $loaded = $false
-
-    try {
-        $loadOutput = & reg.exe load "HKU\$tempHiveName" "$HiveFile" 2>&1
-        if ($LASTEXITCODE -ne 0) {
-            Write-Status "Failed to load hive for $DisplayName : $($loadOutput -join ' ')" 'WARN'
-            return $false
-        }
-
-        $loaded = $true
-        $registryRoot = "Registry::HKEY_USERS\$tempHiveName"
-        & $Action $registryRoot $DisplayName | Out-Null
-        return $true
-    }
-    catch {
-        Write-Status "Unexpected error while processing hive for $DisplayName : $($_.Exception.Message)" 'WARN'
-        return $false
-    }
-    finally {
-        if ($loaded) {
-            try {
-                [gc]::Collect()
-                [gc]::WaitForPendingFinalizers()
-                Start-Sleep -Milliseconds 300
-                $unloadOutput = & reg.exe unload "HKU\$tempHiveName" 2>&1
-                if ($LASTEXITCODE -eq 0) {
-                    Write-Status "Unloaded temporary registry hive for $DisplayName" 'OK'
-                }
-                else {
-                    Write-Status "Failed to unload temporary registry hive for $DisplayName : $($unloadOutput -join ' ')" 'WARN'
-                }
-            }
-            catch {
-                Write-Status "Unexpected error unloading hive for $DisplayName : $($_.Exception.Message)" 'WARN'
-            }
-        }
-    }
-}
-
-function Enable-ClassicWindows11RightClickMenu {
-    [CmdletBinding()]
-    param()
-
-    Write-Status "Applying Windows 11 classic right-click menu for all users..." 'INFO'
-
-    $processedSids = New-Object 'System.Collections.Generic.HashSet[string]'
-
-    [void](Set-ClassicRightClickMenuForHive -RegistryRoot 'HKCU:' -DisplayName 'current user')
-
-    try {
-        $currentSid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value
-        [void]$processedSids.Add($currentSid)
-    }
-    catch {
-        Write-Status "Could not determine current user SID: $($_.Exception.Message)" 'WARN'
-    }
-
-    try {
-        Get-ChildItem -Path 'Registry::HKEY_USERS' -ErrorAction Stop |
-            Where-Object {
-                $_.PSChildName -match '^S-1-5-21-' -and
-                $_.PSChildName -notmatch '_Classes$'
-            } |
-            ForEach-Object {
-                $sid = $_.PSChildName
-                [void]$processedSids.Add($sid)
-                [void](Set-ClassicRightClickMenuForHive -RegistryRoot "Registry::HKEY_USERS\$sid" -DisplayName "loaded profile $sid")
-            }
-    }
-    catch {
-        Write-Status "Failed to enumerate loaded user registry hives: $($_.Exception.Message)" 'WARN'
-    }
-
-    try {
-        $profiles = Get-CimInstance -ClassName Win32_UserProfile -ErrorAction Stop |
-            Where-Object {
-                -not $_.Special -and
-                $_.SID -match '^S-1-5-21-' -and
-                $_.LocalPath -and
-                (Test-Path -LiteralPath (Join-Path $_.LocalPath 'NTUSER.DAT'))
-            }
-
-        foreach ($profile in $profiles) {
-            if ($processedSids.Contains($profile.SID) -or (Test-Path -LiteralPath "Registry::HKEY_USERS\$($profile.SID)")) {
-                Write-Status "Profile already loaded or processed; skipping offline load for $($profile.LocalPath)" 'INFO'
-                continue
-            }
-
-            $ntUserDat = Join-Path $profile.LocalPath 'NTUSER.DAT'
-            [void](Invoke-WithLoadedUserHive -HiveFile $ntUserDat -DisplayName "offline profile $($profile.LocalPath)" -Action {
-                param($RegistryRoot, $DisplayName)
-                Set-ClassicRightClickMenuForHive -RegistryRoot $RegistryRoot -DisplayName $DisplayName
-            })
-        }
-    }
-    catch {
-        Write-Status "Failed to process offline user profiles: $($_.Exception.Message)" 'WARN'
-    }
-
-    $defaultHive = Join-Path $env:SystemDrive 'Users\Default\NTUSER.DAT'
-    if (Test-Path -LiteralPath $defaultHive) {
-        [void](Invoke-WithLoadedUserHive -HiveFile $defaultHive -DisplayName 'Default User profile for future users' -Action {
-            param($RegistryRoot, $DisplayName)
-            Set-ClassicRightClickMenuForHive -RegistryRoot $RegistryRoot -DisplayName $DisplayName
-        })
-    }
-    else {
-        Write-Status "Default User hive not found at expected path: $defaultHive" 'WARN'
-    }
-
-    Write-Status "Completed Windows 11 classic right-click menu application for all available users." 'OK'
-}
-
-
-function Set-Windows11UIPreferencesForHive {
-    [CmdletBinding()]
-    param(
-        [Parameter(Mandatory)]
-        [string]$RegistryRoot,
-
-        [Parameter(Mandatory)]
-        [string]$DisplayName
-    )
-
-    $advancedPath      = "$RegistryRoot\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced"
-    $searchSettingsPath = "$RegistryRoot\Software\Microsoft\Windows\CurrentVersion\SearchSettings"
-    $copilotPolicyPath = "$RegistryRoot\Software\Policies\Microsoft\Windows\WindowsCopilot"
-
-    $settings = @(
-        # Windows 11 taskbar/start alignment
-        @{ Path = $advancedPath;       Name = 'TaskbarAl';                 Value = 0; Description = 'taskbar/start alignment left' },
-
-        # Windows 11 taskbar buttons - intentionally does NOT modify Microsoft Teams/Chat
-        @{ Path = $advancedPath;       Name = 'TaskbarDa';                 Value = 0; Description = 'hide Widgets button' },
-        @{ Path = $advancedPath;       Name = 'ShowTaskViewButton';        Value = 0; Description = 'hide Task View button' },
-        @{ Path = $advancedPath;       Name = 'ShowCopilotButton';         Value = 0; Description = 'hide Copilot button' },
-
-        # Search / Copilot preferences
-        @{ Path = $searchSettingsPath; Name = 'IsDynamicSearchBoxEnabled'; Value = 0; Description = 'disable Search Highlights' },
-        @{ Path = $copilotPolicyPath;  Name = 'TurnOffWindowsCopilot';     Value = 1; Description = 'disable Windows Copilot for this user' },
-
-        # File Explorer preferences
-        @{ Path = $advancedPath;       Name = 'LaunchTo';                  Value = 1; Description = 'open File Explorer to This PC' },
-        @{ Path = $advancedPath;       Name = 'HideFileExt';               Value = 0; Description = 'show file extensions' },
-        @{ Path = $advancedPath;       Name = 'Hidden';                    Value = 1; Description = 'show hidden files' }
-    )
-
-    try {
-        foreach ($setting in $settings) {
-            if (-not (Test-Path -LiteralPath $setting.Path)) {
-                New-Item -Path $setting.Path -Force -ErrorAction Stop | Out-Null
-            }
-
-            New-ItemProperty `
-                -Path $setting.Path `
-                -Name $setting.Name `
-                -Value $setting.Value `
-                -PropertyType DWord `
-                -Force `
-                -ErrorAction Stop | Out-Null
-
-            Write-Status "Applied $($setting.Description) for $DisplayName." 'OK'
-        }
-
-        # NOTE: Microsoft Teams / Chat is intentionally not changed.
-        # Do not set TaskbarMn here because Teams is used on campus.
-
-        return $true
-    }
-    catch {
-        Write-Status "Failed to apply Windows 11 UI preferences for $DisplayName : $($_.Exception.Message)" 'WARN'
-        return $false
-    }
-}
-
-function Set-Windows11UIPreferencesForAllUsers {
-    [CmdletBinding()]
-    param()
-
-    Write-Status "Applying Windows 11 UI preferences for all users..." 'INFO'
-    Write-Status "Microsoft Teams / Chat taskbar settings are intentionally left unchanged." 'INFO'
-
-    $processedSids = New-Object 'System.Collections.Generic.HashSet[string]'
-
-    [void](Set-Windows11UIPreferencesForHive -RegistryRoot 'HKCU:' -DisplayName 'current user')
-
-    try {
-        $currentSid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value
-        [void]$processedSids.Add($currentSid)
-    }
-    catch {
-        Write-Status "Could not determine current user SID: $($_.Exception.Message)" 'WARN'
-    }
-
-    try {
-        Get-ChildItem -Path 'Registry::HKEY_USERS' -ErrorAction Stop |
-            Where-Object {
-                $_.PSChildName -match '^S-1-5-21-' -and
-                $_.PSChildName -notmatch '_Classes$'
-            } |
-            ForEach-Object {
-                $sid = $_.PSChildName
-                [void]$processedSids.Add($sid)
-                [void](Set-Windows11UIPreferencesForHive -RegistryRoot "Registry::HKEY_USERS\$sid" -DisplayName "loaded profile $sid")
-            }
-    }
-    catch {
-        Write-Status "Failed to enumerate loaded user registry hives for Windows 11 UI preferences: $($_.Exception.Message)" 'WARN'
-    }
-
-    try {
-        $profiles = Get-CimInstance -ClassName Win32_UserProfile -ErrorAction Stop |
-            Where-Object {
-                -not $_.Special -and
-                $_.SID -match '^S-1-5-21-' -and
-                $_.LocalPath -and
-                (Test-Path -LiteralPath (Join-Path $_.LocalPath 'NTUSER.DAT'))
-            }
-
-        foreach ($profile in $profiles) {
-            if ($processedSids.Contains($profile.SID) -or (Test-Path -LiteralPath "Registry::HKEY_USERS\$($profile.SID)")) {
-                Write-Status "Profile already loaded or processed; skipping offline Windows 11 UI preference load for $($profile.LocalPath)" 'INFO'
-                continue
-            }
-
-            $ntUserDat = Join-Path $profile.LocalPath 'NTUSER.DAT'
-            [void](Invoke-WithLoadedUserHive -HiveFile $ntUserDat -DisplayName "offline profile $($profile.LocalPath)" -Action {
-                param($RegistryRoot, $DisplayName)
-                Set-Windows11UIPreferencesForHive -RegistryRoot $RegistryRoot -DisplayName $DisplayName
-            })
-        }
-    }
-    catch {
-        Write-Status "Failed to process offline user profiles for Windows 11 UI preferences: $($_.Exception.Message)" 'WARN'
-    }
-
-    $defaultHive = Join-Path $env:SystemDrive 'Users\Default\NTUSER.DAT'
-    if (Test-Path -LiteralPath $defaultHive) {
-        [void](Invoke-WithLoadedUserHive -HiveFile $defaultHive -DisplayName 'Default User profile for future users' -Action {
-            param($RegistryRoot, $DisplayName)
-            Set-Windows11UIPreferencesForHive -RegistryRoot $RegistryRoot -DisplayName $DisplayName
-        })
-    }
-    else {
-        Write-Status "Default User hive not found at expected path: $defaultHive" 'WARN'
-    }
-
-    Write-Status "Completed Windows 11 UI preference application for all available users." 'OK'
-}
-
 
 function Get-ScriptHeaderValue {
     [CmdletBinding()]
@@ -990,58 +1014,6 @@ function Test-CheckForUpdatedScriptsTaskCompliant {
 }
 
 
-function Disable-MissedRunBehaviorForMaintenanceTasks {
-    [CmdletBinding()]
-    param(
-        [string[]]$TaskNames = @(
-            '01. Check for Updated Scripts',
-            '02. Remove User Profiles',
-            '03. Weekend Apps Update',
-            '04. Update Edge Silent',
-            '05. Weekend HP Drivers Update',
-            '06. Weekend Windows Updates',
-            '07. Force Reboot Install Updates',
-            '08. System Repair',
-            '09. Disable Windows Update Services',
-            '10. Sync System Time'
-        )
-    )
-
-    try {
-        Import-Module ScheduledTasks -ErrorAction Stop | Out-Null
-    }
-    catch {
-        Write-Status "ScheduledTasks module is unavailable. Cannot clear missed-run behavior: $($_.Exception.Message)" 'WARN'
-        return
-    }
-
-    foreach ($taskName in $TaskNames) {
-        try {
-            $tasks = Get-ScheduledTask -TaskName $taskName -ErrorAction Stop
-        }
-        catch {
-            Write-Status "Task not found while clearing missed-run behavior: $taskName" 'WARN'
-            continue
-        }
-
-        foreach ($task in @($tasks)) {
-            try {
-                if ($task.Settings.StartWhenAvailable -eq $true) {
-                    $task.Settings.StartWhenAvailable = $false
-                    Set-ScheduledTask -InputObject $task -ErrorAction Stop | Out-Null
-                    Write-Status "Disabled missed-run behavior for task: $($task.TaskPath)$($task.TaskName)" 'OK'
-                }
-                else {
-                    Write-Status "Missed-run behavior already disabled for task: $($task.TaskPath)$($task.TaskName)" 'INFO'
-                }
-            }
-            catch {
-                Write-Status "Failed to clear missed-run behavior for task $($task.TaskPath)$($task.TaskName): $($_.Exception.Message)" 'WARN'
-            }
-        }
-    }
-}
-
 function Ensure-CheckForUpdatedScriptsTask {
     [CmdletBinding()]
     param(
@@ -1124,18 +1096,14 @@ try {
         Write-Status 'This script must be run as Administrator.' 'ERROR'
         $script:FinalStatus = 'Failed'
         $script:ExitCode = 1
-        throw 'Administrative privileges are required.'
+        $script:FailureStage = 'PrivilegeCheck'
+        $script:FailureMessage = 'Administrative privileges are required.'
+        throw $script:FailureMessage
     }
 
     $script:ServiceStateBefore = @(Get-ServiceTelemetrySnapshot -Names $script:ServiceNames)
     $script:PolicyConflictsBefore = @(Get-WindowsUpdatePolicyConflicts)
-
-    Invoke-UpdaterBootstrap
-
 Write-Status "Initializing script..." 'INFO'
-Set-Windows11UIPreferencesForAllUsers
-Enable-ClassicWindows11RightClickMenu
-
 # Restore registry startup values first
 # Common defaults used for Windows Update-related services:
 # wuauserv = Manual (3)
@@ -1279,8 +1247,6 @@ else {
 
 # Final enforcement pass. This runs after any task rebuild so older register scripts
 # cannot leave "Run task as soon as possible after a scheduled start is missed" enabled.
-Disable-MissedRunBehaviorForMaintenanceTasks
-
 $script:FinalStatus = if ($script:WarningCount -gt 0) { 'SuccessWithWarnings' } else { 'Success' }
 $script:ExitCode = 0
 Write-Status "Windows Update settings have been restored and critical services are running." 'OK'
@@ -1289,11 +1255,33 @@ Write-Status "No reboot required. Continuing normally." 'INFO'
 catch {
     if ($script:ExitCode -eq 0) { $script:ExitCode = 1 }
     if ($script:FinalStatus -eq 'Running') { $script:FinalStatus = 'Failed' }
+    if ([string]::IsNullOrWhiteSpace($script:FailureStage)) { $script:FailureStage = 'Execution' }
+    if ([string]::IsNullOrWhiteSpace($script:FailureMessage)) { $script:FailureMessage = $_.Exception.Message }
     Write-Status "Unhandled failure: $($_.Exception.Message)" 'ERROR'
 }
 finally {
     $script:ServiceStateAfter = @(Get-ServiceTelemetrySnapshot -Names $script:ServiceNames)
     Write-ExecutionTelemetry
+
+    # This is the final text-log write. Once published into C:\Logs, Elastic may
+    # open the file immediately, so nothing should append to it afterward.
+    Write-Status ("Completed {0}. Status={1}; ExitCode={2}; Warnings={3}; Errors={4}" -f `
+        $script:ScriptName,
+        $script:FinalStatus,
+        $script:ExitCode,
+        $script:WarningCount,
+        $script:ErrorCount) $(if ($script:ExitCode -eq 0) { 'OK' } else { 'ERROR' })
+
+    if ($null -ne $script:LogSession) {
+        $publishResult = Publish-MaintenanceLog -LogSession $script:LogSession
+
+        if ($publishResult.Published) {
+            Write-Host ("Published completed script 01 text log for Elastic: {0}" -f $script:PublishedLogPath) -ForegroundColor Green
+        }
+        else {
+            Write-Warning ("Script 01 completed log remains in staging because publication failed: {0}" -f $publishResult.Path)
+        }
+    }
 }
 
 exit $script:ExitCode

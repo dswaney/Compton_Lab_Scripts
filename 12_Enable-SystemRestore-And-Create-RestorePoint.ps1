@@ -1,11 +1,16 @@
-﻿<#
+<#
 .SYNOPSIS
     Enables System Restore on the Windows client operating-system drive, creates a verified
     restore point, and retains a configurable number of restore points created by this script.
 
 .NOTES
     ScriptName: 12_Enable-SystemRestore-And-Create-RestorePoint.ps1
-    ScriptVersion: 2.0.0
+    ScriptVersion: 2.0.8
+    LastUpdated: 2026-08-17
+    Changes: v2.0.8 normalizes restore-point enumeration to arrays in retention and latest-point logic so a single restore point does not trigger a StrictMode Count-property failure.
+              v2.0.7 allows an empty restore-point inventory during pre/post checks, which is valid on systems with no existing restore points.
+              v2.0.6 adds Elastic mapping-safe array serialization for services, restore-point inventories, and retention results; normalizes Windows 11 product naming; and adds a concise Elastic restore-point summary.
+              v2.0.5 uses Maintenance.Framework v2.4 staged text logging.
     Designed for Windows PowerShell 5.1 on Windows 10/11.
 #>
 
@@ -30,11 +35,13 @@ Set-StrictMode -Version 2.0
 $ErrorActionPreference = 'Stop'
 
 $ScriptName = '12_Enable-SystemRestore-And-Create-RestorePoint.ps1'
-$ScriptVersion = '2.0.0'
+$ScriptVersion = '2.0.8'
 $RunId = [guid]::NewGuid().Guid
 $RunStart = Get-Date
 $LogDirectory = 'C:\Logs'
-$LogPath = Join-Path $LogDirectory '12_Enable-SystemRestore-And-Create-RestorePoint.log'
+$LogPath = $null
+$PublishedLogPath = $null
+$LogSession = $null
 $TelemetryPath = Join-Path $LogDirectory 'Maintenance-Telemetry.ndjson'
 $LatestTelemetryPath = Join-Path $LogDirectory '12_Enable-SystemRestore-And-Create-RestorePoint.latest.json'
 
@@ -58,8 +65,33 @@ $script:FrequencyChanged = $false
 
 # Load the shared framework from the same directory as this script.
 $MaintenanceFrameworkPath = 'C:\Scripts\Maintenance.Framework.psm1'
-Import-Module -Name $MaintenanceFrameworkPath -Force -ErrorAction Stop
-$MaintenanceConfig = Initialize-MaintenanceEnvironment -ScriptRoot 'C:\Scripts' -LogRoot 'C:\Logs'
+Import-Module -Name $MaintenanceFrameworkPath -Force -DisableNameChecking -ErrorAction Stop
+$MaintenanceConfig = Initialize-MaintenanceEnvironment -ScriptRoot 'C:\Scripts' -LogRoot $LogDirectory
+
+$requiredFrameworkVersion = [version]'2.4.0'
+$currentFrameworkVersion = [version](Get-MaintenanceFrameworkVersion)
+
+if ($currentFrameworkVersion -lt $requiredFrameworkVersion) {
+    throw "Script 12 requires Maintenance.Framework.psm1 version $requiredFrameworkVersion or newer. Installed version: $currentFrameworkVersion"
+}
+
+Archive-MaintenanceLogs `
+    -ScriptName $ScriptName `
+    -LogRoot $LogDirectory `
+    -AdditionalPatterns @(
+        '12_Enable-SystemRestore-And-Create-RestorePoint.log',
+        '*-12_Enable-SystemRestore-And-Create-RestorePoint-*.log'
+    ) | Out-Null
+
+$LogSession = New-MaintenanceStagedLog `
+    -ScriptName $ScriptName `
+    -LogRoot $LogDirectory `
+    -StagingRoot $MaintenanceConfig.LogStagingRoot `
+    -ComputerName $env:COMPUTERNAME `
+    -Timestamp $RunStart
+
+$LogPath = [string]$LogSession.WorkingPath
+$PublishedLogPath = [string]$LogSession.PublishedPath
 
 function Ensure-Directory {
     param([Parameter(Mandatory)][string]$Path)
@@ -79,7 +111,13 @@ function Write-Log {
     if ($Level -eq 'ERROR') { $script:ErrorCount++ }
 
     $timestamp = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
-    $line = '[{0}] [{1,-5}] {2}' -f $timestamp, $Level, $Message
+    $computerName = if ($env:COMPUTERNAME) { $env:COMPUTERNAME } else { 'UNKNOWN' }
+    $normalizedLevel = switch ($Level) {
+        'OK'   { 'SUCCESS' }
+        'WARN' { 'WARNING' }
+        default { $Level }
+    }
+    $line = '{0} [{1}] [{2}] {3}' -f $timestamp, $computerName, $normalizedLevel, $Message
 
     switch ($Level) {
         'OK'    { Write-Host $line -ForegroundColor Green }
@@ -89,7 +127,8 @@ function Write-Log {
     }
 
     try {
-        Ensure-Directory -Path $LogDirectory
+        $activeLogDirectory = Split-Path -Parent $LogPath
+        Ensure-Directory -Path $activeLogDirectory
         Add-Content -LiteralPath $LogPath -Value $line -Encoding UTF8
     }
     catch {
@@ -154,14 +193,23 @@ function Get-WindowsIdentity {
     $cvPath = 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion'
     $cv = Get-ItemProperty -LiteralPath $cvPath -ErrorAction SilentlyContinue
 
+    $productName = if ($cv) { [string]$cv.ProductName } else { [string]$os.Caption }
+    $buildText = [string]$os.BuildNumber
+    $buildNumber = 0
+    [void][int]::TryParse($buildText, [ref]$buildNumber)
+
+    if ($buildNumber -ge 22000 -and $productName -match '^Windows 10') {
+        $productName = $productName -replace '^Windows 10', 'Windows 11'
+    }
+
     [pscustomobject]@{
-        ProductName    = if ($cv) { [string]$cv.ProductName } else { [string]$os.Caption }
+        ProductName    = $productName
         EditionId      = if ($cv) { [string]$cv.EditionID } else { $null }
         DisplayVersion = if ($cv) { [string]$cv.DisplayVersion } else { $null }
         ReleaseId      = if ($cv) { [string]$cv.ReleaseId } else { $null }
-        Build          = [string]$os.BuildNumber
+        Build          = $buildText
         UBR            = if ($cv -and $null -ne $cv.UBR) { [int]$cv.UBR } else { $null }
-        FullBuild      = if ($cv -and $null -ne $cv.UBR) { '{0}.{1}' -f $os.BuildNumber, $cv.UBR } else { [string]$os.BuildNumber }
+        FullBuild      = if ($cv -and $null -ne $cv.UBR) { '{0}.{1}' -f $buildText, $cv.UBR } else { $buildText }
         ProductType    = [int]$os.ProductType
         SystemDrive    = [string]$os.SystemDrive
     }
@@ -222,15 +270,85 @@ function Set-RestorePointCreationFrequency {
     }
 }
 
+
+function Test-SystemRestorePolicy {
+    [CmdletBinding()]
+    param()
+
+    $policyPath = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\SystemRestore'
+    $disableSr = $null
+    $disableConfig = $null
+
+    if (Test-Path -LiteralPath $policyPath) {
+        try {
+            $policy = Get-ItemProperty -LiteralPath $policyPath -ErrorAction Stop
+            if ($null -ne $policy.DisableSR) {
+                $disableSr = [int]$policy.DisableSR
+            }
+            if ($null -ne $policy.DisableConfig) {
+                $disableConfig = [int]$policy.DisableConfig
+            }
+        }
+        catch {
+            Write-Log ('Unable to read System Restore policy: {0}' -f $_.Exception.Message) 'WARN'
+        }
+    }
+
+    if ($disableSr -eq 1) {
+        throw 'System Restore is disabled by policy (DisableSR=1). Remove or change the policy before restore points can be created.'
+    }
+
+    if ($disableConfig -eq 1) {
+        Write-Log 'System Restore configuration is restricted by policy (DisableConfig=1), but restore-point creation will still be attempted.' 'WARN'
+    }
+
+    Write-Log 'System Restore policy does not explicitly disable restore-point creation.' 'OK'
+}
+
 function Enable-SystemRestoreProtection {
-    param([Parameter(Mandatory)][string]$Drive)
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$Drive,
+        [ValidateRange(5,120)]
+        [int]$InitializationWaitSeconds = 20
+    )
 
     $script:RestoreProtectionEnableAttempted = $true
-    Write-Log ('Ensuring System Restore protection is enabled for {0}' -f $Drive)
+    Write-Log ('Ensuring System Restore protection is enabled for {0}' -f $Drive) 'INFO'
 
+    # Keep the supported PowerShell cmdlet call.
     Enable-ComputerRestore -Drive $Drive -ErrorAction Stop
     $script:RestoreProtectionEnabled = $true
     Write-Log ('System Restore protection enable command completed for {0}' -f $Drive) 'OK'
+
+    # Call the underlying SystemRestore.Enable() method directly as well so
+    # we can capture its return code. Microsoft documents that this method
+    # returns before monitoring/filter-driver initialization is complete.
+    try {
+        $restoreClass = Get-WmiObject `
+            -Namespace 'root\default' `
+            -List `
+            -Class 'SystemRestore' `
+            -ErrorAction Stop
+
+        if ($restoreClass) {
+            $enableResult = $restoreClass.Enable($Drive)
+            $enableCode = [int]$enableResult.ReturnValue
+
+            if ($enableCode -eq 0) {
+                Write-Log ('Native SystemRestore.Enable returned success for {0}.' -f $Drive) 'OK'
+            }
+            else {
+                Write-Log ('Native SystemRestore.Enable returned code {0} for {1}.' -f $enableCode, $Drive) 'WARN'
+            }
+        }
+    }
+    catch {
+        Write-Log ('Unable to obtain native SystemRestore.Enable return code: {0}' -f $_.Exception.Message) 'WARN'
+    }
+
+    Write-Log ('Waiting {0} second(s) for System Restore monitoring to initialize...' -f $InitializationWaitSeconds) 'INFO'
+    Start-Sleep -Seconds $InitializationWaitSeconds
 }
 
 function Get-ServiceSnapshot {
@@ -257,46 +375,99 @@ function Get-ServiceSnapshot {
 }
 
 function Initialize-ShadowCopyServices {
-    foreach ($serviceName in @('VSS', 'swprv')) {
+    # VSS and swprv are always expected. srservice is checked when present.
+    # On some Windows builds the System Restore service is not exposed as a
+    # separate service, so absence of srservice is informational rather than fatal.
+    $serviceDefinitions = @(
+        [pscustomobject]@{ Name = 'VSS';       DesiredStartup = 'Manual'; Required = $true  },
+        [pscustomobject]@{ Name = 'swprv';     DesiredStartup = 'Manual'; Required = $true  },
+        [pscustomobject]@{ Name = 'srservice'; DesiredStartup = 'Manual'; Required = $false }
+    )
+
+    foreach ($definition in $serviceDefinitions) {
+        $serviceName = $definition.Name
         $before = Get-ServiceSnapshot -Name $serviceName
         $attempted = $false
         $operationStatus = 'NoChange'
         $message = $null
 
         if (-not $before.Exists) {
-            $operationStatus = 'NotFound'
-            $message = 'Required service was not found.'
-            Write-Log ('Service {0} was not found.' -f $serviceName) 'WARN'
-        }
-        elseif ($before.State -ne 'Running') {
-            $attempted = $true
-            Write-Log ('Starting required service {0}...' -f $serviceName)
-
-            try {
-                Start-Service -Name $serviceName -ErrorAction Stop
-                $serviceController = Get-Service -Name $serviceName -ErrorAction Stop
-                $serviceController.WaitForStatus(
-                    [System.ServiceProcess.ServiceControllerStatus]::Running,
-                    [TimeSpan]::FromSeconds($ServiceStartTimeoutSeconds)
-                )
-                $operationStatus = 'Started'
-                Write-Log ('Service {0} is running.' -f $serviceName) 'OK'
+            if ($definition.Required) {
+                $operationStatus = 'NotFound'
+                $message = 'Required service was not found.'
+                Write-Log ('Required service {0} was not found.' -f $serviceName) 'WARN'
             }
-            catch {
-                $operationStatus = 'Failed'
-                $message = $_.Exception.Message
-                Write-Log ('Service {0} could not be started: {1}' -f $serviceName, $message) 'WARN'
+            else {
+                $operationStatus = 'NotPresentOnBuild'
+                $message = 'Optional System Restore service is not present on this Windows build.'
+                Write-Log ('Optional service {0} is not present on this Windows build.' -f $serviceName) 'INFO'
             }
         }
         else {
-            Write-Log ('Required service {0} is already running.' -f $serviceName)
+            # A disabled dependency causes Checkpoint-Computer to fail with
+            # "the service cannot be started because it is disabled".
+            if ($before.StartMode -eq 'Disabled') {
+                $attempted = $true
+                Write-Log ('Service {0} is disabled. Changing startup type to {1}...' -f $serviceName, $definition.DesiredStartup) 'INFO'
+
+                try {
+                    Set-Service -Name $serviceName -StartupType $definition.DesiredStartup -ErrorAction Stop
+                    Write-Log ('Startup type for {0} changed to {1}.' -f $serviceName, $definition.DesiredStartup) 'OK'
+                }
+                catch {
+                    # Some protected services reject Set-Service; try sc.exe.
+                    $scStart = if ($definition.DesiredStartup -eq 'Manual') { 'demand' } else { 'auto' }
+                    $scOutput = & "$env:SystemRoot\System32\sc.exe" config $serviceName start= $scStart 2>&1
+
+                    if ($LASTEXITCODE -ne 0) {
+                        $operationStatus = 'Failed'
+                        $message = ($scOutput -join ' ')
+                        Write-Log ('Unable to change startup type for service {0}: {1}' -f $serviceName, $message) 'WARN'
+                    }
+                    else {
+                        Write-Log ('Startup type for {0} changed through sc.exe.' -f $serviceName) 'OK'
+                    }
+                }
+            }
+
+            $current = Get-ServiceSnapshot -Name $serviceName
+
+            if ($current.State -ne 'Running') {
+                $attempted = $true
+                Write-Log ('Starting restore-point dependency service {0}...' -f $serviceName) 'INFO'
+
+                try {
+                    Start-Service -Name $serviceName -ErrorAction Stop
+                    $serviceController = Get-Service -Name $serviceName -ErrorAction Stop
+                    $serviceController.WaitForStatus(
+                        [System.ServiceProcess.ServiceControllerStatus]::Running,
+                        [TimeSpan]::FromSeconds($ServiceStartTimeoutSeconds)
+                    )
+                    $operationStatus = 'Started'
+                    Write-Log ('Service {0} is running.' -f $serviceName) 'OK'
+                }
+                catch {
+                    $operationStatus = 'Failed'
+                    $message = $_.Exception.Message
+                    Write-Log ('Service {0} could not be started: {1}' -f $serviceName, $message) 'WARN'
+                }
+            }
+            else {
+                Write-Log ('Required service {0} is already running.' -f $serviceName) 'INFO'
+            }
         }
 
         $after = Get-ServiceSnapshot -Name $serviceName
-        $verified = ($after.Exists -and $after.State -eq 'Running')
+        $verified = if (-not $after.Exists -and -not $definition.Required) {
+            $true
+        }
+        else {
+            ($after.Exists -and $after.State -eq 'Running')
+        }
 
         [void]$script:ServiceResults.Add([pscustomobject]@{
             Name            = $serviceName
+            Required        = [bool]$definition.Required
             Before          = $before
             StartAttempted  = $attempted
             OperationStatus = $operationStatus
@@ -305,8 +476,12 @@ function Initialize-ShadowCopyServices {
             VerifiedRunning = $verified
         })
 
-        if (-not $verified) {
-            Write-Log ('Service {0} is not verified as running; restore-point creation will still be attempted.' -f $serviceName) 'WARN'
+        $serviceLogLevel = if ($verified) { 'OK' } else { 'WARN' }
+        Write-Log ('Restore service state: Name={0}; Required={1}; State={2} -> {3}; StartMode={4} -> {5}; VerifiedRunning={6}; Operation={7}.' -f `
+            $serviceName, $definition.Required, $before.State, $after.State, $before.StartMode, $after.StartMode, $verified, $operationStatus) $serviceLogLevel
+
+        if (-not $verified -and $definition.Required) {
+            throw ('Required restore-point service {0} could not be verified as running.' -f $serviceName)
         }
     }
 }
@@ -343,7 +518,12 @@ function Convert-RestorePointRecord {
 
 function Get-AllRestorePoints {
     try {
-        return @(Get-ComputerRestorePoint -ErrorAction Stop | Sort-Object -Property SequenceNumber -Descending)
+        [object[]]$points = @(
+            Get-ComputerRestorePoint -ErrorAction Stop |
+            Sort-Object -Property SequenceNumber -Descending
+        )
+
+        return $points
     }
     catch {
         Write-Log ('Unable to enumerate restore points: {0}' -f $_.Exception.Message) 'WARN'
@@ -351,8 +531,30 @@ function Get-AllRestorePoints {
     }
 }
 
+function Write-RestorePointInventorySummary {
+    param(
+        [Parameter(Mandatory)][string]$Label,
+        [Parameter(Mandatory)][AllowEmptyCollection()][object[]]$RestorePoints
+    )
+
+    $managed = @($RestorePoints | Where-Object { $_.Managed })
+    $nonManaged = @($RestorePoints | Where-Object { -not $_.Managed })
+    $latest = $RestorePoints | Sort-Object -Property SequenceNumber -Descending | Select-Object -First 1
+
+    Write-Log ('Restore-point inventory {0}: Total={1}; Managed={2}; NonManaged={3}.' -f `
+        $Label, $RestorePoints.Count, $managed.Count, $nonManaged.Count)
+
+    if ($latest) {
+        Write-Log ('Latest restore point {0}: SequenceNumber={1}; Created={2}; Managed={3}; Description={4}.' -f `
+            $Label, $latest.SequenceNumber, $latest.CreationTime, $latest.Managed, $latest.Description)
+    }
+    else {
+        Write-Log ('Latest restore point {0}: none found.' -f $Label) 'INFO'
+    }
+}
+
 function Get-LatestRestorePoint {
-    $points = Get-AllRestorePoints
+    $points = @(Get-AllRestorePoints)
     if ($points.Count -eq 0) { return $null }
     return $points[0]
 }
@@ -399,7 +601,7 @@ function Remove-ObsoleteManagedRestorePoints {
         [Parameter(Mandatory)][int]$KeepCount
     )
 
-    $all = Get-AllRestorePoints
+    $all = @(Get-AllRestorePoints)
     $managed = @($all |
         Where-Object { [string]$_.Description -eq $ManagedDescription } |
         Sort-Object -Property SequenceNumber -Descending)
@@ -448,6 +650,49 @@ function Remove-ObsoleteManagedRestorePoints {
     }
 }
 
+
+function New-NativeSystemRestorePoint {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$Description
+    )
+
+    Write-Log ('Attempting native SystemRestore.CreateRestorePoint fallback: {0}' -f $Description) 'INFO'
+
+    $restoreClass = Get-WmiObject `
+        -Namespace 'root\default' `
+        -List `
+        -Class 'SystemRestore' `
+        -ErrorAction Stop
+
+    if (-not $restoreClass) {
+        throw 'The root\default:SystemRestore WMI class is not available.'
+    }
+
+    # EventType 100 = BEGIN_SYSTEM_CHANGE
+    # RestorePointType 12 = MODIFY_SETTINGS
+    try {
+        $result = $restoreClass.CreateRestorePoint(
+            $Description,
+            12,
+            100
+        )
+
+        $returnCode = [int]$result.ReturnValue
+        Write-Log ('Native SystemRestore.CreateRestorePoint returned code {0}.' -f $returnCode) `
+            $(if ($returnCode -eq 0) { 'OK' } else { 'WARN' })
+
+        if ($returnCode -ne 0) {
+            throw ('Native SystemRestore.CreateRestorePoint failed with return code {0}.' -f $returnCode)
+        }
+
+        return $true
+    }
+    catch {
+        throw
+    }
+}
+
 function New-VerifiedRestorePoint {
     param(
         [Parameter(Mandatory)][string]$Description,
@@ -469,16 +714,68 @@ function New-VerifiedRestorePoint {
     $script:RestorePointCreationAttempted = $true
     Write-Log ('Creating restore point: {0}' -f $safeDescription)
 
-    Checkpoint-Computer `
-        -Description $safeDescription `
-        -RestorePointType MODIFY_SETTINGS `
-        -ErrorAction Stop
+    $creationSucceeded = $false
+    $maxCreationAttempts = 6
+    $retryDelaySeconds = 10
+    $lastCreationError = $null
+
+    for ($attempt = 1; $attempt -le $maxCreationAttempts; $attempt++) {
+        try {
+            Write-Log ('Restore-point creation attempt {0} of {1} using Checkpoint-Computer.' -f $attempt, $maxCreationAttempts) 'INFO'
+
+            Checkpoint-Computer `
+                -Description $safeDescription `
+                -RestorePointType MODIFY_SETTINGS `
+                -ErrorAction Stop
+
+            Write-Log 'Checkpoint-Computer completed without error.' 'OK'
+            $creationSucceeded = $true
+            break
+        }
+        catch {
+            $lastCreationError = $_.Exception.Message
+            Write-Log ('Checkpoint-Computer attempt {0} failed: {1}' -f $attempt, $lastCreationError) 'WARN'
+
+            $serviceDisabledCondition = (
+                $lastCreationError -match 'service cannot be started because it is disabled' -or
+                $lastCreationError -match 'does not have enabled devices associated with it' -or
+                $lastCreationError -match 'ServiceDisabled' -or
+                $lastCreationError -match '0x80070422'
+            )
+
+            if (-not $serviceDisabledCondition) {
+                throw
+            }
+
+            # Try the lower-level WMI interface too. If System Restore is still
+            # initializing, it can fail with the same underlying condition.
+            try {
+                $null = New-NativeSystemRestorePoint -Description $safeDescription
+                Write-Log 'Native SystemRestore.CreateRestorePoint completed successfully.' 'OK'
+                $creationSucceeded = $true
+                break
+            }
+            catch {
+                $lastCreationError = $_.Exception.Message
+                Write-Log ('Native fallback attempt {0} also failed: {1}' -f $attempt, $lastCreationError) 'WARN'
+            }
+
+            if ($attempt -lt $maxCreationAttempts) {
+                Write-Log ('System Restore may still be initializing. Waiting {0} seconds before retrying...' -f $retryDelaySeconds) 'INFO'
+                Start-Sleep -Seconds $retryDelaySeconds
+            }
+        }
+    }
+
+    if (-not $creationSucceeded) {
+        throw ('Restore-point creation failed after {0} attempts. Last error: {1}' -f $maxCreationAttempts, $lastCreationError)
+    }
 
     $deadline = (Get-Date).AddMinutes($TimeoutMinutes)
 
     do {
         Start-Sleep -Seconds 5
-        $points = Get-AllRestorePoints
+        $points = @(Get-AllRestorePoints)
         $candidate = $points |
             Where-Object {
                 $sequenceNumbersBefore -notcontains [uint32]$_.SequenceNumber -and
@@ -524,6 +821,23 @@ function Write-JsonAtomically {
     Move-Item -LiteralPath $temporaryPath -Destination $Path -Force
 }
 
+
+function New-ObjectArrayForJson {
+    [CmdletBinding()]
+    param([AllowNull()]$InputObject)
+
+    [object[]]$items = @(
+        $InputObject |
+        ForEach-Object { $_ }
+    )
+
+    if ($items.Count -eq 0) {
+        return ,([object[]]@())
+    }
+
+    return ,([object[]]$items)
+}
+
 function Write-Telemetry {
     param([AllowNull()]$WindowsIdentity)
 
@@ -554,6 +868,7 @@ function Write-Telemetry {
             WarningCount = $script:WarningCount
             ErrorCount = $script:ErrorCount
             FailureMessage = $script:FailureMessage
+            TextLogPath = $PublishedLogPath
             RunningAccount = [Security.Principal.WindowsIdentity]::GetCurrent().Name
             IsSystem = ([Security.Principal.WindowsIdentity]::GetCurrent().IsSystem)
             Windows = $WindowsIdentity
@@ -572,7 +887,7 @@ function Write-Telemetry {
                 Changed = $script:FrequencyChanged
                 Verified = ($script:FrequencyAfter -eq 0)
             }
-            ShadowCopyServices = @($script:ServiceResults)
+            ShadowCopyServices = New-ObjectArrayForJson -InputObject $script:ServiceResults
             RestorePointCreation = [ordered]@{
                 Attempted = $script:RestorePointCreationAttempted
                 Verified = $script:RestorePointVerified
@@ -585,17 +900,31 @@ function Write-Telemetry {
                 ManagedAfter = $managedAfter.Count
                 NonManagedBefore = $nonManagedBefore.Count
                 NonManagedAfter = $nonManagedAfter.Count
-                RestorePointsBefore = $script:RestorePointsBefore
-                RestorePointsAfter = $script:RestorePointsAfter
+                RestorePointsBefore = New-ObjectArrayForJson -InputObject $script:RestorePointsBefore
+                RestorePointsAfter = New-ObjectArrayForJson -InputObject $script:RestorePointsAfter
             }
             Retention = [ordered]@{
                 CleanupSkipped = [bool]$SkipRetentionCleanup
-                DeletedCount = @($script:RetentionResults | Where-Object { $_.Status -eq 'Deleted' }).Count
-                FailedCount = @($script:RetentionResults | Where-Object { $_.Status -eq 'Failed' }).Count
-                Results = @($script:RetentionResults)
+                DeletedCount = @($script:RetentionResults | ForEach-Object { $_ } | Where-Object { $_.Status -eq 'Deleted' }).Count
+                FailedCount = @($script:RetentionResults | ForEach-Object { $_ } | Where-Object { $_.Status -eq 'Failed' }).Count
+                Results = New-ObjectArrayForJson -InputObject $script:RetentionResults
                 NonManagedRestorePointsPreserved = $true
             }
         }
+
+        try {
+            Write-Log ('Elastic system-restore summary: Status={0}; ProtectionEnabled={1}; RestorePointVerified={2}; TotalBefore={3}; TotalAfter={4}; ManagedBefore={5}; ManagedAfter={6}; RetentionDeleted={7}; RetentionFailed={8}.' -f `
+                $event.Status,
+                $event.RestoreProtection.EnableCommandSucceeded,
+                $event.RestorePointCreation.Verified,
+                $event.RestorePointInventory.TotalBefore,
+                $event.RestorePointInventory.TotalAfter,
+                $event.RestorePointInventory.ManagedBefore,
+                $event.RestorePointInventory.ManagedAfter,
+                $event.Retention.DeletedCount,
+                $event.Retention.FailedCount) 'INFO'
+        }
+        catch { }
 
         $prettyJson = $event | ConvertTo-Json -Depth 12
         $compactJson = $event | ConvertTo-Json -Depth 12 -Compress
@@ -614,6 +943,8 @@ try {
     Invoke-SelfElevation
     Ensure-Directory -Path $LogDirectory
     Write-Log ('===== System Restore script v{0} started; RunId={1} =====' -f $ScriptVersion, $RunId)
+    Write-Log ('Active staged text log: {0}' -f $LogPath)
+    Write-Log ('Completed text log publish path: {0}' -f $PublishedLogPath)
 
     if (-not (Test-IsAdministrator)) {
         throw 'Administrative privileges are required.'
@@ -631,10 +962,23 @@ try {
     $script:RestorePointsBefore = @(
         Get-AllRestorePoints | ForEach-Object { Convert-RestorePointRecord -RestorePoint $_ }
     )
+    Write-RestorePointInventorySummary -Label 'before' -RestorePoints $script:RestorePointsBefore
 
-    Enable-SystemRestoreProtection -Drive $osDrive
+    Test-SystemRestorePolicy
+    Enable-SystemRestoreProtection -Drive $osDrive -InitializationWaitSeconds 20
     Set-RestorePointCreationFrequency
     Initialize-ShadowCopyServices
+
+    try {
+        $systemRestoreClass = Get-WmiObject -Namespace 'root\default' -List -Class 'SystemRestore' -ErrorAction Stop
+        if ($systemRestoreClass) {
+            Write-Log 'SystemRestore WMI provider is available.' 'OK'
+        }
+    }
+    catch {
+        Write-Log ('SystemRestore WMI provider pre-check failed: {0}' -f $_.Exception.Message) 'WARN'
+    }
+
 
     [void](New-VerifiedRestorePoint `
         -Description $RestorePointDescription `
@@ -652,8 +996,9 @@ try {
     $script:RestorePointsAfter = @(
         Get-AllRestorePoints | ForEach-Object { Convert-RestorePointRecord -RestorePoint $_ }
     )
+    Write-RestorePointInventorySummary -Label 'after' -RestorePoints $script:RestorePointsAfter
 
-    $retentionFailures = @($script:RetentionResults | Where-Object { $_.Status -eq 'Failed' }).Count
+    $retentionFailures = @($script:RetentionResults | ForEach-Object { $_ } | Where-Object { $_.Status -eq 'Failed' }).Count
     if ($retentionFailures -gt 0 -or $script:WarningCount -gt 0) {
         $script:FinalStatus = 'SuccessWithWarnings'
     }
@@ -683,7 +1028,35 @@ finally {
         try { $windowsIdentity = Get-WindowsIdentity } catch { $windowsIdentity = $null }
     }
 
-    Write-Telemetry -WindowsIdentity $windowsIdentity
+    try {
+        Write-Telemetry -WindowsIdentity $windowsIdentity
+    }
+    catch {
+        Write-Log ('Telemetry write failed: {0}' -f $_.Exception.Message) 'ERROR'
+        if ($script:FinalExitCode -eq 0) {
+            $script:FinalStatus = 'TelemetryFailure'
+            $script:FinalExitCode = 4
+        }
+    }
+
+    # Final append before the completed immutable text log enters C:\Logs.
+    Write-Log ('Finalizing {0}. Status={1}; ExitCode={2}; Warnings={3}; Errors={4}' -f `
+        $ScriptName,
+        $script:FinalStatus,
+        $script:FinalExitCode,
+        $script:WarningCount,
+        $script:ErrorCount) $(if ($script:FinalExitCode -eq 0) { 'OK' } else { 'ERROR' })
+
+    if ($null -ne $LogSession) {
+        $publishResult = Publish-MaintenanceLog -LogSession $LogSession
+
+        if ($publishResult.Published) {
+            Write-Host ("Published completed script 12 text log for Elastic: {0}" -f $PublishedLogPath) -ForegroundColor Green
+        }
+        else {
+            Write-Warning ("Script 12 completed text log remains in staging because publication failed: {0}" -f $publishResult.Path)
+        }
+    }
 }
 
 exit $script:FinalExitCode

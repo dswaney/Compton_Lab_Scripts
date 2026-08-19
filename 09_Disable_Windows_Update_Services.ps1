@@ -1,4 +1,4 @@
-﻿#requires -version 5.1
+#requires -version 5.1
 <#
 .SYNOPSIS
     Disables Windows Update background activity after the weekly maintenance window.
@@ -10,8 +10,9 @@
 
 .NOTES
     ScriptName:    09_Disable_Windows_Update_Services.ps1
-    ScriptVersion: 2.0.1
-    LastUpdated:   2026-07-27
+    ScriptVersion: 2.0.6
+    LastUpdated:   2026-08-17
+    Changes:       v2.0.3 uses Maintenance.Framework v2.4 staged text logging.
 
     Script 01 is expected to restore the services and required scheduled tasks before the
     next maintenance cycle. Disabling BITS can affect non-Windows-Update software that uses
@@ -29,12 +30,14 @@ Set-StrictMode -Version 2.0
 $ErrorActionPreference = 'Stop'
 
 $ScriptName = '09_Disable_Windows_Update_Services.ps1'
-$ScriptVersion = '2.0.1'
+$ScriptVersion = '2.0.6'
 $RunId = [guid]::NewGuid().Guid
 $StartTime = Get-Date
 $UtcTimestamp = $StartTime.ToUniversalTime().ToString('o')
 $LogDirectory = 'C:\Logs'
-$RuntimeLogPath = Join-Path $LogDirectory '09_Disable_Windows_Update_Services.log'
+$RuntimeLogPath = $null
+$PublishedLogPath = $null
+$LogSession = $null
 $TelemetryPath = Join-Path $LogDirectory 'Maintenance-Telemetry.ndjson'
 $LatestTelemetryPath = Join-Path $LogDirectory '09_Disable_Windows_Update_Services.latest.json'
 
@@ -45,7 +48,32 @@ $script:OperationResults = New-Object System.Collections.Generic.List[object]
 # Load the shared framework from the same directory as this script.
 $MaintenanceFrameworkPath = 'C:\Scripts\Maintenance.Framework.psm1'
 Import-Module -Name $MaintenanceFrameworkPath -Force -ErrorAction Stop
-$MaintenanceConfig = Initialize-MaintenanceEnvironment -ScriptRoot 'C:\Scripts' -LogRoot 'C:\Logs'
+$MaintenanceConfig = Initialize-MaintenanceEnvironment -ScriptRoot 'C:\Scripts' -LogRoot $LogDirectory
+
+$requiredFrameworkVersion = [version]'2.4.0'
+$currentFrameworkVersion = [version](Get-MaintenanceFrameworkVersion)
+
+if ($currentFrameworkVersion -lt $requiredFrameworkVersion) {
+    throw "Script 09 requires Maintenance.Framework.psm1 version $requiredFrameworkVersion or newer. Installed version: $currentFrameworkVersion"
+}
+
+Archive-MaintenanceLogs `
+    -ScriptName $ScriptName `
+    -LogRoot $LogDirectory `
+    -AdditionalPatterns @(
+        '09_Disable_Windows_Update_Services.log',
+        '*-09_Disable_Windows_Update_Services-*.log'
+    ) | Out-Null
+
+$LogSession = New-MaintenanceStagedLog `
+    -ScriptName $ScriptName `
+    -LogRoot $LogDirectory `
+    -StagingRoot $MaintenanceConfig.LogStagingRoot `
+    -ComputerName $env:COMPUTERNAME `
+    -Timestamp $StartTime
+
+$RuntimeLogPath = [string]$LogSession.WorkingPath
+$PublishedLogPath = [string]$LogSession.PublishedPath
 
 function Initialize-LogDirectory {
     if (-not (Test-Path -LiteralPath $LogDirectory)) {
@@ -63,7 +91,13 @@ function Write-Status {
     )
 
     $timestamp = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
-    $line = "[$timestamp] [$($Level.PadRight(5))] $Message"
+    $computerName = if ($env:COMPUTERNAME) { $env:COMPUTERNAME } else { 'UNKNOWN' }
+    $normalizedLevel = switch ($Level) {
+        'OK'   { 'SUCCESS' }
+        'WARN' { 'WARNING' }
+        default { $Level }
+    }
+    $line = "$timestamp [$computerName] [$normalizedLevel] $Message"
 
     switch ($Level) {
         'INFO'  { Write-Host $line -ForegroundColor Cyan }
@@ -72,7 +106,14 @@ function Write-Status {
         'ERROR' { Write-Host $line -ForegroundColor Red; $script:ErrorCount++ }
     }
 
-    try { Add-Content -LiteralPath $RuntimeLogPath -Value $line -Encoding UTF8 } catch { }
+    try {
+        $activeLogDirectory = Split-Path -Parent $RuntimeLogPath
+        if (-not (Test-Path -LiteralPath $activeLogDirectory -PathType Container)) {
+            New-Item -Path $activeLogDirectory -ItemType Directory -Force | Out-Null
+        }
+        Add-Content -LiteralPath $RuntimeLogPath -Value $line -Encoding UTF8
+    }
+    catch { }
 }
 
 function Add-OperationResult {
@@ -175,6 +216,137 @@ function Invoke-ScCommand {
     }
 }
 
+
+
+function New-StringArrayForJson {
+    param([object[]]$Values)
+
+    [string[]]$items = @(
+        $Values |
+        ForEach-Object { [string]$_ } |
+        Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+    )
+
+    # PowerShell 5.1 can serialize some empty collections unexpectedly when they
+    # are produced through conditional expressions. Return an explicit object[]
+    # so ConvertTo-Json emits [] consistently.
+    if ($items.Count -eq 0) {
+        return ,([object[]]@())
+    }
+
+    return ,([object[]]$items)
+}
+
+function Stop-ServiceProcessSafely {
+    param(
+        [Parameter(Mandatory)][string]$Name,
+        [int]$WaitSeconds = 8
+    )
+
+    $result = [ordered]@{
+        Attempted      = $false
+        Succeeded      = $false
+        Skipped        = $false
+        Reason         = $null
+        ProcessId      = $null
+        HostedServices = @()
+    }
+
+    try {
+        $svc = Get-CimInstance Win32_Service -Filter ("Name='{0}'" -f $Name.Replace("'","''")) -ErrorAction Stop
+        $pid = [int]$svc.ProcessId
+        $result.ProcessId = $pid
+
+        if ($pid -le 0) {
+            $result.Skipped = $true
+            $result.Reason = 'Service has no active process ID.'
+            return [pscustomobject]$result
+        }
+
+        $hosted = @(
+            Get-CimInstance Win32_Service -Filter ("ProcessId={0}" -f $pid) -ErrorAction Stop |
+            Where-Object { [int]$_.ProcessId -eq $pid } |
+            Select-Object -ExpandProperty Name
+        )
+        $result.HostedServices = @($hosted)
+
+        if ($hosted.Count -gt 1) {
+            $result.Skipped = $true
+            $result.Reason = "PID $pid is shared by services: $($hosted -join ', '). Process kill was skipped."
+            return [pscustomobject]$result
+        }
+
+        $result.Attempted = $true
+        Stop-Process -Id $pid -Force -ErrorAction Stop
+
+        $deadline = (Get-Date).AddSeconds($WaitSeconds)
+        do {
+            Start-Sleep -Milliseconds 250
+            $snapshot = @(Get-ServiceSnapshot -Names @($Name))[0]
+            if (-not $snapshot.Exists -or $snapshot.State -eq 'Stopped') {
+                $result.Succeeded = $true
+                $result.Reason = "Force-terminated exclusive service process PID $pid."
+                return [pscustomobject]$result
+            }
+        } while ((Get-Date) -lt $deadline)
+
+        $result.Reason = "PID $pid was terminated, but service state did not verify as Stopped within $WaitSeconds second(s)."
+    }
+    catch {
+        $result.Reason = "Safe process termination failed: $($_.Exception.Message)"
+    }
+
+    return [pscustomobject]$result
+}
+
+function Set-ServiceStartupDisabledWithRetry {
+    param(
+        [Parameter(Mandatory)][string]$Name,
+        [int]$Attempts = 3,
+        [int]$DelayMilliseconds = 750
+    )
+
+    $messages = New-Object System.Collections.Generic.List[string]
+    $succeeded = $false
+
+    for ($attempt = 1; $attempt -le $Attempts; $attempt++) {
+        try {
+            Set-Service -Name $Name -StartupType Disabled -ErrorAction Stop
+            $messages.Add("Set-Service startup disable succeeded on attempt $attempt.")
+        }
+        catch {
+            $messages.Add("Set-Service attempt $attempt failed: $($_.Exception.Message)")
+        }
+
+        Start-Sleep -Milliseconds $DelayMilliseconds
+        $snapshot = @(Get-ServiceSnapshot -Names @($Name))[0]
+        if ($snapshot.Exists -and $snapshot.StartMode -eq 'Disabled') {
+            $succeeded = $true
+            break
+        }
+
+        $scConfig = Invoke-ScCommand -Arguments @('config', $Name, 'start=', 'disabled')
+        if ($scConfig.Succeeded) {
+            $messages.Add("sc.exe config succeeded on attempt $attempt.")
+        }
+        else {
+            $messages.Add("sc.exe config attempt $attempt failed. ExitCode=$($scConfig.ExitCode). $($scConfig.Output)")
+        }
+
+        Start-Sleep -Milliseconds $DelayMilliseconds
+        $snapshot = @(Get-ServiceSnapshot -Names @($Name))[0]
+        if ($snapshot.Exists -and $snapshot.StartMode -eq 'Disabled') {
+            $succeeded = $true
+            break
+        }
+    }
+
+    return [pscustomobject]@{
+        Succeeded = $succeeded
+        Messages  = @($messages | ForEach-Object { $_ })
+    }
+}
+
 function Stop-AndDisableService {
     param(
         [Parameter(Mandatory)][string]$Name,
@@ -194,20 +366,50 @@ function Stop-AndDisableService {
     $operationFailed = $false
 
     if ($before.State -ne 'Stopped') {
+        $normalStopVerified = $false
+
         try {
             Stop-Service -Name $Name -Force -ErrorAction Stop
             $serviceObject = Get-Service -Name $Name -ErrorAction Stop
-            $serviceObject.WaitForStatus('Stopped', [timespan]::FromSeconds(20))
-            $messages.Add('Stopped with Stop-Service.')
+            $serviceObject.WaitForStatus('Stopped', [timespan]::FromSeconds(12))
+            $normalStopVerified = $true
+            $messages.Add('Stopped with Stop-Service within 12 seconds.')
         }
         catch {
+            $messages.Add("Stop-Service did not verify within 12 seconds: $($_.Exception.Message)")
+
             $scStop = Invoke-ScCommand -Arguments @('stop', $Name)
             if ($scStop.Succeeded -or $scStop.Output -match 'service has not been started|service is not started') {
-                $messages.Add('Stop requested with sc.exe.')
+                $messages.Add('Fallback stop requested with sc.exe.')
+
+                try {
+                    $serviceObject = Get-Service -Name $Name -ErrorAction Stop
+                    $serviceObject.WaitForStatus('Stopped', [timespan]::FromSeconds(6))
+                    $normalStopVerified = $true
+                    $messages.Add('Service stopped after sc.exe fallback.')
+                }
+                catch {
+                    $messages.Add('Service still did not verify as stopped after sc.exe fallback.')
+                }
+            }
+            else {
+                $messages.Add("sc.exe stop failed. ExitCode=$($scStop.ExitCode). $($scStop.Output)")
+            }
+        }
+
+        if (-not $normalStopVerified) {
+            $killResult = Stop-ServiceProcessSafely -Name $Name -WaitSeconds 6
+
+            if ($killResult.Succeeded) {
+                $messages.Add($killResult.Reason)
+            }
+            elseif ($killResult.Skipped) {
+                $operationFailed = $true
+                $messages.Add("Process kill skipped for safety. $($killResult.Reason)")
             }
             else {
                 $operationFailed = $true
-                $messages.Add("Could not stop service. sc.exe exit code: $($scStop.ExitCode). $($scStop.Output)")
+                $messages.Add($killResult.Reason)
             }
         }
     }
@@ -215,27 +417,21 @@ function Stop-AndDisableService {
         $messages.Add('Service was already stopped.')
     }
 
-    try {
-        Set-Service -Name $Name -StartupType Disabled -ErrorAction Stop
-        $messages.Add('Startup type set to Disabled with Set-Service.')
+    $startupResult = Set-ServiceStartupDisabledWithRetry -Name $Name -Attempts 3 -DelayMilliseconds 750
+    foreach ($msg in $startupResult.Messages) {
+        $messages.Add($msg)
     }
-    catch {
-        $scConfig = Invoke-ScCommand -Arguments @('config', $Name, 'start=', 'disabled')
-        if ($scConfig.Succeeded) {
-            $messages.Add('Startup type set to Disabled with sc.exe.')
-        }
-        else {
-            $operationFailed = $true
-            $messages.Add("Could not set startup type. sc.exe exit code: $($scConfig.ExitCode). $($scConfig.Output)")
-        }
+    if (-not $startupResult.Succeeded) {
+        $operationFailed = $true
+        $messages.Add('Startup type did not verify as Disabled after 3 attempts.')
     }
 
-    Start-Sleep -Milliseconds 500
+    Start-Sleep -Milliseconds 1000
     $after = @(Get-ServiceSnapshot -Names @($Name))[0]
     $verified = $after.Exists -and $after.StartMode -eq 'Disabled' -and $after.State -eq 'Stopped'
 
     if ($verified) {
-        Write-Status "Verified service stopped and disabled: $Name" 'OK'
+        Write-Status "Service state change: $Name | State: $($before.State) -> $($after.State) | StartMode: $($before.StartMode) -> $($after.StartMode)" 'OK'
         Add-OperationResult -Type 'Service' -Name $Name -Status 'Success' -Message ($messages -join ' ') -Before $before -After $after
     }
     else {
@@ -388,10 +584,10 @@ function Write-Telemetry {
     # PowerShell 5.1 can throw 'Argument types do not match' when a generic List[object]
     # is wrapped directly in @(...). Convert it explicitly to a normal object array.
     $operations = if ($null -ne $script:OperationResults) {
-        [object[]]$script:OperationResults.ToArray()
+        @($script:OperationResults | ForEach-Object { $_ })
     }
     else {
-        [object[]]@()
+        @()
     }
 
     $serviceOperations = @($operations | Where-Object { $_.Type -eq 'Service' })
@@ -415,28 +611,68 @@ function Write-Telemetry {
         ErrorCount = $script:ErrorCount
         WarningCount = $script:WarningCount
         FailureMessage = $FailureMessage
-        KeepBITSAvailable = [bool]$KeepBITSAvailable
-        ScheduledTaskChangesSkipped = [bool]$SkipScheduledTasks
-        UpdatePolicyChangesSkipped = [bool]$SkipUpdatePolicy
-        RebootRecommended = $true
-        PendingReboot = if ($PendingReboot) { [bool]$PendingReboot.Pending } else { $null }
-        PendingRebootReasons = if ($PendingReboot) { @($PendingReboot.Reasons) } else { @() }
-        ServicesTargeted = $serviceOperations.Count
-        ServicesDisabledVerified = @($serviceOperations | Where-Object { $_.Status -eq 'Success' }).Count
-        ServicesFailed = @($serviceOperations | Where-Object { $_.Status -in @('Failed','VerificationFailed') } | ForEach-Object Name)
-        ScheduledTasksTargeted = $taskOperations.Count
-        ScheduledTasksDisabledVerified = @($taskOperations | Where-Object { $_.Status -eq 'Success' }).Count
-        ScheduledTasksFailed = @($taskOperations | Where-Object { $_.Status -in @('Failed','VerificationFailed') } | ForEach-Object Name)
-        PoliciesTargeted = $policyOperations.Count
-        PoliciesVerified = @($policyOperations | Where-Object { $_.Status -eq 'Success' }).Count
-        PolicyFailures = @($policyOperations | Where-Object { $_.Status -in @('Failed','VerificationFailed') } | ForEach-Object Name)
-        ServicesBefore = @($ServicesBefore)
-        ServicesAfter = @($ServicesAfter)
-        ScheduledTasksAfter = @($TasksAfter)
-        UpdatePolicyAfter = @($PolicyAfter)
-        OperationResults = $operations
-        Windows = Get-WindowsBuildInfo
+        TextLogPath = $PublishedLogPath
+
+        windows_update_control = [ordered]@{
+            KeepBITSAvailable = [bool]$KeepBITSAvailable
+            ScheduledTaskChangesSkipped = [bool]$SkipScheduledTasks
+            UpdatePolicyChangesSkipped = [bool]$SkipUpdatePolicy
+
+            Reboot = [ordered]@{
+                Recommended = $true
+                Pending = if ($PendingReboot) { [bool]$PendingReboot.Pending } else { $null }
+                PendingRebootReasonNames = New-StringArrayForJson -Values $(if ($PendingReboot) { @($PendingReboot.Reasons) } else { @() })
+            }
+
+            Services = [ordered]@{
+                Targeted = $serviceOperations.Count
+                DisabledVerified = @($serviceOperations | Where-Object { $_.Status -eq 'Success' }).Count
+                FailedNames = New-StringArrayForJson -Values @(
+                    $serviceOperations |
+                    Where-Object { $_.Status -in @('Failed','VerificationFailed') } |
+                    ForEach-Object { $_.Name }
+                )
+                Before = @($ServicesBefore)
+                After = @($ServicesAfter)
+            }
+
+            ScheduledTasks = [ordered]@{
+                Targeted = $taskOperations.Count
+                DisabledVerified = @($taskOperations | Where-Object { $_.Status -eq 'Success' }).Count
+                FailedNames = New-StringArrayForJson -Values @(
+                    $taskOperations |
+                    Where-Object { $_.Status -in @('Failed','VerificationFailed') } |
+                    ForEach-Object { $_.Name }
+                )
+                After = @($TasksAfter)
+            }
+
+            Policies = [ordered]@{
+                Targeted = $policyOperations.Count
+                Verified = @($policyOperations | Where-Object { $_.Status -eq 'Success' }).Count
+                FailureNames = New-StringArrayForJson -Values @(
+                    $policyOperations |
+                    Where-Object { $_.Status -in @('Failed','VerificationFailed') } |
+                    ForEach-Object { $_.Name }
+                )
+                After = @($PolicyAfter)
+            }
+
+            OperationResults = $operations
+            Windows = Get-WindowsBuildInfo
+        }
     }
+
+    try {
+        $wuc = $event.windows_update_control
+        Write-Status ("Elastic Script 09 summary: ServicesFailed={0}; TasksFailed={1}; PolicyFailures={2}; PendingReboot={3}; RebootReasons={4}" -f `
+            @($wuc.Services.FailedNames).Count,
+            @($wuc.ScheduledTasks.FailedNames).Count,
+            @($wuc.Policies.FailureNames).Count,
+            $wuc.Reboot.Pending,
+            (@($wuc.Reboot.PendingRebootReasonNames) -join ', ')) 'INFO'
+    }
+    catch { }
 
     $jsonCompact = $event | ConvertTo-Json -Depth 12 -Compress
     $jsonFormatted = $event | ConvertTo-Json -Depth 12
@@ -450,6 +686,8 @@ function Write-Telemetry {
 
 Initialize-LogDirectory
 Write-Status "Starting $ScriptName version $ScriptVersion. Run ID: $RunId" 'INFO'
+Write-Status "Active staged text log: $RuntimeLogPath" 'INFO'
+Write-Status "Completed text log publish path: $PublishedLogPath" 'INFO'
 
 $finalStatus = 'Failed'
 $finalExitCode = 1
@@ -562,6 +800,26 @@ finally {
         if ($finalExitCode -eq 0) {
             $finalStatus = 'TelemetryFailure'
             $finalExitCode = 4
+        }
+    }
+
+    # This is the final append to the active text log. Nothing should write to
+    # the file after it is published into C:\Logs for Elastic.
+    Write-Status ("Finalizing {0}. Status={1}; ExitCode={2}; Warnings={3}; Errors={4}" -f `
+        $ScriptName,
+        $finalStatus,
+        $finalExitCode,
+        $script:WarningCount,
+        $script:ErrorCount) $(if ($finalExitCode -eq 0) { 'OK' } else { 'ERROR' })
+
+    if ($null -ne $LogSession) {
+        $publishResult = Publish-MaintenanceLog -LogSession $LogSession
+
+        if ($publishResult.Published) {
+            Write-Host ("Published completed script 09 text log for Elastic: {0}" -f $PublishedLogPath) -ForegroundColor Green
+        }
+        else {
+            Write-Warning ("Script 09 completed text log remains in staging because publication failed: {0}" -f $publishResult.Path)
         }
     }
 }

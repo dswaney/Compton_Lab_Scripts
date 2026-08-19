@@ -1,13 +1,14 @@
-﻿#requires -version 5.1
+#requires -version 5.1
 # =====================================================================
 # ScriptName: 00_Update-Scripts-FromShare.ps1
-# ScriptVersion: 4.1.0
-# LastUpdated: 2026-07-27
+# ScriptVersion: 4.2.3
+# LastUpdated: 2026-08-17
 # Purpose:
 #   Manifest-driven, self-bootstrapping updater for C:\Scripts.
+#   - Uses standardized Elastic-friendly text log format: timestamp, computer, level, message.
 #   - Uses \\filesvr\Labscripts with an IP fallback.
 #   - Downloads Maintenance.Framework.psm1 when missing or changed.
-#   - Validates source and staged files against SHA-256 hashes.
+#   - Validates PowerShell syntax and updater structure before deployment.
 #   - Parses all PowerShell files before installation.
 #   - Creates rollback copies before replacement.
 #   - Updates itself last and safely relaunches.
@@ -23,12 +24,47 @@ $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 
 $ScriptName = '00_Update-Scripts-FromShare.ps1'
-$ScriptVersion = '4.1.0'
+$ScriptVersion = '4.2.3'
 $PreferredSourceRoot = '\\filesvr\Labscripts'
 $FallbackSourceRoot = '\\10.2.3.30\Labscripts'
 $ManifestName = 'DeploymentManifest.json'
 $FrameworkName = 'Maintenance.Framework.psm1'
 $RegisterTasksName = 'Register-Tasks_SYSTEM.ps1'
+$ElasticAgentScriptName = '15_Install_Elastic_Agent.ps1'
+$DeepFreezeStatusScriptName = '16_Check_Deep_Freeze_Status.ps1'
+
+# Supplemental files are deployed directly from the active source share even
+# when they are not yet listed in DeploymentManifest.json.
+[string[]]$SupplementalManagedFiles = @(
+    $ElasticAgentScriptName,
+    $DeepFreezeStatusScriptName
+)
+
+# Only these files are permitted to deploy into C:\Scripts.
+# Files present on the share but not listed here are intentionally ignored.
+[string[]]$ApprovedMaintenanceFiles = @(
+    '00_Update-Scripts-FromShare.ps1',
+    '01_Enable_Windows_Update_Services.ps1',
+    '02_Remove_User_Profiles.ps1',
+    '03_Weekend_Apps_Update.ps1',
+    '05_Weekend_HP_Drivers_Update.ps1',
+    '06_Weekend_Windows_Updates.ps1',
+    '07_Force_Reboot_Install_Updates.ps1',
+    '08_System_Repair.ps1',
+    '09_Disable_Windows_Update_Services.ps1',
+    '10_Sync_System_Time.ps1',
+    '11_Install_SharpDriver_And_PaperCut.ps1',
+    '12_Enable-SystemRestore-And-Create-RestorePoint.ps1',
+    '13_Configure_Autologon_And_Edge.ps1',
+    '14_Endpoint_Health_Inventory.ps1',
+    '15_Install_Elastic_Agent.ps1',
+    '16_Check_Deep_Freeze_Status.ps1',
+    'Get-MaintenanceFleetStatus.ps1',
+    'Invoke-MaintenanceScript.ps1',
+    'Maintenance.Framework.psm1',
+    'Maintenance.Policy.json',
+    'Register-Tasks_SYSTEM.ps1'
+)
 $LocalRoot = 'C:\Scripts'
 $LogRoot = 'C:\Logs'
 $RollbackRoot = 'C:\Scripts\Rollback'
@@ -62,7 +98,7 @@ function Write-UpdaterStatus {
     )
     if ($Level -eq 'WARN') { $script:WarningCount++ }
     if ($Level -eq 'ERROR') { $script:ErrorCount++ }
-    $line = '[{0}] [{1,-6}] {2}' -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $Level, $Message
+    $line = '{0} [{1}] [{2}] {3}' -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $env:COMPUTERNAME, $Level, $Message
     $color = switch ($Level) {
         'ACTION' { 'Yellow' }
         'OK' { 'Green' }
@@ -81,14 +117,44 @@ function Get-Sha256 {
 }
 
 function Test-PowerShellFile {
-    param([Parameter(Mandatory)][string]$Path)
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [ValidateRange(1,20)][int]$MaxReadAttempts = 8,
+        [ValidateRange(50,5000)][int]$InitialRetryDelayMilliseconds = 250
+    )
     $extension = [IO.Path]::GetExtension($Path)
     if ($extension -notin @('.ps1','.psm1','.psd1')) {
         return [pscustomobject]@{ Valid = $true; Errors = @() }
     }
-    $tokens = $null
-    $parseErrors = $null
-    [System.Management.Automation.Language.Parser]::ParseFile($Path,[ref]$tokens,[ref]$parseErrors) | Out-Null
+
+    $parseErrors = @()
+    for ($attempt = 1; $attempt -le $MaxReadAttempts; $attempt++) {
+        $tokens = $null
+        $currentParseErrors = $null
+        [System.Management.Automation.Language.Parser]::ParseFile($Path,[ref]$tokens,[ref]$currentParseErrors) | Out-Null
+        $parseErrors = @($currentParseErrors)
+
+        $fileReadErrors = @(
+            $parseErrors |
+            Where-Object {
+                $_.Extent.StartLineNumber -eq 0 -and
+                $_.Message -match '(?i)file could not be read|cannot access the file|being used by another process|sharing violation'
+            }
+        )
+
+        if ($fileReadErrors.Count -eq 0 -or $attempt -eq $MaxReadAttempts) {
+            break
+        }
+
+        $delay = [math]::Min(
+            $InitialRetryDelayMilliseconds * [math]::Pow(2, $attempt - 1),
+            2000
+        )
+        Write-UpdaterStatus -Message ("Parser read attempt {0}/{1} was blocked for {2}; retrying in {3} ms." -f `
+            $attempt, $MaxReadAttempts, [IO.Path]::GetFileName($Path), [int]$delay) -Level INFO
+        Start-Sleep -Milliseconds ([int]$delay)
+    }
+
     $details = @(
         foreach ($parseError in @($parseErrors)) {
             [pscustomobject]@{
@@ -141,7 +207,7 @@ function Read-DeploymentManifest {
     foreach ($entry in $files) {
         if ([string]::IsNullOrWhiteSpace([string]$entry.Name)) { throw 'A manifest file entry has no Name.' }
         if ([IO.Path]::GetFileName([string]$entry.Name) -ne [string]$entry.Name) { throw "Manifest entry must be a file name without a path: $($entry.Name)" }
-        if ([string]$entry.SHA256 -notmatch '^[A-Fa-f0-9]{64}$') { throw "Manifest entry has an invalid SHA-256 value: $($entry.Name)" }
+        # SHA256 remains optional manifest metadata only; update decisions use the actual source-file hash.
     }
     if (-not ($files | Where-Object Name -eq $FrameworkName)) { throw "Manifest does not contain required framework: $FrameworkName" }
     if (-not ($files | Where-Object Name -eq $ScriptName)) { throw "Manifest does not contain updater: $ScriptName" }
@@ -160,6 +226,65 @@ function Add-Result {
     })
 }
 
+
+function Test-UpdaterSourceStructure {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$Path
+    )
+
+    $requiredFunctions = @(
+        'Ensure-Directory',
+        'Write-UpdaterStatus',
+        'Get-Sha256',
+        'Test-PowerShellFile',
+        'Get-FileVersionText',
+        'Get-ActiveSourceRoot',
+        'Read-DeploymentManifest',
+        'Add-Result',
+        'Install-ManifestEntry',
+        'Import-RequiredFramework',
+        'Write-ExecutionRecord',
+        'Invoke-TaskReconciliation'
+    )
+
+    $parserResult = Test-PowerShellFile -Path $Path
+    if (-not $parserResult.Valid) {
+        $summary = @(
+            $parserResult.Errors |
+            ForEach-Object { "Line $($_.Line), column $($_.Column): $($_.Message)" }
+        ) -join ' | '
+
+        return [pscustomobject]@{
+            Valid   = $false
+            Message = "PowerShell parser validation failed. $summary"
+        }
+    }
+
+    $content = Get-Content -LiteralPath $Path -Raw -ErrorAction Stop
+    $missingFunctions = @()
+
+    foreach ($functionName in $requiredFunctions) {
+        $pattern = '(?m)^\s*function\s+{0}\s*\{{' -f [regex]::Escape($functionName)
+
+        if ($content -notmatch $pattern) {
+            $missingFunctions += $functionName
+        }
+    }
+
+    if ($missingFunctions.Count -gt 0) {
+        return [pscustomobject]@{
+            Valid   = $false
+            Message = "Missing required function(s): $($missingFunctions -join ', ')"
+        }
+    }
+
+    return [pscustomobject]@{
+        Valid   = $true
+        Message = 'Updater source structure is valid.'
+    }
+}
+
 function Install-ManifestEntry {
     param(
         [Parameter(Mandatory)]$Entry,
@@ -176,19 +301,50 @@ function Install-ManifestEntry {
     $localHash = Get-Sha256 -Path $destinationPath
     $localVersion = Get-FileVersionText -Path $destinationPath
 
-    if ($localExists -and $localHash -eq $expectedHash) {
-        Write-UpdaterStatus "$name is current." 'OK'
-        Add-Result -Name $name -Role $role -Status 'Current' -LocalVersion $localVersion -ShareVersion $shareVersion -LocalHash $localHash -ShareHash $expectedHash -BackupPath $null -Message $null
-        return [pscustomobject]@{ Changed=$false; SelfUpdated=$false }
-    }
     if (-not (Test-Path -LiteralPath $sourcePath -PathType Leaf)) { throw "Manifest file is missing from source share: $sourcePath" }
 
+    # The active network share is authoritative. Compare the actual source file
+    # directly with the local file instead of using the manifest SHA as the
+    # update decision. This prevents stale manifest hashes from blocking updates.
     $sourceHash = Get-Sha256 -Path $sourcePath
-    if ($sourceHash -ne $expectedHash) { throw "Source SHA-256 does not match the manifest for $name. Expected $expectedHash; found $sourceHash." }
+
+    if ($localExists -and $localHash -eq $sourceHash) {
+        Write-UpdaterStatus "$name is current." 'OK'
+        Add-Result -Name $name -Role $role -Status 'Current' -LocalVersion $localVersion -ShareVersion $shareVersion -LocalHash $localHash -ShareHash $sourceHash -BackupPath $null -Message $null
+        return [pscustomobject]@{ Changed=$false; SelfUpdated=$false }
+    }
+
+    if ($name -ieq $ScriptName) {
+        $selfValidation = Test-UpdaterSourceStructure -Path $sourcePath
+
+        if (-not $selfValidation.Valid) {
+            Write-UpdaterStatus `
+                -Message "The source copy of $ScriptName is incomplete and will not replace the working local updater. $($selfValidation.Message)" `
+                -Level WARN
+
+            Add-Result `
+                -Name $name `
+                -Role $role `
+                -Status 'SkippedInvalidUpdaterSource' `
+                -LocalVersion $localVersion `
+                -ShareVersion $shareVersion `
+                -LocalHash $localHash `
+                -ShareHash $expectedHash `
+                -BackupPath $null `
+                -Message $selfValidation.Message
+
+            return [pscustomobject]@{
+                Changed     = $false
+                SelfUpdated = $false
+            }
+        }
+
+        Write-UpdaterStatus -Message 'Source updater passed structural validation.' -Level OK
+    }
+
 
     Copy-Item -LiteralPath $sourcePath -Destination $stagedPath -Force -ErrorAction Stop
     $stagedHash = Get-Sha256 -Path $stagedPath
-    if ($stagedHash -ne $expectedHash) { throw "Staged SHA-256 verification failed for $name." }
 
     $parserResult = Test-PowerShellFile -Path $stagedPath
     if (-not $parserResult.Valid) {
@@ -206,7 +362,6 @@ function Install-ManifestEntry {
     try {
         Move-Item -LiteralPath $stagedPath -Destination $destinationPath -Force -ErrorAction Stop
         $installedHash = Get-Sha256 -Path $destinationPath
-        if ($installedHash -ne $expectedHash) { throw "Post-install SHA-256 verification failed for $name." }
         $installedParser = Test-PowerShellFile -Path $destinationPath
         if (-not $installedParser.Valid) { throw "Post-install parser validation failed for $name." }
     }
@@ -227,14 +382,48 @@ function Install-ManifestEntry {
 
     $status = if ($localExists) { 'Updated' } else { 'Installed' }
     Write-UpdaterStatus "$status and verified: $name" 'OK'
-    Add-Result -Name $name -Role $role -Status $status -LocalVersion $localVersion -ShareVersion $shareVersion -LocalHash (Get-Sha256 -Path $destinationPath) -ShareHash $expectedHash -BackupPath $backupPath -Message $null
+    Add-Result -Name $name -Role $role -Status $status -LocalVersion $localVersion -ShareVersion $shareVersion -LocalHash (Get-Sha256 -Path $destinationPath) -ShareHash $sourceHash -BackupPath $backupPath -Message $null
     [pscustomobject]@{ Changed=$true; SelfUpdated=($name -ieq $ScriptName) }
+}
+
+
+function Install-SupplementalManagedFiles {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$SourceRoot
+    )
+
+    foreach ($fileName in $SupplementalManagedFiles) {
+        if ($fileName -notin $ApprovedMaintenanceFiles) {
+            Write-UpdaterStatus -Message "Supplemental file is not approved for maintenance deployment; skipping: $fileName" -Level WARN
+            continue
+        }
+
+        $sourcePath = Join-Path $SourceRoot $fileName
+
+        if (-not (Test-Path -LiteralPath $sourcePath -PathType Leaf)) {
+            Write-UpdaterStatus -Message "Supplemental managed file is not present on the source share; skipping: $fileName" -Level INFO
+            continue
+        }
+
+        $sourceVersion = Get-FileVersionText -Path $sourcePath
+
+        $entry = [pscustomobject]@{
+            Name    = $fileName
+            Role    = 'SupplementalManagedFile'
+            Version = $sourceVersion
+            SHA256  = ''
+        }
+
+        Write-UpdaterStatus -Message "Checking supplemental managed file: $fileName" -Level INFO
+        [void](Install-ManifestEntry -Entry $entry -SourceRoot $SourceRoot)
+    }
 }
 
 function Import-RequiredFramework {
     $frameworkPath = Join-Path $LocalRoot $FrameworkName
     if (-not (Test-Path -LiteralPath $frameworkPath -PathType Leaf)) { throw "Framework bootstrap failed; file is missing: $frameworkPath" }
-    Import-Module -Name $frameworkPath -Force -ErrorAction Stop
+    Import-Module -Name $frameworkPath -Force -DisableNameChecking -ErrorAction Stop
     $script:FrameworkImported = $true
     $configuration = Get-MaintenanceConfiguration -ScriptRoot $LocalRoot -LogRoot $LogRoot
     Write-UpdaterStatus "Framework imported. Version: $($configuration.FrameworkVersion)" 'OK'
@@ -248,7 +437,7 @@ function Write-ExecutionRecord {
         ScriptName=$ScriptName;ScriptVersion=$ScriptVersion;RunId=$RunId;Status=$Status;ExitCode=$ExitCode
         StartTime=$Started.ToString('o');EndTime=$ended.ToString('o');DurationSeconds=[math]::Round(($ended-$Started).TotalSeconds,3)
         SourceShare=$SourceRootUsed;ManifestName=$ManifestName;Relaunched=[bool]$Relaunched
-        WarningCount=$WarningCount;ErrorCount=$ErrorCount;Results=@($Results);FailureMessage=$FailureMessage
+        WarningCount=$WarningCount;ErrorCount=$ErrorCount;Results=@($Results | ForEach-Object { $_ });FailureMessage=$FailureMessage
         Timestamp=$ended.ToUniversalTime().ToString('o')
     }
     try {
@@ -289,16 +478,34 @@ try {
     $manifest = Read-DeploymentManifest -SourceRoot $sourceRoot
     Write-UpdaterStatus "Loaded manifest version $($manifest.ManifestVersion), package version $($manifest.PackageVersion), containing $(@($manifest.Files).Count) file(s)." 'INFO'
 
-    $frameworkEntry = @($manifest.Files | Where-Object Name -eq $FrameworkName)[0]
+    $ignoredManifestEntries = @(
+        $manifest.Files |
+        Where-Object { $_.Name -notin $ApprovedMaintenanceFiles }
+    )
+
+    foreach ($ignoredEntry in $ignoredManifestEntries) {
+        Write-UpdaterStatus -Message "Ignoring non-maintenance manifest entry: $($ignoredEntry.Name)" -Level INFO
+    }
+
+    $approvedManifestEntries = @(
+        $manifest.Files |
+        Where-Object { $_.Name -in $ApprovedMaintenanceFiles }
+    )
+
+    $frameworkEntry = @($approvedManifestEntries | Where-Object Name -eq $FrameworkName)[0]
     [void](Install-ManifestEntry -Entry $frameworkEntry -SourceRoot $sourceRoot)
     Import-RequiredFramework
 
     $orderedEntries = @(
-        $manifest.Files | Where-Object { $_.Name -notin @($FrameworkName,$ScriptName) } | Sort-Object @{Expression={ if ($_.Name -eq $RegisterTasksName) { 1 } else { 0 } }}, Name
+        $approvedManifestEntries | Where-Object { $_.Name -notin (@($FrameworkName,$ScriptName) + $SupplementalManagedFiles) } | Sort-Object @{Expression={ if ($_.Name -eq $RegisterTasksName) { 1 } else { 0 } }}, Name
     )
     foreach ($entry in $orderedEntries) { [void](Install-ManifestEntry -Entry $entry -SourceRoot $sourceRoot) }
 
-    $selfEntry = @($manifest.Files | Where-Object Name -eq $ScriptName)[0]
+    # Deploy supplemental scripts that are intentionally managed outside the
+    # current DeploymentManifest.json. This includes script 15 for Elastic Agent.
+    Install-SupplementalManagedFiles -SourceRoot $sourceRoot
+
+    $selfEntry = @($approvedManifestEntries | Where-Object Name -eq $ScriptName)[0]
     $selfResult = Install-ManifestEntry -Entry $selfEntry -SourceRoot $sourceRoot
     if ($selfResult.SelfUpdated -and -not $Relaunched) {
         Write-UpdaterStatus 'Updater was replaced successfully. Relaunching the new version.' 'ACTION'

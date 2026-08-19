@@ -1,7 +1,11 @@
-﻿# =====================================================================
+# =====================================================================
 # ScriptName: 02_Remove_User_Profiles.ps1
-# ScriptVersion: 2.1.0
-# LastUpdated: 2026-07-27
+# ScriptVersion: 2.3.3
+# LastUpdated: 2026-08-18
+# Changes: v2.3.3 adds stable Elastic telemetry fields for deleted-profile count,
+#          deleted-profile details, measured profile size removed, and disk space recovered.
+#          v2.3.2 uses Maintenance.Framework v2.4 staged text logging so
+#          Elastic only opens the completed immutable text log.
 # =====================================================================
 
 [CmdletBinding(SupportsShouldProcess = $true, ConfirmImpact = 'Low')]
@@ -55,8 +59,11 @@ $script:BaseFileName = "{0}-RemoveUserProfiles-{1}" -f $script:ComputerName, $sc
 $script:YamlLogPath = Join-Path $LogDirectory ($script:BaseFileName + '.yaml')
 $script:RunId = [guid]::NewGuid().ToString('N')
 $script:ScriptName = '02_Remove_User_Profiles.ps1'
-$script:ScriptVersion = '2.1.0'
+$script:ScriptVersion = '2.3.3'
 $script:Domain = $env:USERDNSDOMAIN
+$script:TextLogPath = $null
+$script:PublishedTextLogPath = $null
+$script:TextLogSession = $null
 $script:TelemetryNdjsonPath = Join-Path $LogDirectory 'Maintenance-Telemetry.ndjson'
 $script:LatestTelemetryPath = Join-Path $LogDirectory '02_Remove_User_Profiles.latest.json'
 $script:WarningCount = 0
@@ -82,6 +89,8 @@ $script:Summary = [ordered]@{
     FailedProfiles     = 0
     TimedOutProfiles   = 0
     DeferredProfiles   = 0
+    TotalQueuedProfileSizeGB = 0
+    TotalDeletedProfileSizeGB = 0
     DiskFreeGBBefore   = $null
     DiskFreeGBAfter    = $null
     SpaceReclaimedGB   = $null
@@ -128,6 +137,32 @@ $script:Windows11UIPreferences = @(
 $MaintenanceFrameworkPath = 'C:\Scripts\Maintenance.Framework.psm1'
 Import-Module -Name $MaintenanceFrameworkPath -Force -ErrorAction Stop
 $MaintenanceConfig = Initialize-MaintenanceEnvironment -ScriptRoot 'C:\Scripts' -LogRoot 'C:\Logs'
+
+$requiredFrameworkVersion = [version]'2.4.0'
+$currentFrameworkVersion = [version](Get-MaintenanceFrameworkVersion)
+
+if ($currentFrameworkVersion -lt $requiredFrameworkVersion) {
+    throw "Script 02 requires Maintenance.Framework.psm1 version $requiredFrameworkVersion or newer. Installed version: $currentFrameworkVersion"
+}
+
+Archive-MaintenanceLogs `
+    -ScriptName $script:ScriptName `
+    -LogRoot $LogDirectory `
+    -AdditionalPatterns @(
+        '02_Remove_User_Profiles.log',
+        '*-02_Remove_User_Profiles-*.log'
+    ) | Out-Null
+
+$script:TextLogSession = New-MaintenanceStagedLog `
+    -ScriptName $script:ScriptName `
+    -LogRoot $LogDirectory `
+    -StagingRoot $MaintenanceConfig.LogStagingRoot `
+    -ComputerName $script:ComputerName `
+    -Timestamp $script:RunStart
+
+$script:TextLogPath = [string]$script:TextLogSession.WorkingPath
+$script:PublishedTextLogPath = [string]$script:TextLogSession.PublishedPath
+
 
 function Ensure-Directory {
     param([Parameter(Mandatory)][string]$Path)
@@ -187,6 +222,7 @@ function Write-ExecutionTelemetry {
             WarningCount               = $script:WarningCount
             ErrorCount                 = $script:ErrorCount
             Timestamp                  = (Get-Date).ToUniversalTime().ToString('o')
+            TextLogPath                = $script:PublishedTextLogPath
             UsersRoot                  = $UsersRoot
             OlderThanDays              = $OlderThanDays
             FoundProfiles              = $script:Summary.FoundProfiles
@@ -195,18 +231,39 @@ function Write-ExecutionTelemetry {
             SkippedSpecial             = $script:Summary.SkippedSpecial
             SkippedByAge               = $script:Summary.SkippedByAge
             QueuedProfiles             = $script:Summary.QueuedProfiles
-            DeletedProfiles            = $script:Summary.DeletedProfiles
             FailedProfiles             = $script:Summary.FailedProfiles
             TimedOutProfiles           = $script:Summary.TimedOutProfiles
             DeferredProfiles           = $script:Summary.DeferredProfiles
-            OneDriveTasksRemoved       = $script:Summary.OneDriveTasksRemoved
-            DiskFreeGBBefore           = $script:Summary.DiskFreeGBBefore
-            DiskFreeGBAfter            = $script:Summary.DiskFreeGBAfter
-            SpaceReclaimedGB           = $script:Summary.SpaceReclaimedGB
-            EdgeInPrivateMatched       = $script:EdgeInPrivateMatched
-            EdgeInPrivateConfigured    = $script:EdgeInPrivateConfigured
-            DeletedProfileNames        = @($script:DeletedProfileDetails | ForEach-Object { $_.ProfileName })
-            FailedProfileNames         = @($script:FailedProfileDetails | ForEach-Object { $_.ProfileName })
+            TotalQueuedProfileSizeGB     = [double]$script:Summary.TotalQueuedProfileSizeGB
+
+            # Stable numeric fields intended for Kibana/Elastic aggregations.
+            DeletedProfileCount          = [int]$script:Summary.DeletedProfiles
+            TotalDeletedProfileSizeGB    = [double]$script:Summary.TotalDeletedProfileSizeGB
+            DiskFreeGBBefore             = $script:Summary.DiskFreeGBBefore
+            DiskFreeGBAfter              = $script:Summary.DiskFreeGBAfter
+            SpaceReclaimedGB             = if ($null -eq $script:Summary.SpaceReclaimedGB) { 0.0 } else { [double]$script:Summary.SpaceReclaimedGB }
+
+            OneDriveTasksRemoved         = $script:Summary.OneDriveTasksRemoved
+            EdgeInPrivateMatched         = $script:EdgeInPrivateMatched
+            EdgeInPrivateConfigured      = $script:EdgeInPrivateConfigured
+
+            DeletedProfileNames          = @($script:DeletedProfileDetails | ForEach-Object { $_.ProfileName })
+
+            # Use a new detail field name so it can remain an object/array field
+            # without ever colliding with the numeric DeletedProfileCount field.
+            DeletedProfileDetails        = @($script:DeletedProfileDetails | ForEach-Object {
+                [ordered]@{
+                    ProfileName             = $_.ProfileName
+                    LocalPath               = $_.LocalPath
+                    SID                     = $_.SID
+                    ProfileSizeBytes        = $_.ProfileSizeBytes
+                    ProfileSizeGB           = $_.ProfileSizeGB
+                    SizeMeasurementComplete = $_.SizeMeasurementComplete
+                    DeleteSeconds           = $_.DeleteSeconds
+                }
+            })
+
+            FailedProfileNames          = @($script:FailedProfileDetails | ForEach-Object { $_.ProfileName })
             DeferredProfileNames       = @($script:DeferredProfileDetails | ForEach-Object { $_.ProfileName })
             SkippedProfileCountsByReason = @($script:SkippedProfileDetails | Group-Object Reason | ForEach-Object {
                 [ordered]@{ Reason = $_.Name; Count = $_.Count }
@@ -249,6 +306,27 @@ function Complete-ScriptExecution {
 
     Write-YamlLog
     Write-ExecutionTelemetry -Status $status -ExitCode $ExitCode
+
+    # Final write to the active text log. Nothing should append after the
+    # completed file is published into C:\Logs for Elastic.
+    Write-Log ("Completed {0}. Status={1}; ExitCode={2}; Warnings={3}; Errors={4}" -f `
+        $script:ScriptName,
+        $status,
+        $ExitCode,
+        $script:WarningCount,
+        $script:ErrorCount) $(if ($ExitCode -eq 0) { 'OK' } else { 'ERROR' })
+
+    if ($null -ne $script:TextLogSession) {
+        $publishResult = Publish-MaintenanceLog -LogSession $script:TextLogSession
+
+        if ($publishResult.Published) {
+            Write-Host ("Published completed script 02 text log for Elastic: {0}" -f $script:PublishedTextLogPath) -ForegroundColor Green
+        }
+        else {
+            Write-Warning ("Script 02 completed text log remains in staging because publication failed: {0}" -f $publishResult.Path)
+        }
+    }
+
     exit $ExitCode
 }
 
@@ -314,6 +392,7 @@ function Write-YamlLog {
         $lines.Add("  start_time: $(ConvertTo-YamlScalar $script:Summary.StartTime)") | Out-Null
         $lines.Add("  end_time: $(ConvertTo-YamlScalar $script:Summary.EndTime)") | Out-Null
         $lines.Add("  yaml_log_path: $(ConvertTo-YamlScalar $script:YamlLogPath)") | Out-Null
+        $lines.Add("  text_log_path: $(ConvertTo-YamlScalar $script:PublishedTextLogPath)") | Out-Null
         $lines.Add("  run_id: $(ConvertTo-YamlScalar $script:RunId)") | Out-Null
         $lines.Add('') | Out-Null
 
@@ -350,7 +429,7 @@ function Write-YamlLog {
         $deferredYamlItems = @($script:DeferredProfileDetails.ToArray())
         $failedYamlItems   = @($script:FailedProfileDetails.ToArray())
 
-        Write-YamlList -Lines $lines -Name 'deleted_profiles' -Items $deletedYamlItems -Properties @('ProfileName','LocalPath','SID','Loaded','Special','CreatedTime','LastUseTime','DaysOnSystem','DeleteSeconds','Message')
+        Write-YamlList -Lines $lines -Name 'deleted_profiles' -Items $deletedYamlItems -Properties @('ProfileName','LocalPath','SID','Loaded','Special','CreatedTime','LastUseTime','DaysOnSystem','ProfileSizeBytes','ProfileSizeGB','SizeMeasurementComplete','DeleteSeconds','Message')
         $lines.Add('') | Out-Null
         Write-YamlList -Lines $lines -Name 'skipped_profiles' -Items $skippedYamlItems -Properties @('ProfileName','LocalPath','SID','Reason','CreatedTime','LastUseTime','DaysOnSystem')
         $lines.Add('') | Out-Null
@@ -368,20 +447,35 @@ function Write-YamlLog {
 function Write-Log {
     param(
         [Parameter(Mandatory)][string]$Message,
-        [ValidateSet('INFO','OK','WARN','ERROR')][string]$Level = 'INFO'
+        [ValidateSet('INFO','OK','WARN','ERROR','SUCCESS','WARNING')][string]$Level = 'INFO'
     )
 
-    if ($Level -eq 'WARN') { $script:WarningCount++ }
-    elseif ($Level -eq 'ERROR') { $script:ErrorCount++ }
+    $normalizedLevel = switch ($Level) {
+        'OK'   { 'SUCCESS' }
+        'WARN' { 'WARNING' }
+        default { $Level }
+    }
+
+    if ($normalizedLevel -eq 'WARNING') { $script:WarningCount++ }
+    elseif ($normalizedLevel -eq 'ERROR') { $script:ErrorCount++ }
 
     $timestamp = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
-    $line = "[$timestamp] [$('{0,-5}' -f $Level)] $Message"
+    $line = "$timestamp [$($script:ComputerName)] [$normalizedLevel] $Message"
 
-    switch ($Level) {
-        'INFO'  { Write-Host $line -ForegroundColor Cyan }
-        'OK'    { Write-Host $line -ForegroundColor Green }
-        'WARN'  { Write-Host $line -ForegroundColor Yellow }
-        'ERROR' { Write-Host $line -ForegroundColor Red }
+    try {
+        $activeTextLogDirectory = Split-Path -Parent $script:TextLogPath
+        Ensure-Directory -Path $activeTextLogDirectory
+        Add-Content -LiteralPath $script:TextLogPath -Value $line -Encoding UTF8
+    }
+    catch {
+        Write-Warning "Failed to write text log '$($script:TextLogPath)': $($_.Exception.Message)"
+    }
+
+    switch ($normalizedLevel) {
+        'INFO'    { Write-Host $line -ForegroundColor Cyan }
+        'SUCCESS' { Write-Host $line -ForegroundColor Green }
+        'WARNING' { Write-Host $line -ForegroundColor Yellow }
+        'ERROR'   { Write-Host $line -ForegroundColor Red }
     }
 }
 
@@ -490,6 +584,37 @@ function Get-ProfileAgeData {
         CreatedTime  = $createdTime
         LastUseTime  = $normalizedLastUseTime
         DaysOnSystem = $daysOnSystem
+    }
+}
+
+function Get-ProfileSizeData {
+    param([Parameter(Mandatory)][string]$ProfilePath)
+
+    if (-not (Test-Path -LiteralPath $ProfilePath)) {
+        return [PSCustomObject]@{
+            Bytes               = [int64]0
+            GB                  = 0
+            MeasurementComplete = $false
+            ErrorCount          = 1
+        }
+    }
+
+    $enumerationErrors = @()
+    [int64]$totalBytes = 0
+
+    try {
+        Get-ChildItem -LiteralPath $ProfilePath -File -Recurse -Force -ErrorAction SilentlyContinue -ErrorVariable +enumerationErrors |
+            ForEach-Object { $totalBytes += [int64]$_.Length }
+    }
+    catch {
+        $enumerationErrors += $_
+    }
+
+    return [PSCustomObject]@{
+        Bytes               = $totalBytes
+        GB                  = [math]::Round($totalBytes / 1GB, 3)
+        MeasurementComplete = ($enumerationErrors.Count -eq 0)
+        ErrorCount          = $enumerationErrors.Count
     }
 }
 
@@ -884,8 +1009,12 @@ function Invoke-ParallelProfileDeletion {
             try {
                 Remove-ProfileRegistration -Sid $item.SID -ProfilePath $item.LocalPath -ProfileName $item.ProfileName
                 $script:Summary.DeletedProfiles++
+                $script:Summary.TotalDeletedProfileSizeGB = [math]::Round(
+                    $script:Summary.TotalDeletedProfileSizeGB + [double]$item.ProfileSizeGB,
+                    3
+                )
                 Add-StateItemUnique -State $state -ListName 'Completed' -Value $item.LocalPath
-                Write-Log "Successfully deleted profile: $($item.ProfileName) ($($item.LocalPath))" 'OK'
+                Write-Log "Successfully deleted profile: $($item.ProfileName) ($($item.LocalPath)) | Measured size: $($item.ProfileSizeGB) GB ($($item.ProfileSizeBytes) bytes) | Size measurement complete: $($item.SizeMeasurementComplete)" 'OK'
 
                 $removedOneDriveTasks = Remove-OneDriveTasksForProfile `
                     -Sid $item.SID `
@@ -901,6 +1030,9 @@ function Invoke-ParallelProfileDeletion {
                     CreatedTime   = $item.CreatedTime
                     LastUseTime   = $item.LastUseTime
                     DaysOnSystem  = $item.DaysOnSystem
+                    ProfileSizeBytes = $item.ProfileSizeBytes
+                    ProfileSizeGB = $item.ProfileSizeGB
+                    SizeMeasurementComplete = $item.SizeMeasurementComplete
                     DeleteSeconds = $jobResult.DurationSeconds
                     Message       = $jobResult.Message
                 }) | Out-Null
@@ -1021,6 +1153,10 @@ function Invoke-ParallelProfileDeletion {
                 try {
                     Remove-ProfileRegistration -Sid $item.SID -ProfilePath $item.LocalPath -ProfileName $item.ProfileName
                     $script:Summary.DeletedProfiles++
+                    $script:Summary.TotalDeletedProfileSizeGB = [math]::Round(
+                        $script:Summary.TotalDeletedProfileSizeGB + [double]$item.ProfileSizeGB,
+                        3
+                    )
                     $removedOneDriveTasks = Remove-OneDriveTasksForProfile `
                         -Sid $item.SID `
                         -ProfileName $item.ProfileName
@@ -1048,6 +1184,10 @@ function Invoke-ParallelProfileDeletion {
             if (-not (Test-Path -LiteralPath $item.LocalPath)) {
                 Write-Log "Native profile removal deleted the folder before job start: $($item.ProfileName) ($($item.LocalPath))" 'OK'
                 $script:Summary.DeletedProfiles++
+                $script:Summary.TotalDeletedProfileSizeGB = [math]::Round(
+                    $script:Summary.TotalDeletedProfileSizeGB + [double]$item.ProfileSizeGB,
+                    3
+                )
                 $removedOneDriveTasks = Remove-OneDriveTasksForProfile `
                     -Sid $item.SID `
                     -ProfileName $item.ProfileName
@@ -1063,6 +1203,9 @@ function Invoke-ParallelProfileDeletion {
                     CreatedTime   = $item.CreatedTime
                     LastUseTime   = $item.LastUseTime
                     DaysOnSystem  = $item.DaysOnSystem
+                    ProfileSizeBytes = $item.ProfileSizeBytes
+                    ProfileSizeGB = $item.ProfileSizeGB
+                    SizeMeasurementComplete = $item.SizeMeasurementComplete
                     DeleteSeconds = 0
                     Message       = 'Removed by Win32_UserProfile cleanup before robocopy job.'
                 }) | Out-Null
@@ -1360,6 +1503,8 @@ Write-Log "Max parallel profile deletes: $MaxParallelProfileDeletes" 'INFO'
 Write-Log "Profile cleanup time budget: $ProfileCleanupTimeLimitMinutes minute(s)" 'INFO'
 Write-Log "Profile folder job timeout: $ProfileFolderJobTimeoutMinutes minute(s)" 'INFO'
 Write-Log "Profile cleanup state path: $ProfileCleanupStatePath" 'INFO'
+Write-Log "Active staged text log path: $($script:TextLogPath)" 'INFO'
+Write-Log "Completed text log publish path: $($script:PublishedTextLogPath)" 'INFO'
 Write-Log "YAML log path: $($script:YamlLogPath)" 'INFO'
 
 try {
@@ -1460,6 +1605,15 @@ foreach ($profile in $allUserProfiles) {
     }
 
     $targetDescription = "$profileName ($profilePath)"
+    Write-Log "Measuring profile size before deletion: $profileName ($profilePath)" 'INFO'
+    $profileSize = Get-ProfileSizeData -ProfilePath $profilePath
+    if ($profileSize.MeasurementComplete) {
+        Write-Log "Profile size measured: $profileName ($profilePath) | $($profileSize.GB) GB ($($profileSize.Bytes) bytes)" 'INFO'
+    }
+    else {
+        Write-Log "Profile size was only partially measured because $($profileSize.ErrorCount) item(s) could not be read: $profileName ($profilePath) | Partial size: $($profileSize.GB) GB ($($profileSize.Bytes) bytes)" 'WARN'
+    }
+
     if ($PSCmdlet.ShouldProcess($targetDescription, 'Queue profile folder for capped parallel timeout-safe deletion and remove profile registration')) {
         $profilesToDelete.Add([PSCustomObject]@{
             ProfileName  = $profileName
@@ -1470,12 +1624,19 @@ foreach ($profile in $allUserProfiles) {
             CreatedTime  = $ageData.CreatedTime
             LastUseTime  = $ageData.LastUseTime
             DaysOnSystem = $ageData.DaysOnSystem
+            ProfileSizeBytes = $profileSize.Bytes
+            ProfileSizeGB = $profileSize.GB
+            SizeMeasurementComplete = $profileSize.MeasurementComplete
         }) | Out-Null
     }
 }
 
 $script:Summary.QueuedProfiles = $profilesToDelete.Count
+$script:Summary.TotalQueuedProfileSizeGB = [math]::Round((
+    @($profilesToDelete | Measure-Object -Property ProfileSizeGB -Sum).Sum
+), 3)
 Write-Log "Queued $($profilesToDelete.Count) profile(s) for capped parallel deletion." 'INFO'
+Write-Log "Total measured size of queued profiles: $($script:Summary.TotalQueuedProfileSizeGB) GB" 'INFO'
 Write-YamlLog
 
 if ($profilesToDelete.Count -gt 0) {
@@ -1497,7 +1658,11 @@ Write-YamlLog
 $script:Summary.EndTime = Get-Date
 
 Write-Log 'Profile cleanup complete.' 'INFO'
-Write-Log "Summary: Found=$($script:Summary.FoundProfiles), Excluded=$($script:Summary.ExcludedProfiles), LoadedSkipped=$($script:Summary.SkippedLoaded), SpecialSkipped=$($script:Summary.SkippedSpecial), AgeSkipped=$($script:Summary.SkippedByAge), Queued=$($script:Summary.QueuedProfiles), Deleted=$($script:Summary.DeletedProfiles), OneDriveTasksRemoved=$($script:Summary.OneDriveTasksRemoved), Failed=$($script:Summary.FailedProfiles), TimedOut=$($script:Summary.TimedOutProfiles), Deferred=$($script:Summary.DeferredProfiles)" 'INFO'
+Write-Log "Summary: Found=$($script:Summary.FoundProfiles), Excluded=$($script:Summary.ExcludedProfiles), LoadedSkipped=$($script:Summary.SkippedLoaded), SpecialSkipped=$($script:Summary.SkippedSpecial), AgeSkipped=$($script:Summary.SkippedByAge), Queued=$($script:Summary.QueuedProfiles), QueuedSizeGB=$($script:Summary.TotalQueuedProfileSizeGB), Deleted=$($script:Summary.DeletedProfiles), DeletedMeasuredSizeGB=$($script:Summary.TotalDeletedProfileSizeGB), OneDriveTasksRemoved=$($script:Summary.OneDriveTasksRemoved), Failed=$($script:Summary.FailedProfiles), TimedOut=$($script:Summary.TimedOutProfiles), Deferred=$($script:Summary.DeferredProfiles)" 'INFO'
+Write-Log ("Elastic profile-cleanup summary: DeletedProfileCount={0}; TotalDeletedProfileSizeGB={1}; SpaceReclaimedGB={2}" -f `
+    $script:Summary.DeletedProfiles,
+    $script:Summary.TotalDeletedProfileSizeGB,
+    $(if ($null -eq $script:Summary.SpaceReclaimedGB) { 0 } else { $script:Summary.SpaceReclaimedGB })) 'INFO'
 
 Write-YamlLog
 

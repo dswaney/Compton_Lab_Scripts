@@ -1,8 +1,12 @@
-﻿# =====================================================================
+# =====================================================================
 # ScriptName: 07_Force_Reboot_Install_Updates.ps1
-# ScriptVersion: 2.0.0
-# LastUpdated: 2026-07-27
-# ChangeLog: Added common Elastic execution telemetry, reboot verification, boot/uptime and logged-on-user snapshots, Windows build/update status, persistent-flag reporting, and safer opt-in-only registry flag cleanup.
+# ScriptVersion: 2.0.5
+# LastUpdated: 2026-08-18
+# ChangeLog: v2.0.5 adds -StartupResume support. Startup-triggered executions exit immediately when no reboot cycle is active.
+#            v2.0.4 extends the cycle to a maximum of three reboots, then performs a final no-more-reboots verification pass.
+#            Adds structured persistent-reboot cause telemetry including likely source and affected file/change details.
+#            v2.0.3 adds Maintenance.Framework v2.4 staged text logging and publishes the completed log before script exit/reboot.
+#            Previous telemetry, reboot verification, boot/uptime, update status, and safe reboot-flag handling remain intact.
 # =====================================================================
 
 [CmdletBinding()]
@@ -12,18 +16,23 @@ param(
     [string]$LogDirectory = 'C:\Logs',
     [string]$StateDirectory = 'C:\ProgramData\MISMaintenance\State',
     [string]$StateFileName = '07_Force_Reboot_Install_Updates_State.json',
-    [switch]$AllowUnsafeRebootFlagCleanup
+    [switch]$AllowUnsafeRebootFlagCleanup,
+    [switch]$StartupResume
 )
 
 $ErrorActionPreference = 'Stop'
 
 $script:RunStart         = Get-Date
 $script:ScriptName       = '07_Force_Reboot_Install_Updates.ps1'
-$script:ScriptVersion    = '2.0.0'
+$script:ScriptVersion    = '2.0.5'
 $script:RunId            = [guid]::NewGuid().ToString()
 $script:Domain           = if ($env:USERDNSDOMAIN) { $env:USERDNSDOMAIN } else { $env:USERDOMAIN }
 $script:TelemetryPath    = Join-Path $LogDirectory 'Maintenance-Telemetry.ndjson'
 $script:LatestJsonPath   = Join-Path $LogDirectory '07_Force_Reboot_Install_Updates.latest.json'
+$script:TextLogPath      = $null
+$script:PublishedLogPath = $null
+$script:LogSession       = $null
+$script:LogPublished     = $false
 $script:ExitCode         = 0
 $script:BootSnapshot     = $null
 $script:UpdateSnapshot   = $null
@@ -37,6 +46,9 @@ $script:YamlLogPath      = $null
 $script:OverallResult    = 'Unknown'
 $script:FailureMessage   = $null
 $script:CurrentFlags     = @()
+$script:RebootCauseDetails = @()
+$script:PersistentAfterThirdReboot = $false
+$script:FinalVerificationAfterThirdReboot = $false
 $script:ClearResults     = @()
 $script:ActionHistory    = @()
 $script:CurrentStage     = 0
@@ -48,8 +60,15 @@ $script:MutexAcquired    = $false
 
 # Load the shared framework from the same directory as this script.
 $MaintenanceFrameworkPath = 'C:\Scripts\Maintenance.Framework.psm1'
-Import-Module -Name $MaintenanceFrameworkPath -Force -ErrorAction Stop
-$MaintenanceConfig = Initialize-MaintenanceEnvironment -ScriptRoot 'C:\Scripts' -LogRoot 'C:\Logs'
+Import-Module -Name $MaintenanceFrameworkPath -Force -DisableNameChecking -ErrorAction Stop
+$MaintenanceConfig = Initialize-MaintenanceEnvironment -ScriptRoot 'C:\Scripts' -LogRoot $LogDirectory
+
+$requiredFrameworkVersion = [version]'2.4.0'
+$currentFrameworkVersion = [version](Get-MaintenanceFrameworkVersion)
+
+if ($currentFrameworkVersion -lt $requiredFrameworkVersion) {
+    throw "Script 07 requires Maintenance.Framework.psm1 version $requiredFrameworkVersion or newer. Installed version: $currentFrameworkVersion"
+}
 
 function Ensure-Folder {
     param(
@@ -68,6 +87,25 @@ function Initialize-Paths {
 
     $script:TelemetryPath  = Join-Path $LogDirectory 'Maintenance-Telemetry.ndjson'
     $script:LatestJsonPath = Join-Path $LogDirectory '07_Force_Reboot_Install_Updates.latest.json'
+
+    Archive-MaintenanceLogs `
+        -ScriptName $script:ScriptName `
+        -LogRoot $LogDirectory `
+        -AdditionalPatterns @(
+            '07_Force_Reboot_Install_Updates.log',
+            '*-07_Force_Reboot_Install_Updates-*.log'
+        ) | Out-Null
+
+    $script:LogSession = New-MaintenanceStagedLog `
+        -ScriptName $script:ScriptName `
+        -LogRoot $LogDirectory `
+        -StagingRoot $MaintenanceConfig.LogStagingRoot `
+        -ComputerName $script:ComputerName `
+        -Timestamp $script:RunStart
+
+    $script:TextLogPath = [string]$script:LogSession.WorkingPath
+    $script:PublishedLogPath = [string]$script:LogSession.PublishedPath
+
     $timestamp = $script:RunStart.ToString('yyyy-MM-dd_HH-mm-ss')
     $baseName = "$($script:ComputerName)-ForceRebootInstallUpdates-$timestamp"
     $script:YamlLogPath = Join-Path $LogDirectory ($baseName + '.yaml')
@@ -81,7 +119,9 @@ function Initialize-SingleInstanceLock {
         if (-not $script:Mutex.WaitOne(0)) {
             Write-Status 'Another instance of Script 07 is already running. Exiting to prevent state-file corruption.' 'WARN'
             $script:OverallResult = 'SkippedAlreadyRunning'
+            $script:ExitCode = 0
             Write-YamlLog
+            Complete-TextLogPublication -Reason 'Skipped because another instance is running'
             exit 0
         }
 
@@ -150,6 +190,9 @@ function Confirm-StateWriteBeforeReboot {
         if ($script:LatestJsonPath) {
             Confirm-FileWriteToDisk -Path $script:LatestJsonPath
         }
+        if ($script:TextLogPath) {
+            Confirm-FileWriteToDisk -Path $script:TextLogPath
+        }
         Start-Sleep -Seconds 3
         Write-Status 'State and YAML log writes confirmed before reboot.' 'INFO'
     }
@@ -163,24 +206,68 @@ function Write-Status {
         [Parameter(Mandatory)]
         [string]$Message,
 
-        [ValidateSet('INFO','OK','WARN','ERROR')]
+        [ValidateSet('INFO','OK','WARN','ERROR','SUCCESS','WARNING')]
         [string]$Level = 'INFO'
     )
 
-    $timestamp = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
-    $line = "[$timestamp] [$('{0,-5}' -f $Level)] $Message"
+    $normalizedLevel = switch ($Level) {
+        'OK'   { 'SUCCESS' }
+        'WARN' { 'WARNING' }
+        default { $Level }
+    }
 
-    switch ($Level) {
-        'INFO'  { Write-Host $line -ForegroundColor Cyan }
-        'OK'    { Write-Host $line -ForegroundColor Green }
-        'WARN'  { Write-Host $line -ForegroundColor Yellow }
-        'ERROR' { Write-Host $line -ForegroundColor Red }
+    $timestamp = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
+    $line = "$timestamp [$($script:ComputerName)] [$normalizedLevel] $Message"
+
+    switch ($normalizedLevel) {
+        'INFO'    { Write-Host $line -ForegroundColor Cyan }
+        'SUCCESS' { Write-Host $line -ForegroundColor Green }
+        'WARNING' { Write-Host $line -ForegroundColor Yellow }
+        'ERROR'   { Write-Host $line -ForegroundColor Red }
+    }
+
+    try {
+        $activeTextLogDirectory = Split-Path -Parent $script:TextLogPath
+        Ensure-Folder -Path $activeTextLogDirectory
+        Add-Content -LiteralPath $script:TextLogPath -Value $line -Encoding UTF8
+    }
+    catch {
+        Write-Warning "Failed to write text log '$($script:TextLogPath)': $($_.Exception.Message)"
     }
 
     $script:ActionHistory += [PSCustomObject]@{
         Time    = $timestamp
-        Level   = $Level
+        Level   = $normalizedLevel
         Message = $Message
+    }
+}
+
+function Complete-TextLogPublication {
+    [CmdletBinding()]
+    param(
+        [string]$Reason = 'Script completion'
+    )
+
+    if ($script:LogPublished -or $null -eq $script:LogSession) {
+        return
+    }
+
+    # This is intentionally the final text-log append. Do not call Write-Status
+    # after this point because Elastic may open the published file immediately.
+    Write-Status ("Finalizing text log before exit. Reason={0}; Result={1}; ExitCode={2}" -f `
+        $Reason,
+        $script:OverallResult,
+        $script:ExitCode) 'INFO'
+
+    Confirm-FileWriteToDisk -Path $script:TextLogPath
+    $publishResult = Publish-MaintenanceLog -LogSession $script:LogSession
+
+    if ($publishResult.Published) {
+        $script:LogPublished = $true
+        Write-Host ("Published completed script 07 text log for Elastic: {0}" -f $script:PublishedLogPath) -ForegroundColor Green
+    }
+    else {
+        Write-Warning ("Script 07 completed text log remains in staging because publication failed: {0}" -f $publishResult.Path)
     }
 }
 
@@ -232,7 +319,7 @@ function Get-LoggedOnUserSnapshot {
     catch {
         Write-Status "Unable to enumerate interactive users: $($_.Exception.Message)" 'WARN'
     }
-    return @($results)
+    return @($results | ForEach-Object { $_ })
 }
 
 function Get-WindowsUpdateSnapshot {
@@ -298,18 +385,20 @@ function Get-ExecutionStatus {
     if ($script:RebootIssued) { return 'SuccessRebootInitiated' }
     if ($script:OverallResult -match 'Persistent') { return 'SuccessWithWarnings' }
     if (@($script:ActionHistory | Where-Object Level -eq 'ERROR').Count -gt 0) { return 'Failed' }
-    if (@($script:ActionHistory | Where-Object Level -eq 'WARN').Count -gt 0) { return 'SuccessWithWarnings' }
+    if (@($script:ActionHistory | Where-Object Level -eq 'WARNING').Count -gt 0) { return 'SuccessWithWarnings' }
     return 'Success'
 }
 
 function Write-ExecutionTelemetry {
     try {
         $runEnd = Get-Date
-        $warnings = @($script:ActionHistory | Where-Object Level -eq 'WARN').Count
+        $warnings = @($script:ActionHistory | Where-Object Level -eq 'WARNING').Count
         $errors = @($script:ActionHistory | Where-Object Level -eq 'ERROR').Count
         $status = Get-ExecutionStatus
         $flags = @($script:CurrentFlags)
         $clear = @($script:ClearResults)
+        $causeDetails = @($script:RebootCauseDetails)
+        $previousUpdateContext = Get-PreviousWindowsUpdateContext
 
         $event = [ordered]@{
             EventType                   = 'maintenance.execution'
@@ -340,12 +429,18 @@ function Write-ExecutionTelemetry {
             PendingReboot                = ($flags.Count -gt 0)
             PendingRebootReasonCount     = $flags.Count
             PendingRebootReasons        = @($flags | Select-Object Name,Type,Path,ValueName,Details)
+            RebootCauseDetails           = $causeDetails
+            FinalVerificationAfterThirdReboot = [bool]$script:FinalVerificationAfterThirdReboot
+            PersistentAfterThirdReboot   = [bool]$script:PersistentAfterThirdReboot
+            PreviousWindowsUpdateContext = $previousUpdateContext
+            StartupResumeInvocation      = [bool]$StartupResume
             UnsafeFlagCleanupEnabled     = [bool]$AllowUnsafeRebootFlagCleanup
             ClearActionCount             = $clear.Count
             ClearActions                 = $clear
             WindowsUpdate                = $script:UpdateSnapshot
             StateFilePath                = $script:StateFilePath
             StateRecovered               = $script:StateRecovered
+            TextLogPath                  = $script:PublishedLogPath
         }
 
         $jsonCompact = $event | ConvertTo-Json -Depth 14 -Compress
@@ -455,6 +550,134 @@ function Get-RegistryValueSafe {
     }
 }
 
+
+function Get-RebootCauseDetails {
+    param(
+        [Parameter(Mandatory)]
+        [array]$Flags
+    )
+
+    $results = New-Object System.Collections.Generic.List[object]
+
+    foreach ($flag in @($Flags)) {
+        $likelySource = 'Unknown'
+        $affectedItems = @()
+        $explanation = [string]$flag.Details
+
+        switch ([string]$flag.Name) {
+            'WindowsUpdateRebootRequired' {
+                $likelySource = 'Windows Update'
+                $explanation = 'Windows Update explicitly reports that a reboot is required to finish update processing.'
+            }
+            'WindowsUpdatePostRebootReporting' {
+                $likelySource = 'Windows Update'
+                $explanation = 'Windows Update has post-reboot reporting work pending.'
+            }
+            'CBSRebootPending' {
+                $likelySource = 'Component Based Servicing'
+                $explanation = 'Windows servicing (CBS) reports a component/package change that has not completed across a reboot.'
+            }
+            'CBSRebootInProgress' {
+                $likelySource = 'Component Based Servicing'
+                $explanation = 'Windows servicing reports a reboot transaction still in progress.'
+            }
+            'CBSPackagesPending' {
+                $likelySource = 'Component Based Servicing'
+                $explanation = 'One or more Windows component packages remain pending.'
+            }
+            'UpdateExeVolatile' {
+                $likelySource = 'Windows Installer / Update installer'
+                $explanation = "UpdateExeVolatile remains non-zero. $($flag.Details)"
+            }
+            { $_ -in @('PendingFileRenameOperations','PendingFileRenameOperations2') } {
+                $likelySource = 'Pending file replacement/deletion'
+
+                # PendingFileRenameOperations is typically a sequence of source/destination
+                # paths. Preserve the exact paths as evidence and infer the subsystem.
+                $rawParts = @(
+                    ([string]$flag.Details -split '\s+\|\s+') |
+                    Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+                )
+
+                $affectedItems = @($rawParts)
+
+                $joined = ($rawParts -join ' ')
+                if ($joined -match '(?i)\\AppPatch\\|AcPluginDlls') {
+                    $likelySource = 'Windows Application Compatibility / AppPatch'
+                    $explanation = 'Windows application-compatibility files are queued for rename/deletion at reboot.'
+                }
+                elseif ($joined -match '(?i)\\DriverStore\\|\\System32\\drivers\\') {
+                    $likelySource = 'Driver installation/update'
+                    $explanation = 'Driver files are queued for replacement/deletion at reboot.'
+                }
+                elseif ($joined -match '(?i)\\WinSxS\\|\\servicing\\') {
+                    $likelySource = 'Windows Component Servicing'
+                    $explanation = 'Windows servicing files are queued for replacement/deletion at reboot.'
+                }
+                elseif ($joined -match '(?i)\\Program Files\\Elastic\\|Elastic\\Agent') {
+                    $likelySource = 'Elastic Agent'
+                    $explanation = 'Elastic Agent files are queued for replacement/deletion at reboot.'
+                }
+                elseif ($joined -match '(?i)\.msi\b|\\Installer\\|\\Temp\\') {
+                    $likelySource = 'Application installer'
+                    $explanation = 'An application installer left file replacement/deletion operations pending.'
+                }
+                else {
+                    $explanation = 'Windows has file rename/delete operations queued for the next reboot. AffectedItems contains the raw file paths.'
+                }
+            }
+        }
+
+        $results.Add([pscustomobject]@{
+            FlagName       = [string]$flag.Name
+            FlagType       = [string]$flag.Type
+            RegistryPath   = [string]$flag.Path
+            RegistryValue  = [string]$flag.ValueName
+            LikelySource   = $likelySource
+            Explanation    = $explanation
+            AffectedItems  = @($affectedItems)
+            RawDetails     = [string]$flag.Details
+        }) | Out-Null
+    }
+
+    return @($results | ForEach-Object { $_ })
+}
+
+function Get-PreviousWindowsUpdateContext {
+    $path = Join-Path $LogDirectory '06_Weekend_Windows_Updates.latest.json'
+
+    if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
+        return $null
+    }
+
+    try {
+        $obj = Get-Content -LiteralPath $path -Raw -Encoding UTF8 -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
+
+        return [pscustomobject]@{
+            ScriptVersion            = $obj.ScriptVersion
+            RunId                    = $obj.RunId
+            Status                   = $obj.Status
+            EndTime                  = $obj.EndTime
+            UpdatesInstalled         = $obj.UpdatesInstalled
+            InstalledKBs             = @($obj.InstalledKBs)
+            InstalledUpdates         = @($obj.InstalledUpdates | ForEach-Object {
+                [pscustomobject]@{
+                    Title = $_.Title
+                    KB = $_.KB
+                    Result = $_.Result
+                    Classification = $_.Classification
+                }
+            })
+            PendingRebootAfter       = $obj.PendingRebootAfter
+            PendingRebootReasonsAfter = @($obj.PendingRebootReasonsAfter)
+        }
+    }
+    catch {
+        Write-Status "Unable to read Script 06 latest update context: $($_.Exception.Message)" 'WARN'
+        return $null
+    }
+}
+
 function Get-PendingRebootFlags {
     $flags = @()
 
@@ -523,6 +746,7 @@ function Get-PendingRebootFlags {
     }
 
     $script:CurrentFlags = @($flags)
+    $script:RebootCauseDetails = @(Get-RebootCauseDetails -Flags $flags)
     return @($flags)
 }
 
@@ -550,7 +774,7 @@ function ConvertTo-StateObject {
         $stage = 0
     }
 
-    if ($stage -lt 0 -or $stage -gt 2) {
+    if ($stage -lt 0 -or $stage -gt 3) {
         $stage = 0
     }
 
@@ -580,6 +804,25 @@ function Backup-BadStateFile {
     }
 
     Write-Status "State file reset reason: $Reason" 'WARN'
+}
+
+function Test-RebootCycleActive {
+    if (-not (Test-Path -LiteralPath $script:StateFilePath -PathType Leaf)) {
+        return $false
+    }
+
+    try {
+        $state = Get-Content -LiteralPath $script:StateFilePath -Raw -Encoding UTF8 -ErrorAction Stop |
+            ConvertFrom-Json -ErrorAction Stop
+
+        $stage = [int]$state.Stage
+        return ($stage -ge 1 -and $stage -le 3)
+    }
+    catch {
+        # A corrupt state file must not cause a normal startup task to begin
+        # a brand-new reboot cycle. The scheduled Sunday run can handle recovery.
+        return $false
+    }
 }
 
 function Get-State {
@@ -853,12 +1096,17 @@ function Resolve-PersistentRebootFlags {
     )
 
     if (-not $AllowUnsafeRebootFlagCleanup) {
-        Write-Status 'Reboot flags remain after two verified restarts. Registry servicing flags will not be deleted automatically.' 'WARN'
+        Write-Status 'Reboot flags remain after three reboot attempts. Registry servicing flags will not be deleted automatically.' 'WARN'
         foreach ($flag in @($InitialFlags)) {
             Write-Status "Persistent flag retained: $($flag.Name) | $($flag.Path) | $($flag.Details)" 'WARN'
         }
 
-        $script:OverallResult = 'PersistentFlagsRemain'
+        if ($script:PersistentAfterThirdReboot) {
+            $script:OverallResult = 'PersistentFlagsAfterThirdReboot'
+        }
+        else {
+            $script:OverallResult = 'PersistentFlagsRemain'
+        }
         $script:ExitCode = 2
         Reset-State
         Write-YamlLog
@@ -921,6 +1169,8 @@ function Write-YamlLog {
         $lines.Add("reboot_reason: $(ConvertTo-YamlScalar $script:RebootReason)") | Out-Null
         $lines.Add("overall_result: $(ConvertTo-YamlScalar $script:OverallResult)") | Out-Null
         $lines.Add("failure_message: $(ConvertTo-YamlScalar $script:FailureMessage)") | Out-Null
+        $lines.Add("final_verification_after_third_reboot: $(ConvertTo-YamlScalar $script:FinalVerificationAfterThirdReboot)") | Out-Null
+        $lines.Add("persistent_after_third_reboot: $(ConvertTo-YamlScalar $script:PersistentAfterThirdReboot)") | Out-Null
         $lines.Add('') | Out-Null
 
         $lines.Add('flags_detected:') | Out-Null
@@ -969,7 +1219,7 @@ function Write-YamlLog {
         }
 
         $yamlTempPath = "$($script:YamlLogPath).tmp"
-        Set-Content -LiteralPath $yamlTempPath -Value $lines -Encoding UTF8 -Force
+        Set-Content -LiteralPath $yamlTempPath -Value @($lines | ForEach-Object { $_ }) -Encoding UTF8 -Force
         Move-Item -LiteralPath $yamlTempPath -Destination $script:YamlLogPath -Force
         Confirm-FileWriteToDisk -Path $script:YamlLogPath
         Write-ExecutionTelemetry
@@ -1012,7 +1262,18 @@ function Invoke-ForcedReboot {
 }
 
 # Main
+# The AtStartup task always supplies -StartupResume. It exists only to continue
+# an already-active Script 07 reboot sequence. It must never start a new sequence
+# during an ordinary workstation boot.
+if ($StartupResume -and -not (Test-RebootCycleActive)) {
+    Write-Host "Script 07 startup resume: no active reboot cycle. Exiting without action." -ForegroundColor DarkGray
+    exit 0
+}
+
 Initialize-Paths
+Write-Status "Starting $($script:ScriptName) version $($script:ScriptVersion)." 'INFO'
+Write-Status "Active staged text log path: $($script:TextLogPath)" 'INFO'
+Write-Status "Completed text log publish path: $($script:PublishedLogPath)" 'INFO'
 Initialize-SingleInstanceLock
 
 try {
@@ -1084,17 +1345,54 @@ try {
 
             2 {
                 if ($flags.Count -gt 0) {
-                    Write-Status "Third pass: reboot flags still present after two reboots. Logging and clearing as non-blocking warning." 'WARN'
+                    Write-Status "Third pass: reboot flags still detected after two reboots. Issuing the third and final automatic reboot." 'WARN'
                     foreach ($flag in $flags) {
-                        Write-Status "Persistent flag: $($flag.Name) | $($flag.Path) | $($flag.Details)" 'WARN'
+                        Write-Status "Flag before third reboot: $($flag.Name) | $($flag.Path) | $($flag.Details)" 'WARN'
                     }
 
+                    Save-State -Stage 3 -FirstSeen $state.FirstSeen -LastRun ((Get-Date).ToString('o')) -LastBootTime $script:BootSnapshot.LastBootTime -LastFlags $flags
+                    $script:OverallResult = 'ThirdRebootIssued'
+                    Invoke-ForcedReboot -Reason 'Reboot flags remain after two reboots. Issuing third and final automatic reboot.'
+                }
+                else {
+                    Write-Status "Third pass: no reboot flags detected after two reboots. Resetting state and exiting normally." 'OK'
+                    Reset-State
+                    $script:OverallResult = 'ThirdPassNoFlags'
+                    Write-YamlLog
+                    exit 0
+                }
+            }
+
+            3 {
+                # This is the important safety gate before the workstation can be
+                # considered ready to re-freeze. No fourth automatic reboot occurs.
+                $script:FinalVerificationAfterThirdReboot = $true
+
+                if ($flags.Count -gt 0) {
+                    $script:PersistentAfterThirdReboot = $true
+                    Write-Status "FINAL CHECK: reboot flags are still present after the third reboot. System is NOT ready to re-freeze." 'ERROR'
+
+                    foreach ($cause in @($script:RebootCauseDetails)) {
+                        Write-Status ("Persistent reboot cause: Flag={0}; LikelySource={1}; Explanation={2}; AffectedItems={3}" -f `
+                            $cause.FlagName,
+                            $cause.LikelySource,
+                            $cause.Explanation,
+                            (@($cause.AffectedItems) -join ' | ')) 'ERROR'
+                    }
+
+                    $script:OverallResult = 'PersistentFlagsAfterThirdReboot'
+                    $script:ExitCode = 2
+
+                    # Preserve the existing opt-in cleanup behavior, but do not
+                    # automatically delete servicing state unless explicitly enabled.
                     Resolve-PersistentRebootFlags -InitialFlags $flags
                 }
                 else {
-                    Write-Status "Third pass: no reboot flags detected. Resetting state and exiting normally." 'OK'
+                    Write-Status "FINAL CHECK: no reboot flags remain after the third reboot. System is safe to proceed to re-freeze." 'OK'
+                    $script:PersistentAfterThirdReboot = $false
                     Reset-State
-                    $script:OverallResult = 'ThirdPassNoFlags'
+                    $script:OverallResult = 'ThirdRebootVerifiedClean'
+                    $script:ExitCode = 0
                     Write-YamlLog
                     exit 0
                 }
@@ -1120,5 +1418,8 @@ try {
     }
 }
 finally {
+    # Release-SingleInstanceLock writes a status entry, so it must happen before
+    # the staged log is published into C:\Logs.
     Release-SingleInstanceLock
+    Complete-TextLogPublication -Reason 'Script exit or reboot handoff'
 }

@@ -1,4 +1,4 @@
-﻿#requires -Version 5.1
+#requires -Version 5.1
 #requires -RunAsAdministrator
 <#
 .SYNOPSIS
@@ -7,6 +7,10 @@
 .DESCRIPTION
     Collects hardware, operating system, performance, storage, security,
     networking, update, event-log, service, and management-agent health.
+
+    Writes one endpoint.health summary event and one endpoint.health.finding
+    event for every Warning or Critical finding. The individual finding events
+    support clean Kibana tables, filtering, drilldowns, and alerting.
 
     The script is fault-tolerant: individual collectors can fail without
     preventing the remaining endpoint snapshot from being written.
@@ -18,7 +22,26 @@
 
 .NOTES
     ScriptName:    14_Endpoint_Health_Inventory.ps1
-    ScriptVersion: 1.1.0
+    ScriptVersion: 1.2.8
+    LastUpdated:   2026-08-19
+    Changes:       v1.2.8 makes Secure Boot detection resilient by using Confirm-SecureBootUEFI first,
+                   then falling back to the Windows SecureBoot registry state when the cmdlet returns Access Denied.
+                   Telemetry now records the detection method and diagnostic error without creating a false warning
+                   when the registry can determine the actual Secure Boot state.
+                   v1.2.7 fixes storage manufacturer normalization so generic Windows values such as
+                   '(Standard disk drives)' are treated as unknown and vendor is inferred from model/PNP data.
+                   v1.2.6 enriches physical storage inventory with explicit manufacturer/brand, model,
+                   serial number, firmware, interface/bus, device identifiers, partition style, boot/system flags,
+                   and Windows PNP metadata to improve lab inventory and lifecycle reporting.
+                   v1.2.5 adds detailed hardware inventory for CPU, GPU, memory modules, and system storage,
+                   derives Building/Lab/DeviceIdentifier from the computer name for dashboard controls,
+                   and places those location fields on both endpoint.health and endpoint.health.finding events.
+                   v1.2.4 refines Device Manager health so benign ProblemCode=0 degraded devices are inventoried but not counted as actionable problems,
+                   and returns exit code 0 for SuccessWithWarnings/SuccessWithCriticalFindings so scheduler execution is not falsely marked failed.
+                   v1.2.3 stabilizes Elastic telemetry mappings for findings and collections,
+                   renames pending-reboot reason telemetry, adds explicit critical-service
+                   expectations, and adds a concise Elastic endpoint-health summary.
+                   v1.2.2 uses Maintenance.Framework v2.4 staged text logging.
     Designed for:  Windows PowerShell 5.1
 #>
 
@@ -44,6 +67,12 @@ param(
 
     [ValidateRange(1, 100)]
     [int]$DiskCriticalPercent = 95,
+
+    [ValidateRange(0.1, 1000)]
+    [double]$CapabilityAccessManagerWarningGB = 1,
+
+    [ValidateRange(0.1, 1000)]
+    [double]$CapabilityAccessManagerCriticalGB = 10,
 
     [ValidateRange(1, 10000)]
     [int]$CriticalEventWarningCount = 5,
@@ -80,7 +109,7 @@ Set-StrictMode -Version 2.0
 $ErrorActionPreference = 'Stop'
 
 $script:ScriptName       = '14_Endpoint_Health_Inventory.ps1'
-$script:ScriptVersion    = '1.1.0'
+$script:ScriptVersion    = '1.2.8'
 $script:RunId            = [guid]::NewGuid().Guid
 $script:StartTime        = Get-Date
 $script:WarningCount     = 0
@@ -88,14 +117,54 @@ $script:ErrorCount       = 0
 $script:Findings         = New-Object System.Collections.Generic.List[object]
 $script:CollectorResults = New-Object System.Collections.Generic.List[object]
 
+# Explicit health expectations for the default critical services.
+# Any custom service supplied through -CriticalServices defaults to RequiredRunning.
+$script:CriticalServiceExpectations = @{
+    'WinDefend'          = 'RequiredRunning'
+    'mpssvc'             = 'RequiredRunning'
+    'W32Time'            = 'RequiredRunning'
+    'EventLog'           = 'RequiredRunning'
+    'Schedule'           = 'RequiredRunning'
+    'RpcSs'              = 'RequiredRunning'
+    'Dnscache'           = 'RequiredRunning'
+    'LanmanWorkstation'  = 'RequiredRunning'
+}
+
 $script:NdjsonPath = Join-Path $LogDirectory 'Maintenance-Telemetry.ndjson'
 $script:LatestPath = Join-Path $LogDirectory '14_Endpoint_Health_Inventory.latest.json'
-$script:LogPath    = Join-Path $LogDirectory '14_Endpoint_Health_Inventory.log'
+$script:LogPath          = $null
+$script:PublishedLogPath = $null
+$script:LogSession       = $null
 
 # Load the shared framework from the same directory as this script.
 $MaintenanceFrameworkPath = 'C:\Scripts\Maintenance.Framework.psm1'
 Import-Module -Name $MaintenanceFrameworkPath -Force -ErrorAction Stop
-$MaintenanceConfig = Initialize-MaintenanceEnvironment -ScriptRoot 'C:\Scripts' -LogRoot 'C:\Logs'
+$MaintenanceConfig = Initialize-MaintenanceEnvironment -ScriptRoot 'C:\Scripts' -LogRoot $LogDirectory
+
+$requiredFrameworkVersion = [version]'2.4.0'
+$currentFrameworkVersion = [version](Get-MaintenanceFrameworkVersion)
+
+if ($currentFrameworkVersion -lt $requiredFrameworkVersion) {
+    throw "Script 14 requires Maintenance.Framework.psm1 version $requiredFrameworkVersion or newer. Installed version: $currentFrameworkVersion"
+}
+
+Archive-MaintenanceLogs `
+    -ScriptName $script:ScriptName `
+    -LogRoot $LogDirectory `
+    -AdditionalPatterns @(
+        '14_Endpoint_Health_Inventory.log',
+        '*-14_Endpoint_Health_Inventory-*.log'
+    ) | Out-Null
+
+$script:LogSession = New-MaintenanceStagedLog `
+    -ScriptName $script:ScriptName `
+    -LogRoot $LogDirectory `
+    -StagingRoot $MaintenanceConfig.LogStagingRoot `
+    -ComputerName $env:COMPUTERNAME `
+    -Timestamp $script:StartTime
+
+$script:LogPath = [string]$script:LogSession.WorkingPath
+$script:PublishedLogPath = [string]$script:LogSession.PublishedPath
 
 function Ensure-Directory {
     param([Parameter(Mandatory)][string]$Path)
@@ -112,9 +181,13 @@ function Write-Log {
     )
 
     $timestamp = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss.fff')
-    $line = '{0} [{1}] {2}' -f $timestamp, $Level, $Message
+    $computerName = if ($env:COMPUTERNAME) { $env:COMPUTERNAME } else { 'UNKNOWN' }
+    $normalizedLevel = if ($Level -eq 'WARN') { 'WARNING' } else { $Level }
+    $line = '{0} [{1}] [{2}] {3}' -f $timestamp, $computerName, $normalizedLevel, $Message
 
     try {
+        $activeLogDirectory = Split-Path -Parent $script:LogPath
+        Ensure-Directory -Path $activeLogDirectory
         Add-Content -LiteralPath $script:LogPath -Value $line -Encoding UTF8
     } catch {
         Write-Verbose "Unable to write runtime log: $($_.Exception.Message)"
@@ -126,6 +199,116 @@ function Write-Log {
     }
 
     Write-Verbose $line
+}
+
+
+function New-StringArrayForJson {
+    [CmdletBinding()]
+    param([AllowNull()]$InputObject)
+
+    [string[]]$items = @(
+        $InputObject |
+        ForEach-Object { [string]$_ } |
+        Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+    )
+
+    if ($items.Count -eq 0) {
+        return ,([object[]]@())
+    }
+
+    return ,([object[]]$items)
+}
+
+function New-ObjectArrayForJson {
+    [CmdletBinding()]
+    param([AllowNull()]$InputObject)
+
+    [object[]]$items = @(
+        $InputObject |
+        Where-Object { $null -ne $_ } |
+        ForEach-Object { $_ }
+    )
+
+    if ($items.Count -eq 0) {
+        return ,([object[]]@())
+    }
+
+    return ,([object[]]$items)
+}
+
+function Convert-FindingValueForTelemetry {
+    [CmdletBinding()]
+    param([AllowNull()]$Value)
+
+    $result = [ordered]@{
+        ValueType    = 'Null'
+        ValueNumber  = $null
+        ValueBoolean = $null
+        ValueText    = $null
+        ValueTexts   = [object[]]@()
+        ValueJson    = $null
+    }
+
+    if ($null -eq $Value) {
+        return [pscustomobject]$result
+    }
+
+    if ($Value -is [bool]) {
+        $result.ValueType = 'Boolean'
+        $result.ValueBoolean = [bool]$Value
+        return [pscustomobject]$result
+    }
+
+    if (
+        $Value -is [byte] -or $Value -is [sbyte] -or
+        $Value -is [int16] -or $Value -is [uint16] -or
+        $Value -is [int32] -or $Value -is [uint32] -or
+        $Value -is [int64] -or $Value -is [uint64] -or
+        $Value -is [single] -or $Value -is [double] -or
+        $Value -is [decimal]
+    ) {
+        $result.ValueType = 'Number'
+        $result.ValueNumber = [double]$Value
+        return [pscustomobject]$result
+    }
+
+    if ($Value -is [string] -or $Value -is [char]) {
+        $result.ValueType = 'Text'
+        $result.ValueText = [string]$Value
+        return [pscustomobject]$result
+    }
+
+    if ($Value -is [System.Collections.IEnumerable] -and -not ($Value -is [string])) {
+        $items = @($Value)
+        $allScalarText = $true
+        foreach ($item in $items) {
+            if ($null -eq $item) { continue }
+            if (
+                $item -is [System.Collections.IDictionary] -or
+                $item -is [pscustomobject] -or
+                ($item -is [System.Collections.IEnumerable] -and -not ($item -is [string]))
+            ) {
+                $allScalarText = $false
+                break
+            }
+        }
+
+        if ($allScalarText) {
+            $result.ValueType = 'TextArray'
+            $result.ValueTexts = New-StringArrayForJson -InputObject $items
+            return [pscustomobject]$result
+        }
+    }
+
+    $result.ValueType = 'Json'
+    try {
+        $result.ValueJson = $Value | ConvertTo-Json -Depth 8 -Compress
+    }
+    catch {
+        $result.ValueJson = [string]$Value
+    }
+
+    return [pscustomobject]$result
 }
 
 function Add-Finding {
@@ -140,12 +323,19 @@ function Add-Finding {
         $Value = $null
     )
 
+    $typedValue = Convert-FindingValueForTelemetry -Value $Value
+
     $script:Findings.Add([pscustomobject]@{
-        Severity = $Severity
-        Category = $Category
-        Check    = $Check
-        Message  = $Message
-        Value    = $Value
+        Severity     = $Severity
+        Category     = $Category
+        Check        = $Check
+        Message      = $Message
+        ValueType    = $typedValue.ValueType
+        ValueNumber  = $typedValue.ValueNumber
+        ValueBoolean = $typedValue.ValueBoolean
+        ValueText    = $typedValue.ValueText
+        ValueTexts   = $typedValue.ValueTexts
+        ValueJson    = $typedValue.ValueJson
     })
 }
 
@@ -210,6 +400,20 @@ function Get-RegistryValueSafe {
     }
 }
 
+function Get-ObjectPropertyValueSafe {
+    param(
+        $InputObject,
+        [Parameter(Mandatory)][string]$Name
+    )
+
+    if ($null -eq $InputObject) { return $null }
+
+    $property = $InputObject.PSObject.Properties[$Name]
+    if ($null -eq $property) { return $null }
+
+    return $property.Value
+}
+
 function Test-PendingReboot {
     $reasons = New-Object System.Collections.Generic.List[string]
 
@@ -251,7 +455,219 @@ function Test-PendingReboot {
 
     [pscustomobject]@{
         Pending = ($reasons.Count -gt 0)
-        Reasons = @($reasons | Select-Object -Unique)
+        ReasonNames = New-StringArrayForJson -InputObject @($reasons | Select-Object -Unique)
+    }
+}
+
+
+function Get-ComputerLocationIdentity {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][string]$ComputerName)
+
+    $building = $null
+    $lab = $null
+    $deviceIdentifier = $null
+    $derived = $false
+
+    # Standard lab names such as:
+    #   IB1-103-06
+    #   IB1-103-AV
+    #   SSB-122-01
+    #
+    # The first two hyphen-delimited components define the lab.
+    if ($ComputerName -match '^(?<Building>[^-]+)-(?<Room>[^-]+)(?:-(?<Device>.+))?$') {
+        $building = [string]$Matches.Building
+        $lab = '{0}-{1}' -f $Matches.Building, $Matches.Room
+        if ($Matches.ContainsKey('Device') -and -not [string]::IsNullOrWhiteSpace($Matches.Device)) {
+            $deviceIdentifier = [string]$Matches.Device
+        }
+        $derived = $true
+    }
+
+    [pscustomobject]@{
+        Building         = $building
+        Lab              = $lab
+        DeviceIdentifier = $deviceIdentifier
+        DerivedFromName  = $derived
+    }
+}
+
+function Convert-ProcessorArchitecture {
+    [CmdletBinding()]
+    param([AllowNull()]$Architecture)
+
+    switch ([int]$Architecture) {
+        0  { 'x86' }
+        1  { 'MIPS' }
+        2  { 'Alpha' }
+        3  { 'PowerPC' }
+        5  { 'ARM' }
+        6  { 'Itanium' }
+        9  { 'x64' }
+        12 { 'ARM64' }
+        default { if ($null -eq $Architecture) { $null } else { [string]$Architecture } }
+    }
+}
+
+function Convert-SmbiosMemoryType {
+    [CmdletBinding()]
+    param([AllowNull()]$MemoryType)
+
+    if ($null -eq $MemoryType) { return $null }
+
+    switch ([int]$MemoryType) {
+        18 { 'DDR' }
+        19 { 'DDR2' }
+        20 { 'DDR2 FB-DIMM' }
+        24 { 'DDR3' }
+        26 { 'DDR4' }
+        27 { 'LPDDR' }
+        28 { 'LPDDR2' }
+        29 { 'LPDDR3' }
+        30 { 'LPDDR4' }
+        34 { 'DDR5' }
+        35 { 'LPDDR5' }
+        default { 'Type{0}' -f [int]$MemoryType }
+    }
+}
+
+function Get-HardwareInventory {
+    [CmdletBinding()]
+    param()
+
+    # ----- CPU -----
+    $processorRows = @()
+    $processors = @(Get-CimInstance Win32_Processor -ErrorAction SilentlyContinue)
+
+    foreach ($processor in $processors) {
+        $processorRows += [pscustomobject]@{
+            Manufacturer                  = ([string]$processor.Manufacturer).Trim()
+            Model                         = ([string]$processor.Name).Trim()
+            SocketDesignation             = $processor.SocketDesignation
+            ProcessorId                   = $processor.ProcessorId
+            Architecture                  = Convert-ProcessorArchitecture -Architecture $processor.Architecture
+            AddressWidthBits              = $processor.AddressWidth
+            Cores                         = $processor.NumberOfCores
+            LogicalProcessors             = $processor.NumberOfLogicalProcessors
+            MaxClockMHz                   = $processor.MaxClockSpeed
+            CurrentClockMHz               = $processor.CurrentClockSpeed
+            L2CacheKB                     = $processor.L2CacheSize
+            L3CacheKB                     = $processor.L3CacheSize
+            VirtualizationFirmwareEnabled = [bool]$processor.VirtualizationFirmwareEnabled
+            VmMonitorModeExtensions       = [bool]$processor.VMMonitorModeExtensions
+            SecondLevelAddressTranslation = [bool]$processor.SecondLevelAddressTranslationExtensions
+        }
+    }
+
+    $totalCores = if ($processorRows.Count -gt 0) {
+        [int](($processorRows | Measure-Object -Property Cores -Sum).Sum)
+    } else { 0 }
+
+    $totalLogical = if ($processorRows.Count -gt 0) {
+        [int](($processorRows | Measure-Object -Property LogicalProcessors -Sum).Sum)
+    } else { 0 }
+
+    $cpu = [pscustomobject]@{
+        SocketCount        = $processorRows.Count
+        TotalCores         = $totalCores
+        TotalLogicalProcessors = $totalLogical
+        PrimaryManufacturer = if ($processorRows.Count -gt 0) { $processorRows[0].Manufacturer } else { $null }
+        PrimaryModel        = if ($processorRows.Count -gt 0) { $processorRows[0].Model } else { $null }
+        Processors          = New-ObjectArrayForJson -InputObject $processorRows
+    }
+
+    # ----- Physical memory -----
+    $memoryRows = @()
+    $physicalMemory = @(Get-CimInstance Win32_PhysicalMemory -ErrorAction SilentlyContinue)
+    foreach ($module in $physicalMemory) {
+        $smbiosType = Get-ObjectPropertyValueSafe -InputObject $module -Name 'SMBIOSMemoryType'
+
+        $memoryRows += [pscustomobject]@{
+            DeviceLocator       = $module.DeviceLocator
+            BankLabel           = $module.BankLabel
+            CapacityGB          = if ($module.Capacity) { [math]::Round([double]$module.Capacity / 1GB, 2) } else { $null }
+            Manufacturer        = ([string]$module.Manufacturer).Trim()
+            PartNumber          = ([string]$module.PartNumber).Trim()
+            SerialNumber        = ([string]$module.SerialNumber).Trim()
+            SpeedMHz            = $module.Speed
+            ConfiguredSpeedMHz  = Get-ObjectPropertyValueSafe -InputObject $module -Name 'ConfiguredClockSpeed'
+            MemoryType          = Convert-SmbiosMemoryType -MemoryType $smbiosType
+            SmbiosMemoryType    = $smbiosType
+            FormFactor          = $module.FormFactor
+            DataWidthBits       = $module.DataWidth
+            TotalWidthBits      = $module.TotalWidth
+            ConfiguredVoltageMv = Get-ObjectPropertyValueSafe -InputObject $module -Name 'ConfiguredVoltage'
+        }
+    }
+
+    $memoryArrays = @(Get-CimInstance Win32_PhysicalMemoryArray -ErrorAction SilentlyContinue)
+    $slotCount = 0
+    foreach ($array in $memoryArrays) {
+        if ($null -ne $array.MemoryDevices) { $slotCount += [int]$array.MemoryDevices }
+    }
+
+    $totalInstalledMemoryGB = if ($memoryRows.Count -gt 0) {
+        [math]::Round((($memoryRows | Measure-Object -Property CapacityGB -Sum).Sum), 2)
+    } else { $null }
+
+    $memory = [pscustomobject]@{
+        TotalInstalledGB = $totalInstalledMemoryGB
+        SlotCount        = $slotCount
+        PopulatedSlots   = $memoryRows.Count
+        EmptySlots       = if ($slotCount -ge $memoryRows.Count) { $slotCount - $memoryRows.Count } else { 0 }
+        Modules          = New-ObjectArrayForJson -InputObject $memoryRows
+    }
+
+    # ----- GPU / display adapters -----
+    $gpuRows = @()
+    $videoControllers = @(Get-CimInstance Win32_VideoController -ErrorAction SilentlyContinue)
+    foreach ($gpu in $videoControllers) {
+        $driverDate = $null
+        if ($gpu.DriverDate) {
+            try { $driverDate = (Convert-CimDate $gpu.DriverDate).ToUniversalTime().ToString('o') } catch { }
+        }
+
+        $adapterRamBytes = $null
+        $adapterRamGB = $null
+        if ($null -ne $gpu.AdapterRAM) {
+            try {
+                $adapterRamBytes = [uint64]$gpu.AdapterRAM
+                if ($adapterRamBytes -gt 0) {
+                    $adapterRamGB = [math]::Round([double]$adapterRamBytes / 1GB, 2)
+                }
+            } catch { }
+        }
+
+        $gpuRows += [pscustomobject]@{
+            Manufacturer             = $gpu.AdapterCompatibility
+            Model                    = $gpu.Name
+            VideoProcessor           = $gpu.VideoProcessor
+            PnpDeviceId              = $gpu.PNPDeviceID
+            Status                   = $gpu.Status
+            DriverVersion            = $gpu.DriverVersion
+            DriverDate               = $driverDate
+            AdapterRamBytes          = $adapterRamBytes
+            AdapterRamGB             = $adapterRamGB
+            CurrentHorizontalPixels  = $gpu.CurrentHorizontalResolution
+            CurrentVerticalPixels    = $gpu.CurrentVerticalResolution
+            CurrentRefreshRateHz     = $gpu.CurrentRefreshRate
+            CurrentBitsPerPixel      = $gpu.CurrentBitsPerPixel
+            VideoModeDescription     = $gpu.VideoModeDescription
+            InstalledDisplayDrivers  = $gpu.InstalledDisplayDrivers
+        }
+    }
+
+    $gpu = [pscustomobject]@{
+        AdapterCount = $gpuRows.Count
+        PrimaryManufacturer = if ($gpuRows.Count -gt 0) { $gpuRows[0].Manufacturer } else { $null }
+        PrimaryModel        = if ($gpuRows.Count -gt 0) { $gpuRows[0].Model } else { $null }
+        Adapters            = New-ObjectArrayForJson -InputObject $gpuRows
+    }
+
+    [pscustomobject]@{
+        CPU    = $cpu
+        Memory = $memory
+        GPU    = $gpu
     }
 }
 
@@ -260,9 +676,14 @@ function Get-ComputerIdentity {
     $bios = Get-CimInstance Win32_BIOS
     $baseboard = Get-CimInstance Win32_BaseBoard -ErrorAction SilentlyContinue
     $enclosure = Get-CimInstance Win32_SystemEnclosure -ErrorAction SilentlyContinue
+    $location = Get-ComputerLocationIdentity -ComputerName $env:COMPUTERNAME
 
     [pscustomobject]@{
         ComputerName  = $env:COMPUTERNAME
+        Building      = $location.Building
+        Lab           = $location.Lab
+        DeviceIdentifier = $location.DeviceIdentifier
+        LocationDerivedFromName = $location.DerivedFromName
         Domain        = $computer.Domain
         DomainJoined  = [bool]$computer.PartOfDomain
         Manufacturer  = $computer.Manufacturer
@@ -275,7 +696,7 @@ function Get-ComputerIdentity {
         BIOSDate      = if ($bios.ReleaseDate) { (Convert-CimDate $bios.ReleaseDate).ToUniversalTime().ToString('o') } else { $null }
         Baseboard     = if ($baseboard) { $baseboard.Product } else { $null }
         AssetTag      = if ($enclosure) { $enclosure.SMBIOSAssetTag } else { $null }
-        ChassisTypes  = if ($enclosure) { @($enclosure.ChassisTypes) } else { @() }
+        ChassisTypes  = New-ObjectArrayForJson -InputObject $(if ($enclosure) { @($enclosure.ChassisTypes) } else { @() })
         TotalMemoryGB = [math]::Round($computer.TotalPhysicalMemory / 1GB, 2)
     }
 }
@@ -297,8 +718,8 @@ function Get-OperatingSystemHealth {
     $pending = Test-PendingReboot
     if ($pending.Pending) {
         Add-Finding -Severity 'Warning' -Category 'OperatingSystem' `
-            -Check 'PendingReboot' -Message ('Pending reboot: {0}' -f ($pending.Reasons -join ', ')) `
-            -Value $pending.Reasons
+            -Check 'PendingReboot' -Message ('Pending reboot: {0}' -f ($pending.ReasonNames -join ', ')) `
+            -Value $pending.ReasonNames
     } else {
         Add-Finding -Severity 'Healthy' -Category 'OperatingSystem' `
             -Check 'PendingReboot' -Message 'No pending reboot indicators were found.'
@@ -318,7 +739,7 @@ function Get-OperatingSystemHealth {
         UptimeSeconds        = if ($lastBoot) { [math]::Round(($now - $lastBoot).TotalSeconds, 0) } else { $null }
         UptimeDays           = if ($lastBoot) { [math]::Round(($now - $lastBoot).TotalDays, 2) } else { $null }
         PendingReboot        = $pending.Pending
-        PendingRebootReasons = $pending.Reasons
+        PendingRebootReasonNames = $pending.ReasonNames
     }
 }
 
@@ -370,7 +791,7 @@ function Get-PerformanceHealth {
         CpuSampleSeconds    = $CpuSampleSeconds
         CpuAveragePercent   = $cpuAverage
         CpuMaximumPercent   = $cpuMaximum
-        CpuSamples          = $cpuSamples
+        CpuSamples          = New-ObjectArrayForJson -InputObject $cpuSamples
         MemoryTotalGB       = $totalMemoryGB
         MemoryUsedGB        = $usedMemoryGB
         MemoryFreeGB        = $freeMemoryGB
@@ -378,8 +799,78 @@ function Get-PerformanceHealth {
     }
 }
 
+
+function Get-StorageManufacturerFromModel {
+    [CmdletBinding()]
+    param(
+        [AllowNull()][string]$Manufacturer,
+        [AllowNull()][string]$Model,
+        [AllowNull()][string]$FriendlyName,
+        [AllowNull()][string]$PnpDeviceId
+    )
+
+    if (-not [string]::IsNullOrWhiteSpace($Manufacturer)) {
+        $clean = $Manufacturer.Trim()
+        $normalized = ($clean -replace '[()]','').Trim()
+
+        if ($normalized -notmatch '^(Standard disk drives|Standard disk drive|Unknown|Generic)$') {
+            return $clean
+        }
+    }
+
+    $source = ('{0} {1} {2}' -f $Model, $FriendlyName, $PnpDeviceId).Trim()
+
+    $patterns = [ordered]@{
+        'Samsung'         = 'SAMSUNG|MZ[VNLQ]|PM9|SM9'
+        'SK hynix'        = 'SK HYNIX|SKHYNIX|HFS|HFM'
+        'Western Digital' = 'WESTERN DIGITAL|WDC|WD_BLACK|WD BLUE|WD GREEN|SANDISK'
+        'Micron'          = 'MICRON|MTFD'
+        'KIOXIA'          = 'KIOXIA|TOSHIBA'
+        'Intel'           = 'INTEL'
+        'Kingston'        = 'KINGSTON'
+        'Crucial'         = 'CRUCIAL'
+        'Seagate'         = 'SEAGATE|ST[0-9]'
+        'Solidigm'        = 'SOLIDIGM'
+    }
+
+    foreach ($entry in $patterns.GetEnumerator()) {
+        if ($source -match $entry.Value) {
+            return $entry.Key
+        }
+    }
+
+    return $Manufacturer
+}
+
+function Get-DiskDriveMetadata {
+    [CmdletBinding()]
+    param()
+
+    $rows = @()
+    foreach ($drive in @(Get-CimInstance Win32_DiskDrive -ErrorAction SilentlyContinue)) {
+        $rows += [pscustomobject]@{
+            Index            = $drive.Index
+            DeviceId         = $drive.DeviceID
+            PnpDeviceId      = $drive.PNPDeviceID
+            Manufacturer     = $drive.Manufacturer
+            Model            = $drive.Model
+            SerialNumber     = ([string]$drive.SerialNumber).Trim()
+            FirmwareRevision = $drive.FirmwareRevision
+            InterfaceType    = $drive.InterfaceType
+            MediaType        = $drive.MediaType
+            SizeBytes        = $drive.Size
+            SizeGB           = if ($drive.Size) { [math]::Round([double]$drive.Size / 1GB, 2) } else { $null }
+            Partitions       = $drive.Partitions
+            Status           = $drive.Status
+        }
+    }
+
+    return ,([object[]]$rows)
+}
+
 function Get-DiskHealth {
     $volumes = @()
+    $diskDriveMetadata = @(Get-DiskDriveMetadata)
     $logicalDisks = Get-CimInstance Win32_LogicalDisk -Filter 'DriveType=3'
 
     foreach ($disk in $logicalDisks) {
@@ -426,15 +917,63 @@ function Get-DiskHealth {
                 -Message ("Physical disk {0} health is {1}." -f $pd.FriendlyName, $pd.HealthStatus) `
                 -Value $pd.HealthStatus
 
+            $matchingWmi = $null
+            if ($pd.SerialNumber) {
+                $matchingWmi = $diskDriveMetadata | Where-Object {
+                    $_.SerialNumber -and
+                    ([string]$_.SerialNumber).Trim() -eq ([string]$pd.SerialNumber).Trim()
+                } | Select-Object -First 1
+            }
+
+            if (-not $matchingWmi) {
+                $matchingWmi = $diskDriveMetadata | Where-Object {
+                    $_.Model -and $pd.FriendlyName -and
+                    (
+                        ([string]$_.Model).Trim() -eq ([string]$pd.FriendlyName).Trim() -or
+                        ([string]$pd.FriendlyName).Trim() -like ('*{0}*' -f ([string]$_.Model).Trim())
+                    )
+                } | Select-Object -First 1
+            }
+
+            $pdManufacturer = Get-ObjectPropertyValueSafe -InputObject $pd -Name 'Manufacturer'
+            $pdModel = Get-ObjectPropertyValueSafe -InputObject $pd -Name 'Model'
+            if ([string]::IsNullOrWhiteSpace([string]$pdModel)) { $pdModel = $pd.FriendlyName }
+
+            $manufacturer = Get-StorageManufacturerFromModel `
+                -Manufacturer $(if ($pdManufacturer) { [string]$pdManufacturer } elseif ($matchingWmi) { [string]$matchingWmi.Manufacturer } else { $null }) `
+                -Model ([string]$pdModel) `
+                -FriendlyName ([string]$pd.FriendlyName) `
+                -PnpDeviceId $(if ($matchingWmi) { [string]$matchingWmi.PnpDeviceId } else { $null })
+
+            $diskNumber = Get-ObjectPropertyValueSafe -InputObject $pd -Name 'DeviceId'
+            $diskObject = $null
+            if ($null -ne $diskNumber -and (Get-Command Get-Disk -ErrorAction SilentlyContinue)) {
+                try { $diskObject = Get-Disk -Number ([int]$diskNumber) -ErrorAction Stop } catch { }
+            }
+
             $physical += [pscustomobject]@{
+                DiskNumber             = $diskNumber
+                DeviceId               = if ($matchingWmi) { $matchingWmi.DeviceId } else { $null }
+                PnpDeviceId            = if ($matchingWmi) { $matchingWmi.PnpDeviceId } else { $null }
                 FriendlyName           = $pd.FriendlyName
-                SerialNumber           = $pd.SerialNumber
+                Manufacturer           = $manufacturer
+                RawManufacturer        = if ($pdManufacturer) { [string]$pdManufacturer } elseif ($matchingWmi) { [string]$matchingWmi.Manufacturer } else { $null }
+                Model                  = [string]$pdModel
+                SerialNumber           = ([string]$pd.SerialNumber).Trim()
+                FirmwareVersion        = $pd.FirmwareVersion
+                FirmwareRevisionWmi    = if ($matchingWmi) { $matchingWmi.FirmwareRevision } else { $null }
                 MediaType              = [string]$pd.MediaType
                 BusType                = [string]$pd.BusType
-                SizeGB                 = [math]::Round($pd.Size / 1GB, 2)
+                InterfaceType          = if ($matchingWmi) { $matchingWmi.InterfaceType } else { $null }
+                SizeGB                 = [math]::Round([double]$pd.Size / 1GB, 2)
                 HealthStatus           = [string]$pd.HealthStatus
-                OperationalStatus      = @($pd.OperationalStatus | ForEach-Object { [string]$_ })
-                FirmwareVersion        = $pd.FirmwareVersion
+                OperationalStatus      = New-StringArrayForJson -InputObject @($pd.OperationalStatus | ForEach-Object { [string]$_ })
+                PartitionStyle         = if ($diskObject) { [string]$diskObject.PartitionStyle } else { $null }
+                IsBoot                 = if ($diskObject) { [bool]$diskObject.IsBoot } else { $null }
+                IsSystem               = if ($diskObject) { [bool]$diskObject.IsSystem } else { $null }
+                IsOffline              = if ($diskObject) { [bool]$diskObject.IsOffline } else { $null }
+                IsReadOnly             = if ($diskObject) { [bool]$diskObject.IsReadOnly } else { $null }
+                NumberOfPartitions     = if ($matchingWmi) { $matchingWmi.Partitions } elseif ($diskObject) { $diskObject.NumberOfPartitions } else { $null }
                 Wear                   = if ($reliability) { $reliability.Wear } else { $null }
                 TemperatureC           = if ($reliability) { $reliability.Temperature } else { $null }
                 ReadErrorsTotal        = if ($reliability) { $reliability.ReadErrorsTotal } else { $null }
@@ -444,73 +983,206 @@ function Get-DiskHealth {
         }
     } else {
         foreach ($drive in Get-CimInstance Win32_DiskDrive) {
+            $manufacturer = Get-StorageManufacturerFromModel `
+                -Manufacturer ([string]$drive.Manufacturer) `
+                -Model ([string]$drive.Model) `
+                -FriendlyName ([string]$drive.Model) `
+                -PnpDeviceId ([string]$drive.PNPDeviceID)
+
+            $diskObject = $null
+            if ((Get-Command Get-Disk -ErrorAction SilentlyContinue) -and $null -ne $drive.Index) {
+                try { $diskObject = Get-Disk -Number ([int]$drive.Index) -ErrorAction Stop } catch { }
+            }
+
             $physical += [pscustomobject]@{
-                FriendlyName      = $drive.Model
-                SerialNumber      = $drive.SerialNumber
-                MediaType         = $drive.MediaType
-                BusType           = $drive.InterfaceType
-                SizeGB            = [math]::Round($drive.Size / 1GB, 2)
-                HealthStatus      = if ($drive.Status -eq 'OK') { 'Healthy' } else { $drive.Status }
-                OperationalStatus = @($drive.Status)
-                FirmwareVersion   = $drive.FirmwareRevision
-                Wear              = $null
-                TemperatureC      = $null
-                ReadErrorsTotal   = $null
-                WriteErrorsTotal  = $null
-                PowerOnHours      = $null
+                DiskNumber          = $drive.Index
+                DeviceId            = $drive.DeviceID
+                PnpDeviceId         = $drive.PNPDeviceID
+                FriendlyName        = $drive.Model
+                Manufacturer        = $manufacturer
+                RawManufacturer     = $drive.Manufacturer
+                Model               = $drive.Model
+                SerialNumber        = ([string]$drive.SerialNumber).Trim()
+                FirmwareVersion     = $drive.FirmwareRevision
+                FirmwareRevisionWmi = $drive.FirmwareRevision
+                MediaType           = $drive.MediaType
+                BusType             = if ($diskObject) { [string]$diskObject.BusType } else { $drive.InterfaceType }
+                InterfaceType       = $drive.InterfaceType
+                SizeGB              = [math]::Round([double]$drive.Size / 1GB, 2)
+                HealthStatus        = if ($drive.Status -eq 'OK') { 'Healthy' } else { $drive.Status }
+                OperationalStatus   = New-StringArrayForJson -InputObject @($drive.Status)
+                PartitionStyle      = if ($diskObject) { [string]$diskObject.PartitionStyle } else { $null }
+                IsBoot              = if ($diskObject) { [bool]$diskObject.IsBoot } else { $null }
+                IsSystem            = if ($diskObject) { [bool]$diskObject.IsSystem } else { $null }
+                IsOffline           = if ($diskObject) { [bool]$diskObject.IsOffline } else { $null }
+                IsReadOnly          = if ($diskObject) { [bool]$diskObject.IsReadOnly } else { $null }
+                NumberOfPartitions  = $drive.Partitions
+                Wear                = $null
+                TemperatureC        = $null
+                ReadErrorsTotal     = $null
+                WriteErrorsTotal    = $null
+                PowerOnHours        = $null
             }
         }
     }
 
+    $camWal = Get-CapabilityAccessManagerHealth
+
     [pscustomobject]@{
-        Volumes       = $volumes
-        PhysicalDisks = $physical
+        Volumes                 = New-ObjectArrayForJson -InputObject $volumes
+        PhysicalDisks           = New-ObjectArrayForJson -InputObject $physical
+        PhysicalDiskCount       = $physical.Count
+        PrimaryDiskManufacturer = if ($physical.Count -gt 0) { $physical[0].Manufacturer } else { $null }
+        PrimaryDiskModel        = if ($physical.Count -gt 0) { $physical[0].Model } else { $null }
+        PrimaryDiskBusType      = if ($physical.Count -gt 0) { $physical[0].BusType } else { $null }
+        PrimaryDiskSizeGB       = if ($physical.Count -gt 0) { $physical[0].SizeGB } else { $null }
+        CapabilityAccessManager = $camWal
     }
+}
+
+
+function Get-CapabilityAccessManagerHealth {
+    $camDirectory = Join-Path $env:ProgramData 'Microsoft\Windows\CapabilityAccessManager'
+    $camWalPath = Join-Path $camDirectory 'CapabilityAccessManager.db-wal'
+
+    $result = [ordered]@{
+        Path                 = $camWalPath
+        Exists               = $false
+        SizeBytes            = 0
+        SizeMB               = 0
+        SizeGB               = 0
+        LastWriteTime        = $null
+        SystemDrive          = $env:SystemDrive
+        SystemDriveSizeGB    = $null
+        PercentOfSystemDrive = 0
+        WarningThresholdGB   = $CapabilityAccessManagerWarningGB
+        CriticalThresholdGB  = $CapabilityAccessManagerCriticalGB
+        Status               = 'Healthy'
+        Error                = $null
+    }
+
+    try {
+        $systemDisk = Get-CimInstance Win32_LogicalDisk -Filter ("DeviceID='{0}'" -f $env:SystemDrive) -ErrorAction SilentlyContinue
+        if ($systemDisk -and $systemDisk.Size) {
+            $result.SystemDriveSizeGB = [math]::Round([double]$systemDisk.Size / 1GB, 2)
+        }
+
+        if (Test-Path -LiteralPath $camWalPath -PathType Leaf) {
+            $file = Get-Item -LiteralPath $camWalPath -Force -ErrorAction Stop
+            $sizeBytes = [double]$file.Length
+            $sizeGB = $sizeBytes / 1GB
+
+            $result.Exists        = $true
+            $result.SizeBytes     = [int64]$file.Length
+            $result.SizeMB        = [math]::Round($sizeBytes / 1MB, 2)
+            $result.SizeGB        = [math]::Round($sizeGB, 3)
+            $result.LastWriteTime = $file.LastWriteTimeUtc.ToString('o')
+
+            if ($systemDisk -and $systemDisk.Size -gt 0) {
+                $result.PercentOfSystemDrive = [math]::Round(($sizeBytes / [double]$systemDisk.Size) * 100, 3)
+            }
+
+            if ($sizeGB -ge $CapabilityAccessManagerCriticalGB) {
+                $result.Status = 'Critical'
+            } elseif ($sizeGB -ge $CapabilityAccessManagerWarningGB) {
+                $result.Status = 'Warning'
+            }
+        }
+
+        $message = if (-not $result.Exists) {
+            'CapabilityAccessManager.db-wal was not present.'
+        } else {
+            'CapabilityAccessManager.db-wal size is {0} GB ({1}% of {2}).' -f `
+                $result.SizeGB, $result.PercentOfSystemDrive, $result.SystemDrive
+        }
+
+        Add-Finding -Severity $result.Status -Category 'Storage' `
+            -Check 'CapabilityAccessManagerDbWal' -Message $message -Value $result.SizeGB
+
+        Write-Log -Level 'INFO' -Message ("CAM WAL check: status={0}; exists={1}; sizeGB={2}; percentOfSystemDrive={3}; path={4}" -f `
+            $result.Status, $result.Exists, $result.SizeGB, $result.PercentOfSystemDrive, $camWalPath)
+    } catch {
+        $result.Status = 'Warning'
+        $result.Error = $_.Exception.Message
+        Add-Finding -Severity 'Warning' -Category 'Storage' `
+            -Check 'CapabilityAccessManagerDbWal' `
+            -Message ("CapabilityAccessManager.db-wal could not be inspected: {0}" -f $_.Exception.Message)
+        Write-Log -Level 'WARN' -Message ("CAM WAL check failed: {0}" -f $_.Exception.Message)
+    }
+
+    [pscustomobject]$result
 }
 
 function Get-DeviceManagerHealth {
     $devices = @()
+    $informationalDegraded = @()
 
     if (Get-Command Get-PnpDevice -ErrorAction SilentlyContinue) {
-        $problems = Get-PnpDevice -PresentOnly -ErrorAction SilentlyContinue |
-            Where-Object { $_.Status -ne 'OK' -or $_.Problem -ne 0 }
+        $presentDevices = @(Get-PnpDevice -PresentOnly -ErrorAction SilentlyContinue)
 
-        foreach ($device in $problems) {
-            $devices += [pscustomobject]@{
+        foreach ($device in $presentDevices) {
+            $problemCode = $null
+            try { $problemCode = [int]$device.Problem } catch { $problemCode = $null }
+
+            $entry = [pscustomobject]@{
                 Class        = $device.Class
                 FriendlyName = $device.FriendlyName
                 InstanceId   = $device.InstanceId
                 Status       = [string]$device.Status
-                ProblemCode  = $device.Problem
+                ProblemCode  = $problemCode
+            }
+
+            if ($null -ne $problemCode -and $problemCode -ne 0) {
+                $devices += $entry
+            }
+            elseif ($device.Status -ne 'OK') {
+                $informationalDegraded += $entry
             }
         }
-    } else {
-        $problems = Get-CimInstance Win32_PnPEntity |
-            Where-Object { $null -ne $_.ConfigManagerErrorCode -and $_.ConfigManagerErrorCode -ne 0 }
+    }
+    else {
+        $presentDevices = @(Get-CimInstance Win32_PnPEntity -ErrorAction SilentlyContinue)
 
-        foreach ($device in $problems) {
-            $devices += [pscustomobject]@{
+        foreach ($device in $presentDevices) {
+            $problemCode = $device.ConfigManagerErrorCode
+            $entry = [pscustomobject]@{
                 Class        = $device.PNPClass
                 FriendlyName = $device.Name
                 InstanceId   = $device.PNPDeviceID
                 Status       = $device.Status
-                ProblemCode  = $device.ConfigManagerErrorCode
+                ProblemCode  = $problemCode
+            }
+
+            if ($null -ne $problemCode -and [int]$problemCode -ne 0) {
+                $devices += $entry
+            }
+            elseif ($device.Status -and $device.Status -ne 'OK') {
+                $informationalDegraded += $entry
             }
         }
     }
 
     if ($devices.Count -gt 0) {
         Add-Finding -Severity 'Warning' -Category 'Hardware' -Check 'DeviceManagerProblems' `
-            -Message ("{0} Device Manager problem(s) detected." -f $devices.Count) `
+            -Message ("{0} actionable Device Manager problem(s) detected." -f $devices.Count) `
             -Value $devices.Count
-    } else {
+    }
+    else {
         Add-Finding -Severity 'Healthy' -Category 'Hardware' -Check 'DeviceManagerProblems' `
-            -Message 'No Device Manager problems were detected.' -Value 0
+            -Message 'No actionable Device Manager problems were detected.' -Value 0
+    }
+
+    if ($informationalDegraded.Count -gt 0) {
+        Add-Finding -Severity 'Info' -Category 'Hardware' -Check 'DeviceManagerDegradedNonActionable' `
+            -Message ("{0} degraded device(s) reported ProblemCode=0 and were not counted as actionable problems." -f $informationalDegraded.Count) `
+            -Value $informationalDegraded.Count
     }
 
     [pscustomobject]@{
-        ProblemCount = $devices.Count
-        Problems     = $devices
+        ProblemCount                 = $devices.Count
+        Problems                     = New-ObjectArrayForJson -InputObject $devices
+        DegradedNonActionableCount   = $informationalDegraded.Count
+        DegradedNonActionableDevices = New-ObjectArrayForJson -InputObject $informationalDegraded
     }
 }
 
@@ -556,7 +1228,7 @@ function Get-DefenderHealth {
         FullScanAge                       = $status.FullScanAge
         RebootRequired                    = [bool]$status.RebootRequired
         IsTamperProtected                 = [bool]$status.IsTamperProtected
-        RecentThreatDetections            = $threats
+        RecentThreatDetections            = New-ObjectArrayForJson -InputObject $threats
         RecentThreatDetectionCount        = $threats.Count
     }
 }
@@ -594,7 +1266,7 @@ function Get-FirewallHealth {
     [pscustomobject]@{
         ProfileCount         = $profiles.Count
         DisabledProfileCount = $disabled.Count
-        Profiles             = $profiles
+        Profiles             = New-ObjectArrayForJson -InputObject $profiles
     }
 }
 
@@ -619,7 +1291,7 @@ function Get-BitLockerHealth {
             EncryptionPercentage= $volume.EncryptionPercentage
             AutoUnlockEnabled   = $volume.AutoUnlockEnabled
             LockStatus          = [string]$volume.LockStatus
-            KeyProtectorTypes   = @($volume.KeyProtector | ForEach-Object { [string]$_.KeyProtectorType })
+            KeyProtectorTypes   = New-StringArrayForJson -InputObject @($volume.KeyProtector | ForEach-Object { [string]$_.KeyProtectorType })
         }
     }
 
@@ -634,7 +1306,7 @@ function Get-BitLockerHealth {
 
     [pscustomobject]@{
         Available = $true
-        Volumes   = $volumes
+        Volumes   = New-ObjectArrayForJson -InputObject $volumes
     }
 }
 
@@ -662,34 +1334,89 @@ function Get-TpmAndSecureBootHealth {
     }
 
     $secureBoot = [pscustomobject]@{
-        Supported = $null
-        Enabled   = $null
-        Error     = $null
+        Supported          = $null
+        Enabled            = $null
+        DetectionMethod    = $null
+        RegistryValue      = $null
+        ConfirmCmdletError = $null
+        Error              = $null
     }
 
+    # Preferred method: Microsoft's SecureBoot cmdlet. On some Windows 11 systems
+    # this can return "Unable to set proper privileges. Access was denied." even
+    # when the caller is elevated. If that occurs, fall back to the Windows
+    # SecureBoot state maintained under HKLM.
     if (Get-Command Confirm-SecureBootUEFI -ErrorAction SilentlyContinue) {
         try {
             $secureBoot.Enabled = [bool](Confirm-SecureBootUEFI -ErrorAction Stop)
             $secureBoot.Supported = $true
-        } catch {
-            if ($_.Exception.Message -match 'not supported') {
+            $secureBoot.DetectionMethod = 'Confirm-SecureBootUEFI'
+        }
+        catch {
+            $secureBoot.ConfirmCmdletError = $_.Exception.Message
+
+            if ($_.Exception.Message -match 'not supported|platform does not support|unsupported') {
                 $secureBoot.Supported = $false
-            } else {
-                $secureBoot.Error = $_.Exception.Message
+                $secureBoot.DetectionMethod = 'Confirm-SecureBootUEFI'
             }
         }
     }
 
-    if ($secureBoot.Supported -eq $true) {
+    # Registry fallback. UEFISecureBootEnabled is maintained by Windows and is
+    # readable without needing the firmware-variable privilege required by the
+    # SecureBoot cmdlet.
+    if ($null -eq $secureBoot.Enabled -and $secureBoot.Supported -ne $false) {
+        $secureBootStatePath = 'HKLM:\SYSTEM\CurrentControlSet\Control\SecureBoot\State'
+
+        try {
+            if (Test-Path -LiteralPath $secureBootStatePath) {
+                $state = Get-ItemProperty -LiteralPath $secureBootStatePath `
+                    -Name 'UEFISecureBootEnabled' -ErrorAction Stop
+
+                $rawState = $state.UEFISecureBootEnabled
+                if ($null -ne $rawState) {
+                    $secureBoot.RegistryValue = [int]$rawState
+                    $secureBoot.Enabled = ([int]$rawState -eq 1)
+                    $secureBoot.Supported = $true
+                    $secureBoot.DetectionMethod = 'Registry'
+                }
+            }
+        }
+        catch {
+            $secureBoot.Error = $_.Exception.Message
+        }
+    }
+
+    if ($secureBoot.Supported -eq $true -and $null -ne $secureBoot.Enabled) {
         $severity = if ($secureBoot.Enabled) { 'Healthy' } else { 'Warning' }
+
+        $methodText = if ($secureBoot.DetectionMethod) {
+            '; method={0}' -f $secureBoot.DetectionMethod
+        } else {
+            ''
+        }
+
         Add-Finding -Severity $severity -Category 'Security' -Check 'SecureBoot' `
-            -Message ("Secure Boot enabled={0}." -f $secureBoot.Enabled)
-    } elseif ($secureBoot.Supported -eq $false) {
+            -Message ("Secure Boot enabled={0}{1}." -f $secureBoot.Enabled, $methodText)
+    }
+    elseif ($secureBoot.Supported -eq $false) {
         Add-Finding -Severity 'Info' -Category 'Security' -Check 'SecureBoot' `
             -Message 'Secure Boot is not supported on this system.'
-    } else {
+    }
+    else {
+        $diagnostic = @(
+            $secureBoot.ConfirmCmdletError
+            $secureBoot.Error
+        ) | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+
+        $detail = if ($diagnostic.Count -gt 0) {
+            ' Diagnostic: {0}' -f (($diagnostic | Select-Object -Unique) -join ' | ')
+        } else {
+            ''
+        }
+
         Add-Finding -Severity 'Warning' -Category 'Security' -Check 'SecureBoot' `
-            -Message 'Secure Boot state could not be determined.'
+            -Message ("Secure Boot state could not be determined.{0}" -f $detail)
     }
 
     [pscustomobject]@{
@@ -733,11 +1460,15 @@ function Get-NetworkHealth {
                 InterfaceIndex = $config.InterfaceIndex
                 NetProfileName = if ($config.NetProfile) { $config.NetProfile.Name } else { $null }
                 NetworkCategory= if ($config.NetProfile) { [string]$config.NetProfile.NetworkCategory } else { $null }
-                IPv4Addresses  = @($config.IPv4Address | ForEach-Object { $_.IPAddress })
-                IPv6Addresses  = @($config.IPv6Address | ForEach-Object { $_.IPAddress })
-                IPv4Gateway    = @($config.IPv4DefaultGateway | ForEach-Object { $_.NextHop })
-                IPv6Gateway    = @($config.IPv6DefaultGateway | ForEach-Object { $_.NextHop })
-                DNSServers     = $dnsServers
+                IPv4Addresses  = New-StringArrayForJson -InputObject @($config.IPv4Address | ForEach-Object { $_.IPAddress })
+                IPv6Addresses  = New-StringArrayForJson -InputObject @($config.IPv6Address | ForEach-Object { $_.IPAddress })
+                IPv4Gateway    = New-StringArrayForJson -InputObject @($config.IPv4DefaultGateway | ForEach-Object {
+                    Get-ObjectPropertyValueSafe -InputObject $_ -Name 'NextHop'
+                } | Where-Object { $null -ne $_ })
+                IPv6Gateway    = New-StringArrayForJson -InputObject @($config.IPv6DefaultGateway | ForEach-Object {
+                    Get-ObjectPropertyValueSafe -InputObject $_ -Name 'NextHop'
+                } | Where-Object { $null -ne $_ })
+                DNSServers     = New-StringArrayForJson -InputObject $dnsServers
                 DhcpEnabled    = try {
                     (Get-NetIPInterface -InterfaceIndex $config.InterfaceIndex -AddressFamily IPv4 -ErrorAction Stop).Dhcp -eq 'Enabled'
                 } catch { $null }
@@ -755,8 +1486,8 @@ function Get-NetworkHealth {
     }
 
     [pscustomobject]@{
-        Adapters           = $adapters
-        IPConfigurations   = $ipConfigs
+        Adapters           = New-ObjectArrayForJson -InputObject $adapters
+        IPConfigurations   = New-ObjectArrayForJson -InputObject $ipConfigs
         ActiveAdapterCount = $upPhysical.Count
     }
 }
@@ -820,8 +1551,8 @@ function Get-WindowsUpdateHealth {
             }
         } else { $null }
         RecentHotfixCount = $recent.Count
-        RecentHotfixes    = $recent
-        UpdateHistory     = $history
+        RecentHotfixes    = New-ObjectArrayForJson -InputObject $recent
+        UpdateHistory     = New-ObjectArrayForJson -InputObject $history
     }
 }
 
@@ -890,9 +1621,9 @@ function Get-EventLogHealth {
     [pscustomobject]@{
         LookbackHours          = $EventLookbackHours
         ApplicationCrashCount  = $applicationCrashes.Count
-        ApplicationCrashes     = $applicationCrashes
+        ApplicationCrashes     = New-ObjectArrayForJson -InputObject $applicationCrashes
         CriticalEventCount     = $criticalEvents.Count
-        CriticalEvents         = $criticalEvents
+        CriticalEvents         = New-ObjectArrayForJson -InputObject $criticalEvents
     }
 }
 
@@ -903,44 +1634,71 @@ function Get-ServiceHealth {
         $service = Get-CimInstance Win32_Service -Filter ("Name='{0}'" -f $serviceName.Replace("'","''")) `
             -ErrorAction SilentlyContinue
 
+        $expectation = if ($script:CriticalServiceExpectations.ContainsKey($serviceName)) {
+            [string]$script:CriticalServiceExpectations[$serviceName]
+        }
+        else {
+            'RequiredRunning'
+        }
+
         if (-not $service) {
+            $healthy = ($expectation -eq 'Optional')
             $results += [pscustomobject]@{
-                Name        = $serviceName
-                DisplayName = $null
-                Exists      = $false
-                State       = 'NotFound'
-                StartMode   = $null
-                ProcessId   = $null
-                Healthy     = $null
+                Name          = $serviceName
+                DisplayName   = $null
+                Exists        = $false
+                State         = 'NotFound'
+                StartMode     = $null
+                ProcessId     = $null
+                Expectation   = $expectation
+                Healthy       = $healthy
             }
-            Add-Finding -Severity 'Info' -Category 'Services' -Check $serviceName `
-                -Message ("Service {0} is not installed." -f $serviceName)
+
+            $severity = if ($healthy) { 'Info' } else { 'Critical' }
+            Add-Finding -Severity $severity -Category 'Services' -Check $serviceName `
+                -Message ("Service {0} is not installed; expectation={1}." -f $serviceName, $expectation)
             continue
         }
 
-        $shouldRun = $service.StartMode -notin @('Disabled','Manual')
-        $healthy = if ($shouldRun) { $service.State -eq 'Running' } else { $true }
+        $healthy = switch ($expectation) {
+            'RequiredRunning' {
+                ($service.State -eq 'Running' -and $service.StartMode -ne 'Disabled')
+            }
+            'AllowedStoppedManual' {
+                (
+                    $service.State -eq 'Running' -or
+                    ($service.State -eq 'Stopped' -and $service.StartMode -eq 'Manual')
+                )
+            }
+            'Optional' {
+                $true
+            }
+            default {
+                ($service.State -eq 'Running')
+            }
+        }
 
         $results += [pscustomobject]@{
-            Name        = $service.Name
-            DisplayName = $service.DisplayName
-            Exists      = $true
-            State       = $service.State
-            StartMode   = $service.StartMode
-            ProcessId   = $service.ProcessId
-            Healthy     = $healthy
+            Name          = $service.Name
+            DisplayName   = $service.DisplayName
+            Exists        = $true
+            State         = $service.State
+            StartMode     = $service.StartMode
+            ProcessId     = $service.ProcessId
+            Expectation   = $expectation
+            Healthy       = $healthy
         }
 
         $severity = if ($healthy) { 'Healthy' } else { 'Critical' }
         Add-Finding -Severity $severity -Category 'Services' -Check $service.Name `
-            -Message ("Service {0}: state={1}, startup={2}." -f
-                $service.Name, $service.State, $service.StartMode)
+            -Message ("Service {0}: state={1}, startup={2}, expectation={3}." -f
+                $service.Name, $service.State, $service.StartMode, $expectation)
     }
 
     [pscustomobject]@{
         CheckedCount  = $results.Count
         UnhealthyCount= @($results | Where-Object { $_.Healthy -eq $false }).Count
-        Services      = $results
+        Services      = New-ObjectArrayForJson -InputObject $results
     }
 }
 
@@ -954,7 +1712,7 @@ function Get-ManagementAgentHealth {
         'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*'
     )) {
         $uninstallEntries += @(Get-ItemProperty -Path $path -ErrorAction SilentlyContinue |
-            Where-Object { $_.DisplayName })
+            Where-Object { Get-ObjectPropertyValueSafe -InputObject $_ -Name 'DisplayName' })
     }
 
     $agents = @()
@@ -963,30 +1721,48 @@ function Get-ManagementAgentHealth {
         $escaped = [regex]::Escape($pattern)
 
         $matchingServices = @($serviceInventory | Where-Object {
-            $_.Name -match $escaped -or $_.DisplayName -match $escaped -or $_.PathName -match $escaped
+            (Get-ObjectPropertyValueSafe -InputObject $_ -Name 'Name') -match $escaped -or
+            (Get-ObjectPropertyValueSafe -InputObject $_ -Name 'DisplayName') -match $escaped -or
+            (Get-ObjectPropertyValueSafe -InputObject $_ -Name 'PathName') -match $escaped
         })
 
         $matchingProcesses = @($processInventory | Where-Object {
-            $_.Name -match $escaped -or $_.ExecutablePath -match $escaped -or $_.CommandLine -match $escaped
+            (Get-ObjectPropertyValueSafe -InputObject $_ -Name 'Name') -match $escaped -or
+            (Get-ObjectPropertyValueSafe -InputObject $_ -Name 'ExecutablePath') -match $escaped -or
+            (Get-ObjectPropertyValueSafe -InputObject $_ -Name 'CommandLine') -match $escaped
         })
 
         $matchingProducts = @($uninstallEntries | Where-Object {
-            $_.DisplayName -match $escaped -or $_.Publisher -match $escaped
+            (Get-ObjectPropertyValueSafe -InputObject $_ -Name 'DisplayName') -match $escaped -or
+            (Get-ObjectPropertyValueSafe -InputObject $_ -Name 'Publisher') -match $escaped
         })
 
         if ($matchingServices.Count -gt 0 -or $matchingProcesses.Count -gt 0 -or $matchingProducts.Count -gt 0) {
             $services = @($matchingServices | ForEach-Object {
                 [pscustomobject]@{
-                    Name        = $_.Name
-                    DisplayName = $_.DisplayName
-                    State       = $_.State
-                    StartMode   = $_.StartMode
-                    ProcessId   = $_.ProcessId
+                    Name        = (Get-ObjectPropertyValueSafe -InputObject $_ -Name 'Name')
+                    DisplayName = (Get-ObjectPropertyValueSafe -InputObject $_ -Name 'DisplayName')
+                    State       = (Get-ObjectPropertyValueSafe -InputObject $_ -Name 'State')
+                    StartMode   = (Get-ObjectPropertyValueSafe -InputObject $_ -Name 'StartMode')
+                    ProcessId   = (Get-ObjectPropertyValueSafe -InputObject $_ -Name 'ProcessId')
                 }
             })
 
-            $products = @($matchingProducts | Select-Object DisplayName, DisplayVersion, Publisher, InstallDate)
-            $processes = @($matchingProcesses | Select-Object Name, ProcessId, ExecutablePath)
+            $products = @($matchingProducts | ForEach-Object {
+                [pscustomobject]@{
+                    DisplayName    = (Get-ObjectPropertyValueSafe -InputObject $_ -Name 'DisplayName')
+                    DisplayVersion = (Get-ObjectPropertyValueSafe -InputObject $_ -Name 'DisplayVersion')
+                    Publisher      = (Get-ObjectPropertyValueSafe -InputObject $_ -Name 'Publisher')
+                    InstallDate    = (Get-ObjectPropertyValueSafe -InputObject $_ -Name 'InstallDate')
+                }
+            })
+            $processes = @($matchingProcesses | ForEach-Object {
+                [pscustomobject]@{
+                    Name           = (Get-ObjectPropertyValueSafe -InputObject $_ -Name 'Name')
+                    ProcessId      = (Get-ObjectPropertyValueSafe -InputObject $_ -Name 'ProcessId')
+                    ExecutablePath = (Get-ObjectPropertyValueSafe -InputObject $_ -Name 'ExecutablePath')
+                }
+            })
 
             $serviceHealthy = if ($services.Count -gt 0) {
                 @($services | Where-Object { $_.State -eq 'Running' }).Count -gt 0
@@ -998,9 +1774,9 @@ function Get-ManagementAgentHealth {
                 Pattern        = $pattern
                 Detected       = $true
                 Healthy        = $serviceHealthy
-                Services       = $services
-                Processes      = $processes
-                InstalledItems = $products
+                Services       = New-ObjectArrayForJson -InputObject $services
+                Processes      = New-ObjectArrayForJson -InputObject $processes
+                InstalledItems = New-ObjectArrayForJson -InputObject $products
             }
 
             $severity = if ($serviceHealthy) { 'Healthy' } else { 'Warning' }
@@ -1015,9 +1791,9 @@ function Get-ManagementAgentHealth {
     }
 
     [pscustomobject]@{
-        PatternsChecked = $ManagementAgentPatterns
+        PatternsChecked = New-StringArrayForJson -InputObject $ManagementAgentPatterns
         DetectedCount    = $agents.Count
-        Agents           = $agents
+        Agents           = New-ObjectArrayForJson -InputObject $agents
     }
 }
 
@@ -1129,19 +1905,19 @@ function Get-EdgeHealth {
         ExecutableModified = $fileDate
         Health             = $health
         UpdatesDisabled    = $updatesDisabled
-        UpdateServices     = $services
-        UpdateTasks        = $tasks
+        UpdateServices     = New-ObjectArrayForJson -InputObject $services
+        UpdateTasks        = New-ObjectArrayForJson -InputObject $tasks
         UpdatePolicy       = [pscustomobject]$policy
         CrashCount         = $edgeCrashes.Count
-        Crashes            = $edgeCrashes
+        Crashes            = New-ObjectArrayForJson -InputObject $edgeCrashes
     }
 }
 
 function Get-HealthSummary {
-    $healthy  = @($script:Findings | Where-Object Severity -eq 'Healthy').Count
-    $info     = @($script:Findings | Where-Object Severity -eq 'Info').Count
-    $warnings = @($script:Findings | Where-Object Severity -eq 'Warning').Count
-    $critical = @($script:Findings | Where-Object Severity -eq 'Critical').Count
+    $healthy  = @($script:Findings | ForEach-Object { $_ } | Where-Object Severity -eq 'Healthy').Count
+    $info     = @($script:Findings | ForEach-Object { $_ } | Where-Object Severity -eq 'Info').Count
+    $warnings = @($script:Findings | ForEach-Object { $_ } | Where-Object Severity -eq 'Warning').Count
+    $critical = @($script:Findings | ForEach-Object { $_ } | Where-Object Severity -eq 'Critical').Count
 
     $status = if ($critical -gt 0) {
         'Critical'
@@ -1157,7 +1933,73 @@ function Get-HealthSummary {
         InfoCount     = $info
         WarningCount  = $warnings
         CriticalCount = $critical
-        Findings      = @($script:Findings)
+        Findings      = New-ObjectArrayForJson -InputObject $script:Findings
+    }
+}
+
+function Write-HealthSnapshotSummary {
+    param(
+        $OperatingSystem,
+        $Performance,
+        $Storage,
+        $DeviceManager,
+        $Defender,
+        $Firewall,
+        $EventLogs,
+        $Services,
+        $Agents,
+        $Edge,
+        [Parameter(Mandatory)]$Summary
+    )
+
+    Write-Log -Message ("Health summary: Status={0}; Healthy={1}; Info={2}; Warning={3}; Critical={4}." -f `
+        $Summary.Status, $Summary.HealthyCount, $Summary.InfoCount, $Summary.WarningCount, $Summary.CriticalCount)
+
+    if ($OperatingSystem) {
+        Write-Log -Message ("Operating system: Build={0}; UptimeDays={1}; PendingReboot={2}; Reasons={3}." -f `
+            $OperatingSystem.FullBuild, $OperatingSystem.UptimeDays, $OperatingSystem.PendingReboot, `
+            (@($OperatingSystem.PendingRebootReasonNames) -join ','))
+    }
+    if ($Performance) {
+        Write-Log -Message ("Performance: CpuAverage={0}%; CpuMaximum={1}%; MemoryUsed={2}% ({3}/{4} GB)." -f `
+            $Performance.CpuAveragePercent, $Performance.CpuMaximumPercent, $Performance.MemoryUsedPercent, `
+            $Performance.MemoryUsedGB, $Performance.MemoryTotalGB)
+    }
+    if ($Storage) {
+        foreach ($volume in @($Storage.Volumes)) {
+            Write-Log -Message ("Volume: Drive={0}; Used={1}% ({2} GB); Free={3} GB; Size={4} GB; FileSystem={5}." -f `
+                $volume.DriveLetter, $volume.UsedPercent, $volume.UsedGB, $volume.FreeGB, $volume.SizeGB, $volume.FileSystem)
+        }
+        if ($Storage.CapabilityAccessManager) {
+            $cam = $Storage.CapabilityAccessManager
+            Write-Log -Message ("CapabilityAccessManager.db-wal: Status={0}; Exists={1}; SizeGB={2}; PercentOfSystemDrive={3}; WarningGB={4}; CriticalGB={5}." -f `
+                $cam.Status, $cam.Exists, $cam.SizeGB, $cam.PercentOfSystemDrive, $cam.WarningThresholdGB, $cam.CriticalThresholdGB)
+        }
+    }
+
+    Write-Log -Message ("Operational counts: DeviceProblems={0}; DisabledFirewallProfiles={1}; CriticalEvents={2}; ApplicationCrashes={3}; UnhealthyServices={4}; ManagementAgents={5}; EdgeHealth={6}; EdgeVersion={7}." -f `
+        $(if ($DeviceManager) { $DeviceManager.ProblemCount } else { $null }), `
+        $(if ($Firewall) { $Firewall.DisabledProfileCount } else { $null }), `
+        $(if ($EventLogs) { $EventLogs.CriticalEventCount } else { $null }), `
+        $(if ($EventLogs) { $EventLogs.ApplicationCrashCount } else { $null }), `
+        $(if ($Services) { $Services.UnhealthyCount } else { $null }), `
+        $(if ($Agents) { $Agents.DetectedCount } else { $null }), `
+        $(if ($Edge) { $Edge.Health } else { $null }), `
+        $(if ($Edge) { $Edge.Version } else { $null }))
+
+    if ($Defender -and $Defender.Available) {
+        Write-Log -Message ("Defender: Available={0}; AntivirusEnabled={1}; RealTimeProtection={2}; SignatureVersion={3}; SignatureUpdated={4}; ThreatDetections={5}." -f `
+            $Defender.Available, $Defender.AntivirusEnabled, $Defender.RealTimeProtectionEnabled, `
+            $Defender.AntivirusSignatureVersion, $Defender.AntivirusSignatureLastUpdated, $Defender.RecentThreatDetectionCount)
+    }
+    elseif ($Defender) {
+        Write-Log -Level 'WARN' -Message 'Defender: status information is unavailable on this endpoint.'
+    }
+
+    foreach ($finding in @($Summary.Findings | Where-Object { $_.Severity -in @('Warning','Critical') })) {
+        $level = if ($finding.Severity -eq 'Critical') { 'ERROR' } else { 'WARN' }
+        Write-Log -Level $level -Message ("Health finding: Severity={0}; Category={1}; Check={2}; Message={3}" -f `
+            $finding.Severity, $finding.Category, $finding.Check, $finding.Message)
     }
 }
 
@@ -1182,11 +2024,65 @@ function Write-Telemetry {
     Write-JsonAtomically -Path $script:LatestPath -Json $jsonPretty
 }
 
+function Write-HealthFindingTelemetry {
+    param(
+        [Parameter(Mandatory)]$Finding,
+        [Parameter(Mandatory)][int]$FindingNumber,
+        [Parameter(Mandatory)][int]$FindingCount,
+        [Parameter(Mandatory)][datetime]$EventTime,
+        $Identity,
+        [Parameter(Mandatory)]$Summary
+    )
+
+    $findingEvent = [ordered]@{
+        '@timestamp'   = $EventTime.ToUniversalTime().ToString('o')
+        EventType      = 'endpoint.health.finding'
+        SchemaVersion  = '1.0'
+        RunId          = $script:RunId
+
+        ComputerName   = $env:COMPUTERNAME
+        Domain         = if ($Identity) { $Identity.Domain } else { $env:USERDOMAIN }
+        Building       = if ($Identity) { $Identity.Building } else { $null }
+        Lab            = if ($Identity) { $Identity.Lab } else { $null }
+        DeviceIdentifier = if ($Identity) { $Identity.DeviceIdentifier } else { $null }
+
+        ScriptName     = $script:ScriptName
+        ScriptVersion  = $script:ScriptVersion
+        FindingNumber  = $FindingNumber
+        FindingCount   = $FindingCount
+
+        Finding = [ordered]@{
+            Severity     = [string]$Finding.Severity
+            Category     = [string]$Finding.Category
+            Check        = [string]$Finding.Check
+            Message      = [string]$Finding.Message
+            ValueType    = [string]$Finding.ValueType
+            ValueNumber  = $Finding.ValueNumber
+            ValueBoolean = $Finding.ValueBoolean
+            ValueText    = $Finding.ValueText
+            ValueTexts   = New-StringArrayForJson -InputObject $Finding.ValueTexts
+            ValueJson    = $Finding.ValueJson
+        }
+
+        HealthSummary = [ordered]@{
+            Status        = [string]$Summary.Status
+            WarningCount  = [int]$Summary.WarningCount
+            CriticalCount = [int]$Summary.CriticalCount
+        }
+    }
+
+    $jsonCompact = $findingEvent | ConvertTo-Json -Depth 12 -Compress
+    Write-MaintenanceTelemetryLine -Path $script:NdjsonPath -JsonLine $jsonCompact
+}
+
 Ensure-Directory -Path $LogDirectory
 Write-Log -Message ("Starting {0} version {1}. RunId={2}" -f
     $script:ScriptName, $script:ScriptVersion, $script:RunId)
+Write-Log -Message ("Active staged text log: {0}" -f $script:LogPath)
+Write-Log -Message ("Completed text log publish path: {0}" -f $script:PublishedLogPath)
 
 $identity        = Invoke-Collector -Name 'ComputerIdentity'       -ScriptBlock { Get-ComputerIdentity }
+$hardware        = Invoke-Collector -Name 'HardwareInventory'      -ScriptBlock { Get-HardwareInventory }
 $operatingSystem = Invoke-Collector -Name 'OperatingSystem'       -ScriptBlock { Get-OperatingSystemHealth }
 $performance     = Invoke-Collector -Name 'Performance'           -ScriptBlock { Get-PerformanceHealth }
 $storage         = Invoke-Collector -Name 'Storage'               -ScriptBlock { Get-DiskHealth }
@@ -1203,8 +2099,34 @@ $agents          = Invoke-Collector -Name 'ManagementAgents'      -ScriptBlock {
 $edge            = Invoke-Collector -Name 'MicrosoftEdge'         -ScriptBlock { Get-EdgeHealth }
 
 $summary = Get-HealthSummary
+Write-HealthSnapshotSummary -OperatingSystem $operatingSystem -Performance $performance -Storage $storage `
+    -DeviceManager $deviceManager -Defender $defender -Firewall $firewall -EventLogs $eventLogs `
+    -Services $services -Agents $agents -Edge $edge -Summary $summary
+
+if ($hardware) {
+    Write-Log -Message ("Hardware inventory summary: Building={0}; Lab={1}; CPU={2}; Cores={3}; LogicalProcessors={4}; RAM={5}GB; MemorySlots={6}/{7}; GPU={8}; GPUCount={9}; StorageManufacturer={10}; StorageModel={11}; StorageBus={12}; StorageGB={13}." -f `
+        $(if ($identity) { $identity.Building } else { $null }),
+        $(if ($identity) { $identity.Lab } else { $null }),
+        $hardware.CPU.PrimaryModel,
+        $hardware.CPU.TotalCores,
+        $hardware.CPU.TotalLogicalProcessors,
+        $hardware.Memory.TotalInstalledGB,
+        $hardware.Memory.PopulatedSlots,
+        $hardware.Memory.SlotCount,
+        $hardware.GPU.PrimaryModel,
+        $hardware.GPU.AdapterCount,
+        $(if ($storage) { $storage.PrimaryDiskManufacturer } else { $null }),
+        $(if ($storage) { $storage.PrimaryDiskModel } else { $null }),
+        $(if ($storage) { $storage.PrimaryDiskBusType } else { $null }),
+        $(if ($storage) { $storage.PrimaryDiskSizeGB } else { $null }))
+}
+
 $endTime = Get-Date
-$failedCollectors = @($script:CollectorResults | Where-Object Status -eq 'Failed').Count
+$failedCollectors = @($script:CollectorResults | ForEach-Object { $_ } | Where-Object Status -eq 'Failed').Count
+$systemVolume = if ($storage) {
+    @($storage.Volumes | Where-Object { $_.DriveLetter -eq $env:SystemDrive } | Select-Object -First 1)[0]
+} else { $null }
+$camWal = if ($storage) { $storage.CapabilityAccessManager } else { $null }
 
 $executionStatus = if ($failedCollectors -gt 0) {
     'SuccessWithWarnings'
@@ -1218,10 +2140,6 @@ $executionStatus = if ($failedCollectors -gt 0) {
 
 $exitCode = if ($failedCollectors -gt 0) {
     2
-} elseif ($summary.Status -eq 'Critical') {
-    3
-} elseif ($summary.Status -eq 'Warning') {
-    1
 } else {
     0
 }
@@ -1234,6 +2152,9 @@ $event = [ordered]@{
 
     ComputerName = $env:COMPUTERNAME
     Domain       = if ($identity) { $identity.Domain } else { $env:USERDOMAIN }
+    Building     = if ($identity) { $identity.Building } else { $null }
+    Lab          = if ($identity) { $identity.Lab } else { $null }
+    DeviceIdentifier = if ($identity) { $identity.DeviceIdentifier } else { $null }
 
     ScriptName    = $script:ScriptName
     ScriptVersion = $script:ScriptVersion
@@ -1244,9 +2165,37 @@ $event = [ordered]@{
     DurationSeconds = [math]::Round(($endTime - $script:StartTime).TotalSeconds, 3)
     WarningCount  = $script:WarningCount
     ErrorCount    = $script:ErrorCount
+    TextLogPath   = $script:PublishedLogPath
+
+    AlertMetrics = [ordered]@{
+        CpuAveragePercent = if ($performance) { $performance.CpuAveragePercent } else { $null }
+        CpuMaximumPercent = if ($performance) { $performance.CpuMaximumPercent } else { $null }
+        MemoryUsedPercent = if ($performance) { $performance.MemoryUsedPercent } else { $null }
+        SystemDriveUsedPercent = if ($systemVolume) { $systemVolume.UsedPercent } else { $null }
+        SystemDriveFreeGB = if ($systemVolume) { $systemVolume.FreeGB } else { $null }
+        CapabilityAccessManagerWalSizeGB = if ($camWal) { $camWal.SizeGB } else { $null }
+        CapabilityAccessManagerWalStatus = if ($camWal) { $camWal.Status } else { $null }
+        DeviceManagerProblemCount = if ($deviceManager) { $deviceManager.ProblemCount } else { $null }
+        DeviceManagerDegradedNonActionableCount = if ($deviceManager) { $deviceManager.DegradedNonActionableCount } else { $null }
+        CriticalEventCount = if ($eventLogs) { $eventLogs.CriticalEventCount } else { $null }
+        ApplicationCrashCount = if ($eventLogs) { $eventLogs.ApplicationCrashCount } else { $null }
+        UnhealthyCriticalServiceCount = if ($services) { $services.UnhealthyCount } else { $null }
+        DisabledFirewallProfileCount = if ($firewall) { $firewall.DisabledProfileCount } else { $null }
+        DefenderRecentThreatDetectionCount = if ($defender -and $defender.Available) { $defender.RecentThreatDetectionCount } else { $null }
+        PendingReboot = if ($operatingSystem) { $operatingSystem.PendingReboot } else { $null }
+        PendingRebootReasonNames = if ($operatingSystem) {
+            New-StringArrayForJson -InputObject $operatingSystem.PendingRebootReasonNames
+        } else {
+            [object[]]@()
+        }
+        HealthWarningCount = $summary.WarningCount
+        HealthCriticalCount = $summary.CriticalCount
+        CollectorFailureCount = $failedCollectors
+    }
 
     HealthSummary = $summary
     Identity      = $identity
+    Hardware      = $hardware
     OperatingSystem = $operatingSystem
     Performance   = $performance
     Storage       = $storage
@@ -1266,16 +2215,58 @@ $event = [ordered]@{
     Applications   = [ordered]@{
         MicrosoftEdge = $edge
     }
-    Collectors    = @($script:CollectorResults)
+    Collectors    = New-ObjectArrayForJson -InputObject $script:CollectorResults
 }
 
 try {
+    Write-Log -Message ("Elastic endpoint-health summary: Health={0}; Critical={1}; Warnings={2}; CPU={3}%; Memory={4}%; SystemDrive={5}%; PendingReboot={6}; DeviceProblems={7}; FirewallDisabled={8}; CollectorFailures={9}; FindingEvents={10}" -f `
+        $summary.Status,
+        $summary.CriticalCount,
+        $summary.WarningCount,
+        $(if ($performance) { $performance.CpuAveragePercent } else { $null }),
+        $(if ($performance) { $performance.MemoryUsedPercent } else { $null }),
+        $(if ($systemVolume) { $systemVolume.UsedPercent } else { $null }),
+        $(if ($operatingSystem) { $operatingSystem.PendingReboot } else { $null }),
+        $(if ($deviceManager) { $deviceManager.ProblemCount } else { $null }),
+        $(if ($firewall) { $firewall.DisabledProfileCount } else { $null }),
+        $failedCollectors,
+        @($summary.Findings | Where-Object { $_.Severity -in @('Warning','Critical') }).Count)
+
     Write-Telemetry -Event $event
-    Write-Log -Message ("Endpoint snapshot completed. Health={0}; ExitCode={1}; CollectorsFailed={2}" -f
-        $summary.Status, $exitCode, $failedCollectors)
-} catch {
+
+    $actionableFindings = @($summary.Findings | Where-Object { $_.Severity -in @('Warning','Critical') })
+    for ($findingIndex = 0; $findingIndex -lt $actionableFindings.Count; $findingIndex++) {
+        Write-HealthFindingTelemetry -Finding $actionableFindings[$findingIndex] `
+            -FindingNumber ($findingIndex + 1) -FindingCount $actionableFindings.Count `
+            -EventTime $endTime -Identity $identity -Summary $summary
+    }
+
+    Write-Log -Message ("Endpoint snapshot completed. Health={0}; ExitCode={1}; CollectorsFailed={2}; FindingEvents={3}" -f
+        $summary.Status, $exitCode, $failedCollectors, $actionableFindings.Count)
+}
+catch {
     Write-Log -Level 'ERROR' -Message ("Unable to write endpoint telemetry: {0}" -f $_.Exception.Message)
-    exit 4
+    $exitCode = 4
+}
+
+# Final append before the completed immutable file enters C:\Logs.
+Write-Log -Message ("Finalizing {0}. Health={1}; ExitCode={2}; Warnings={3}; Errors={4}" -f `
+    $script:ScriptName,
+    $summary.Status,
+    $exitCode,
+    $script:WarningCount,
+    $script:ErrorCount) `
+    -Level $(if ($exitCode -eq 4) { 'ERROR' } elseif ($exitCode -eq 2) { 'WARN' } else { 'INFO' })
+
+if ($null -ne $script:LogSession) {
+    $publishResult = Publish-MaintenanceLog -LogSession $script:LogSession
+
+    if ($publishResult.Published) {
+        Write-Host ("Published completed script 14 text log for Elastic: {0}" -f $script:PublishedLogPath) -ForegroundColor Green
+    }
+    else {
+        Write-Warning ("Script 14 completed text log remains in staging because publication failed: {0}" -f $publishResult.Path)
+    }
 }
 
 exit $exitCode

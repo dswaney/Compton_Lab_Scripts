@@ -1,7 +1,10 @@
-﻿# =====================================================================
+# =====================================================================
 # ScriptName: 13_Configure_Autologon_And_Edge.ps1
-# ScriptVersion: 2.1.0
-# LastUpdated: 2026-07-27
+# ScriptVersion: 2.1.3
+# LastUpdated: 2026-08-17
+# Changes: v2.1.3 normalizes Windows 11 product naming, makes telemetry collections explicitly JSON-array safe,
+#          and adds a concise Elastic configuration summary while preserving password redaction.
+#          v2.1.2 uses Maintenance.Framework v2.4 staged text logging.
 # Purpose: Configure lab autologon and launch Microsoft Edge InPrivate
 #          for approved computer-name patterns, with verification and
 #          structured maintenance telemetry. The autologon password is Base64-obfuscated in the script and decoded only at runtime.
@@ -17,7 +20,7 @@ param(
     [string]$DefaultUserName = 'CC-Student',
 
     [ValidateNotNullOrEmpty()]
-    [string]$DefaultPasswordBase64 = '',
+    [string]$DefaultPasswordBase64 = 'Q0MkdHVkM250IQ==',
 
     [string]$DefaultDomainName = 'Compton.edu',
 
@@ -33,13 +36,15 @@ Set-StrictMode -Version 2.0
 $ErrorActionPreference = 'Stop'
 
 $ScriptName = '13_Configure_Autologon_And_Edge.ps1'
-$ScriptVersion = '2.1.0'
+$ScriptVersion = '2.1.3'
 $RunId = [guid]::NewGuid().Guid
 $StartTime = Get-Date
 $ComputerName = $env:COMPUTERNAME
 $DomainName = $env:USERDOMAIN
 $RunningAccount = [Security.Principal.WindowsIdentity]::GetCurrent().Name
-$LogPath = Join-Path $LogDirectory '13_Configure_Autologon_And_Edge.log'
+$LogPath = $null
+$PublishedLogPath = $null
+$LogSession = $null
 $TelemetryPath = Join-Path $LogDirectory 'Maintenance-Telemetry.ndjson'
 $LatestTelemetryPath = Join-Path $LogDirectory '13_Configure_Autologon_And_Edge.latest.json'
 $WinlogonPath = 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon'
@@ -71,7 +76,32 @@ $script:DecodedPassword = $null
 # Load the shared framework from the same directory as this script.
 $MaintenanceFrameworkPath = 'C:\Scripts\Maintenance.Framework.psm1'
 Import-Module -Name $MaintenanceFrameworkPath -Force -ErrorAction Stop
-$MaintenanceConfig = Initialize-MaintenanceEnvironment -ScriptRoot 'C:\Scripts' -LogRoot 'C:\Logs'
+$MaintenanceConfig = Initialize-MaintenanceEnvironment -ScriptRoot 'C:\Scripts' -LogRoot $LogDirectory
+
+$requiredFrameworkVersion = [version]'2.4.0'
+$currentFrameworkVersion = [version](Get-MaintenanceFrameworkVersion)
+
+if ($currentFrameworkVersion -lt $requiredFrameworkVersion) {
+    throw "Script 13 requires Maintenance.Framework.psm1 version $requiredFrameworkVersion or newer. Installed version: $currentFrameworkVersion"
+}
+
+Archive-MaintenanceLogs `
+    -ScriptName $ScriptName `
+    -LogRoot $LogDirectory `
+    -AdditionalPatterns @(
+        '13_Configure_Autologon_And_Edge.log',
+        '*-13_Configure_Autologon_And_Edge-*.log'
+    ) | Out-Null
+
+$LogSession = New-MaintenanceStagedLog `
+    -ScriptName $ScriptName `
+    -LogRoot $LogDirectory `
+    -StagingRoot $MaintenanceConfig.LogStagingRoot `
+    -ComputerName $ComputerName `
+    -Timestamp $StartTime
+
+$LogPath = [string]$LogSession.WorkingPath
+$PublishedLogPath = [string]$LogSession.PublishedPath
 
 function Initialize-LogDirectory {
     if (-not (Test-Path -LiteralPath $LogDirectory)) {
@@ -88,7 +118,13 @@ function Write-Log {
     if ($Level -eq 'WARN') { $script:WarningCount++ }
     if ($Level -eq 'ERROR') { $script:ErrorCount++ }
 
-    $line = '[{0}] [{1,-5}] {2}' -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $Level, $Message
+    $normalizedLevel = switch ($Level) {
+        'OK'   { 'SUCCESS' }
+        'WARN' { 'WARNING' }
+        default { $Level }
+    }
+    $logComputerName = if ($ComputerName) { $ComputerName } else { 'UNKNOWN' }
+    $line = '{0} [{1}] [{2}] {3}' -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $logComputerName, $normalizedLevel, $Message
 
     switch ($Level) {
         'OK'    { Write-Host $line -ForegroundColor Green }
@@ -98,7 +134,10 @@ function Write-Log {
     }
 
     try {
-        Initialize-LogDirectory
+        $activeLogDirectory = Split-Path -Parent $LogPath
+        if (-not (Test-Path -LiteralPath $activeLogDirectory -PathType Container)) {
+            New-Item -Path $activeLogDirectory -ItemType Directory -Force | Out-Null
+        }
         Add-Content -LiteralPath $LogPath -Value $line -Encoding UTF8
     }
     catch {
@@ -116,14 +155,24 @@ function Get-WindowsInformation {
     try {
         $os = Get-CimInstance -ClassName Win32_OperatingSystem -ErrorAction Stop
         $currentVersion = Get-ItemProperty -LiteralPath 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion' -ErrorAction Stop
+
+        $productName = [string]$currentVersion.ProductName
+        $buildText = [string]$os.BuildNumber
+        $buildNumber = 0
+        [void][int]::TryParse($buildText, [ref]$buildNumber)
+
+        if ($buildNumber -ge 22000 -and $productName -match '^Windows 10') {
+            $productName = $productName -replace '^Windows 10', 'Windows 11'
+        }
+
         [pscustomobject]@{
-            ProductName    = [string]$currentVersion.ProductName
+            ProductName    = $productName
             EditionId      = [string]$currentVersion.EditionID
             DisplayVersion = [string]$currentVersion.DisplayVersion
             Version        = [string]$os.Version
-            BuildNumber    = [string]$os.BuildNumber
+            BuildNumber    = $buildText
             UBR            = [int]$currentVersion.UBR
-            FullBuild      = '{0}.{1}' -f $os.BuildNumber, $currentVersion.UBR
+            FullBuild      = '{0}.{1}' -f $buildText, $currentVersion.UBR
         }
     }
     catch {
@@ -350,9 +399,15 @@ function Get-EdgePath {
 
 function Get-EdgeRunState {
     $configuredCommand = Get-RegistryStringValue -Path $RunKeyPath -Name $EdgeRunValueName
+    $edgePath = Get-EdgePath
+    $edgeVersion = $null
+    if ($edgePath) {
+        try { $edgeVersion = [Diagnostics.FileVersionInfo]::GetVersionInfo($edgePath).ProductVersion } catch { }
+    }
     [pscustomobject]@{
-        EdgeInstalled      = [bool](Get-EdgePath)
-        EdgePath           = Get-EdgePath
+        EdgeInstalled      = [bool]$edgePath
+        EdgePath           = $edgePath
+        EdgeVersion        = $edgeVersion
         RunValuePresent    = (-not [string]::IsNullOrWhiteSpace($configuredCommand))
         RunCommand         = $configuredCommand
         CommandMatches     = ($null -ne $script:EdgeCommand -and $configuredCommand -ceq $script:EdgeCommand)
@@ -361,6 +416,23 @@ function Get-EdgeRunState {
         NewWindowEnabled   = (-not [string]::IsNullOrWhiteSpace($configuredCommand) -and $configuredCommand -match '(?i)--new-window(?:\s|$)')
         MaximizedEnabled   = (-not [string]::IsNullOrWhiteSpace($configuredCommand) -and $configuredCommand -match '(?i)--start-maximized(?:\s|$)')
     }
+}
+
+function Write-ConfigurationStateSummary {
+    param(
+        [Parameter(Mandatory)][string]$Label,
+        [Parameter(Mandatory)]$State
+    )
+
+    Write-Log ("Autologon {0}: Enabled={1}; User={2}; Domain={3}; ForceAutoLogon={4}; PasswordPresent={5}; PasswordMatches={6}; ConfigurationMatches={7}." -f `
+        $Label, $State.Autologon.AutoAdminLogonEnabled, $State.Autologon.DefaultUserName, `
+        $State.Autologon.DefaultDomainName, $State.Autologon.ForceAutoLogonEnabled, `
+        $State.Autologon.PasswordPresent, $State.Autologon.PasswordMatches, $State.Autologon.ConfigurationMatches)
+
+    Write-Log ("Edge startup {0}: Installed={1}; Version={2}; RunValuePresent={3}; CommandMatches={4}; UrlPresent={5}; InPrivate={6}; NewWindow={7}; Maximized={8}." -f `
+        $Label, $State.Edge.EdgeInstalled, $State.Edge.EdgeVersion, $State.Edge.RunValuePresent, `
+        $State.Edge.CommandMatches, $State.Edge.UrlPresent, $State.Edge.InPrivateEnabled, `
+        $State.Edge.NewWindowEnabled, $State.Edge.MaximizedEnabled)
 }
 
 function Set-EdgeAutoLaunch {
@@ -380,6 +452,40 @@ function Set-EdgeAutoLaunch {
     }
 
     Write-Log "Configured and verified Edge auto-launch for every user: $EdgeUrl" 'OK'
+}
+
+
+function New-StringArrayForJson {
+    [CmdletBinding()]
+    param([AllowNull()]$InputObject)
+
+    [string[]]$items = @(
+        $InputObject |
+        ForEach-Object { [string]$_ } |
+        Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+    )
+
+    if ($items.Count -eq 0) {
+        return ,([object[]]@())
+    }
+
+    return ,([object[]]$items)
+}
+
+function New-ObjectArrayForJson {
+    [CmdletBinding()]
+    param([AllowNull()]$InputObject)
+
+    [object[]]$items = @(
+        $InputObject |
+        ForEach-Object { $_ }
+    )
+
+    if ($items.Count -eq 0) {
+        return ,([object[]]@())
+    }
+
+    return ,([object[]]$items)
 }
 
 function Write-Telemetry {
@@ -407,27 +513,29 @@ function Write-Telemetry {
             ErrorCount               = $script:ErrorCount
             WarningCount             = $script:WarningCount
             FailureMessage           = $script:FailureMessage
+            TextLogPath              = $PublishedLogPath
             RunningAccount           = $RunningAccount
             RunningAsSystem          = ($RunningAccount -eq 'NT AUTHORITY\SYSTEM')
             IsAdministrator          = (Test-IsAdministrator)
             Targeted                 = $script:Targeted
             MatchedPattern           = $script:MatchedPattern
-            ConfiguredPatterns       = @($ComputerNamePatterns)
+            ConfiguredPatterns       = New-StringArrayForJson -InputObject $ComputerNamePatterns
             ChangesMade              = $script:ChangesMade
             VerificationFailureCount = $script:VerificationFailures.Count
-            VerificationFailures     = @($script:VerificationFailures)
+            VerificationFailures     = New-StringArrayForJson -InputObject $script:VerificationFailures
             Windows                  = $WindowsInfo
             Configuration            = [ordered]@{
                 DefaultUserName   = $DefaultUserName
                 DefaultDomainName = $DefaultDomainName
                 PasswordProvided  = (-not [string]::IsNullOrWhiteSpace($DefaultPasswordBase64))
                 PasswordStorage   = 'Base64ObfuscatedInScript'
+                PasswordValueLogged = $false
                 EdgeUrl           = $EdgeUrl
                 EdgeRunValueName  = $EdgeRunValueName
             }
             Before                   = $script:BeforeState
             After                    = $script:AfterState
-            RegistryChanges          = @($script:RegistryChanges)
+            RegistryChanges          = New-ObjectArrayForJson -InputObject $script:RegistryChanges
             LegacyChromeShortcut     = [ordered]@{
                 Path          = $LegacyChromeShortcutPath
                 PresentBefore = $script:LegacyShortcutPresentBefore
@@ -439,6 +547,26 @@ function Write-Telemetry {
                 RunCommand     = $script:EdgeCommand
             }
         }
+
+        try {
+            $autologonVerified = $false
+            $edgeVerified = $false
+            if ($event.After) {
+                if ($event.After.Autologon) { $autologonVerified = [bool]$event.After.Autologon.ConfigurationMatches }
+                if ($event.After.Edge) { $edgeVerified = [bool]$event.After.Edge.CommandMatches }
+            }
+
+            Write-Log ("Elastic configuration summary: Targeted={0}; MatchedPattern={1}; ChangesMade={2}; VerificationFailures={3}; AutologonVerified={4}; EdgeVerified={5}; LegacyChromeRemoved={6}; Result={7}" -f `
+                $event.Targeted,
+                $event.MatchedPattern,
+                $event.ChangesMade,
+                $event.VerificationFailureCount,
+                $autologonVerified,
+                $edgeVerified,
+                $event.LegacyChromeShortcut.Removed,
+                $event.OverallResult) 'INFO'
+        }
+        catch { }
 
         $compactJson = $event | ConvertTo-Json -Depth 10 -Compress
         Write-MaintenanceTelemetryLine -Path $TelemetryPath -JsonLine $compactJson
@@ -458,6 +586,7 @@ $windowsInfo = Get-WindowsInformation
 try {
     Initialize-LogDirectory
     Write-Log "===== Autologon and Edge configuration v$ScriptVersion started ====="
+    Write-Log "Text log: $LogPath"
     Write-Log "Computer name: $ComputerName"
     Write-Log "Configured computer-name patterns: $($ComputerNamePatterns -join ', ')"
 
@@ -476,6 +605,7 @@ try {
             Edge      = Get-EdgeRunState
         }
         $script:AfterState = $script:BeforeState
+        Write-ConfigurationStateSummary -Label 'unchanged (not targeted)' -State $script:BeforeState
         $script:OverallResult = 'NotTargeted'
         $script:FinalStatus = 'Success'
         Write-Log "Computer '$ComputerName' does not match the configured pattern list. No changes were made."
@@ -490,6 +620,7 @@ try {
             Autologon = Get-AutologonState
             Edge      = Get-EdgeRunState
         }
+        Write-ConfigurationStateSummary -Label 'before' -State $script:BeforeState
 
         Set-AutologonConfiguration
         Remove-LegacyChromeStartupShortcut
@@ -499,6 +630,9 @@ try {
             Autologon = Get-AutologonState
             Edge      = Get-EdgeRunState
         }
+        Write-ConfigurationStateSummary -Label 'after' -State $script:AfterState
+        Write-Log ("Legacy Chrome startup shortcut: PresentBefore={0}; Removed={1}; PresentAfter={2}." -f `
+            $script:LegacyShortcutPresentBefore, $script:LegacyShortcutRemoved, $script:LegacyShortcutPresentAfter)
 
         if (-not $script:AfterState.Autologon.ConfigurationMatches) {
             $script:VerificationFailures.Add('Final autologon configuration does not match the requested values.')
@@ -545,9 +679,41 @@ catch {
     Write-Log '===== Script completed with errors =====' 'ERROR'
 }
 finally {
+    # Clear the decoded credential before final telemetry/log publication.
     $script:DecodedPassword = $null
     [GC]::Collect()
-    Write-Telemetry -WindowsInfo $windowsInfo
+
+    try {
+        Write-Telemetry -WindowsInfo $windowsInfo
+    }
+    catch {
+        Write-Log "Telemetry write failed: $($_.Exception.Message)" 'ERROR'
+        if ($script:ExitCode -eq 0) {
+            $script:FinalStatus = 'TelemetryFailure'
+            $script:OverallResult = 'TelemetryFailure'
+            $script:ExitCode = 4
+        }
+    }
+
+    # Final text-log append before the immutable completed file enters C:\Logs.
+    Write-Log ("Finalizing {0}. Status={1}; Result={2}; ExitCode={3}; Warnings={4}; Errors={5}" -f `
+        $ScriptName,
+        $script:FinalStatus,
+        $script:OverallResult,
+        $script:ExitCode,
+        $script:WarningCount,
+        $script:ErrorCount) $(if ($script:ExitCode -eq 0) { 'OK' } else { 'ERROR' })
+
+    if ($null -ne $LogSession) {
+        $publishResult = Publish-MaintenanceLog -LogSession $LogSession
+
+        if ($publishResult.Published) {
+            Write-Host ("Published completed script 13 text log for Elastic: {0}" -f $PublishedLogPath) -ForegroundColor Green
+        }
+        else {
+            Write-Warning ("Script 13 completed text log remains in staging because publication failed: {0}" -f $publishResult.Path)
+        }
+    }
 }
 
 exit $script:ExitCode

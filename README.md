@@ -16,6 +16,8 @@ The project automates common workstation maintenance tasks including:
 - 📊 Endpoint Health Collection
 - 📡 Elastic Agent Deployment
 - ❄️ Deep Freeze Status Monitoring
+- 🌐 Browser Homepage and Sign-In Policy
+- 🧩 Honorlock Chrome Extension Deployment
 - 📝 Centralized Maintenance Logging
 - 📈 Maintenance Telemetry
 - 🔎 Deployment Validation
@@ -451,6 +453,60 @@ This information can eventually be correlated with update failures or maintenanc
 
 ---
 
+## `17_Set_Browser_Homepage.ps1`
+
+### Browser Homepage and Sign-In Policy
+
+Configures a consistent machine-wide homepage and startup page for Mozilla Firefox, Google Chrome, and Microsoft Edge.
+
+The default homepage is:
+
+`https://www.compton.edu`
+
+The script applies browser policies under the computer-level registry so the configuration is available to every user who signs in to the workstation.
+
+Responsibilities include:
+
+- Setting the Firefox, Chrome, and Edge homepages.
+- Opening the configured homepage when each browser starts.
+- Enabling the browser Home button where supported.
+- Disabling Chrome browser/profile sign-in prompts and synchronization.
+- Preventing Chrome sign-in interception and promotional sign-in tabs.
+- Preserving the ability to sign in normally to websites.
+- Verifying every applied policy value.
+- Recording changes, verification results, logs, and maintenance telemetry.
+
+The browser policies take effect after the affected browser is closed and reopened or after its enterprise policies refresh.
+
+---
+
+## `18_Install_Honorlock_Chrome_Extension.ps1`
+
+### Honorlock Chrome Extension Deployment
+
+Force-installs the Honorlock extension in Google Chrome through machine-wide Chrome enterprise policy.
+
+The script is designed for controlled lab deployment and currently targets computer names matching:
+
+- `SSC-216*`
+- `AHB-146*`
+
+Computers outside the configured pattern list record a successful `NotTargeted` result and make no policy changes.
+
+Responsibilities include:
+
+- Evaluating computer-name wildcard patterns before deployment.
+- Creating Chrome's `ExtensionInstallForcelist` policy when required.
+- Preserving other extensions already present in the force-install list.
+- Updating an existing Honorlock entry when its policy value is incorrect.
+- Selecting the next available numeric policy entry for a new installation.
+- Verifying that the Honorlock policy exists after configuration.
+- Producing local logs and structured maintenance telemetry.
+
+Chrome installs or updates the extension when browser policy refreshes or when Chrome next starts. Additional labs can be introduced by adding their computer-name patterns to the script configuration.
+
+---
+
 # 🧰 Maintenance Framework
 
 The repository contains several additional files that provide the underlying deployment, logging, validation, and orchestration framework.
@@ -540,6 +596,8 @@ The script centralizes task configuration including:
 
 This allows scheduled-task changes to be deployed consistently instead of manually modifying Task Scheduler on every computer.
 
+The current rotation includes the browser-homepage policy at **08:40 Sunday** and the Honorlock policy at **08:45 Sunday**. The Honorlock task can exist on every endpoint because Script 18 performs its own computer-name targeting before making changes.
+
 ---
 
 # 📊 Fleet Status and Monitoring
@@ -598,9 +656,21 @@ The manifest provides a structured source that can be used to determine what fil
 
 ### Manifest Generator / Updater
 
-Updates the deployment manifest when maintenance files change.
+Synchronizes the deployment manifest with the approved maintenance-file catalog.
 
-This reduces the need to manually maintain deployment metadata and helps ensure the manifest accurately represents the current script repository.
+The utility:
+
+- Adds approved files that are present on the deployment share but missing from the manifest.
+- Includes Scripts 17 and 18 in the approved deployment set.
+- Removes retired Script 19/20 names only after their Script 17/18 replacements are ready.
+- Extracts embedded file versions.
+- Recalculates SHA-256 hashes, including hash-only changes where the version number did not change.
+- Detects duplicate manifest entries.
+- Creates a backup before writing.
+- Validates the generated JSON before replacing the active manifest.
+- Supports `-WhatIfOnly` for a read-only preview.
+
+This reduces manual deployment-metadata maintenance and helps ensure the manifest accurately represents the files currently approved for endpoint deployment.
 
 ---
 
@@ -670,6 +740,8 @@ Compton_Lab_Scripts/
 ├── 14_Endpoint_Health_Inventory.ps1
 ├── 15_Install_Elastic_Agent.ps1
 ├── 16_Check_Deep_Freeze_Status.ps1
+├── 17_Set_Browser_Homepage.ps1
+├── 18_Install_Honorlock_Chrome_Extension.ps1
 │
 ├── Maintenance.Framework.psm1
 ├── Maintenance.Policy.json

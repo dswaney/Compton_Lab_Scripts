@@ -1,8 +1,9 @@
 #requires -version 5.1
 # =====================================================================
 # ScriptName: 00_Update-Scripts-FromShare.ps1
-# ScriptVersion: 4.2.3
-# LastUpdated: 2026-08-17
+# ScriptVersion: 4.3.0
+# LastUpdated: 2026-08-27
+# Changes: v4.3.0 approves scripts 17 and 18 for manifest-managed deployment.
 # Purpose:
 #   Manifest-driven, self-bootstrapping updater for C:\Scripts.
 #   - Uses standardized Elastic-friendly text log format: timestamp, computer, level, message.
@@ -24,7 +25,7 @@ $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 
 $ScriptName = '00_Update-Scripts-FromShare.ps1'
-$ScriptVersion = '4.2.3'
+$ScriptVersion = '4.3.0'
 $PreferredSourceRoot = '\\filesvr\Labscripts'
 $FallbackSourceRoot = '\\10.2.3.30\Labscripts'
 $ManifestName = 'DeploymentManifest.json'
@@ -59,6 +60,8 @@ $DeepFreezeStatusScriptName = '16_Check_Deep_Freeze_Status.ps1'
     '14_Endpoint_Health_Inventory.ps1',
     '15_Install_Elastic_Agent.ps1',
     '16_Check_Deep_Freeze_Status.ps1',
+    '17_Set_Browser_Homepage.ps1',
+    '18_Install_Honorlock_Chrome_Extension.ps1',
     'Get-MaintenanceFleetStatus.ps1',
     'Invoke-MaintenanceScript.ps1',
     'Maintenance.Framework.psm1',

@@ -1,13 +1,14 @@
 # =====================================================================
 # ScriptName: 01_Enable_Windows_Update_Services.ps1
-# ScriptVersion: 2.8.4
-# LastUpdated: 2026-08-18
+# ScriptVersion: 2.8.5
+# LastUpdated: 2026-09-03
 # Purpose: Restore Windows Update services, tasks, policy settings,
 #          Windows 11 UI preferences, and classic right-click context menu behavior for all users;
 #          verify required services are running, retry startup failures
 #          up to 4 total attempts, and force a reboot if critical
 #          services still refuse to start.
-# Changes:  v2.8.4 guarantees structured failure telemetry for bootstrap/framework/privilege/runtime failures.
+# Changes:  v2.8.5 aligns updater-task validation and repair with the 01:00 Sunday master schedule.
+#           v2.8.4 guarantees structured failure telemetry for bootstrap/framework/privilege/runtime failures.
 #           Adds FailureStage and FailureMessage fields and ensures service-recovery reboot failures pass through finally.
 #           v2.8.3 uses Maintenance.Framework v2.4 staged text logging so Elastic only sees the completed immutable log.
 # Fix:      Removed StartWhenAvailable from task creation and added direct
@@ -19,7 +20,7 @@ param()
 $ErrorActionPreference = 'Stop'
 
 $script:ScriptName       = '01_Enable_Windows_Update_Services.ps1'
-$script:ScriptVersion    = '2.8.4'
+$script:ScriptVersion    = '2.8.5'
 $script:ExecutionStart   = Get-Date
 $script:WarningCount     = 0
 $script:ErrorCount       = 0
@@ -947,7 +948,7 @@ function Get-WeeklySundayTriggerSummary {
                 $startTime = ([datetime]$startBoundary).ToString('HH:mm')
             }
 
-            if ($days -match 'Sunday' -and $startTime -eq '01:15') {
+            if ($days -match 'Sunday' -and $startTime -eq '01:00') {
                 return $true
             }
         }
@@ -1007,7 +1008,7 @@ function Test-CheckForUpdatedScriptsTaskCompliant {
     }
 
     if (-not (Get-WeeklySundayTriggerSummary -Triggers $Task.Triggers)) {
-        $issues.Add('Task trigger is not Sunday at 01:15.') | Out-Null
+        $issues.Add('Task trigger is not Sunday at 01:00.') | Out-Null
     }
 
     return $issues
@@ -1071,7 +1072,7 @@ function Ensure-CheckForUpdatedScriptsTask {
 
     try {
         $action = New-ScheduledTaskAction -Execute $windowsPowerShellExe -Argument $argumentString
-        $trigger = New-ScheduledTaskTrigger -Weekly -DaysOfWeek Sunday -WeeksInterval 1 -At ([datetime]::Today.Add([timespan]::Parse('01:15')))
+        $trigger = New-ScheduledTaskTrigger -Weekly -DaysOfWeek Sunday -WeeksInterval 1 -At ([datetime]::Today.Add([timespan]::Parse('01:00')))
         $principal = New-ScheduledTaskPrincipal -UserId 'SYSTEM' -LogonType ServiceAccount -RunLevel Highest
         $settings = New-ScheduledTaskSettingsSet `
             -AllowStartIfOnBatteries `
@@ -1081,7 +1082,7 @@ function Ensure-CheckForUpdatedScriptsTask {
         Register-ScheduledTask -TaskName $TaskName -Action $action -Trigger $trigger -Principal $principal -Settings $settings -Force | Out-Null
         Write-Status "Scheduled task '$TaskName' now points to: $ScriptPath" 'OK'
         Write-Status "Task action: $windowsPowerShellExe $argumentString" 'INFO'
-        Write-Status "Task trigger: Sunday at 01:15 as SYSTEM with highest privileges." 'OK'
+        Write-Status "Task trigger: Sunday at 01:00 as SYSTEM with highest privileges." 'OK'
         return $true
     }
     catch {

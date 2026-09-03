@@ -1,8 +1,9 @@
 # =====================================================================
 # ScriptName: 07_Force_Reboot_Install_Updates.ps1
-# ScriptVersion: 2.0.5
-# LastUpdated: 2026-08-18
-# ChangeLog: v2.0.5 adds -StartupResume support. Startup-triggered executions exit immediately when no reboot cycle is active.
+# ScriptVersion: 2.0.6
+# LastUpdated: 2026-09-03
+# ChangeLog: v2.0.6 permits an empty pending-reboot flag collection and treats a clean flag evaluation as a normal state.
+#            v2.0.5 adds -StartupResume support. Startup-triggered executions exit immediately when no reboot cycle is active.
 #            v2.0.4 extends the cycle to a maximum of three reboots, then performs a final no-more-reboots verification pass.
 #            Adds structured persistent-reboot cause telemetry including likely source and affected file/change details.
 #            v2.0.3 adds Maintenance.Framework v2.4 staged text logging and publishes the completed log before script exit/reboot.
@@ -24,7 +25,7 @@ $ErrorActionPreference = 'Stop'
 
 $script:RunStart         = Get-Date
 $script:ScriptName       = '07_Force_Reboot_Install_Updates.ps1'
-$script:ScriptVersion    = '2.0.5'
+$script:ScriptVersion    = '2.0.6'
 $script:RunId            = [guid]::NewGuid().ToString()
 $script:Domain           = if ($env:USERDNSDOMAIN) { $env:USERDNSDOMAIN } else { $env:USERDOMAIN }
 $script:TelemetryPath    = Join-Path $LogDirectory 'Maintenance-Telemetry.ndjson'
@@ -554,6 +555,7 @@ function Get-RegistryValueSafe {
 function Get-RebootCauseDetails {
     param(
         [Parameter(Mandatory)]
+        [AllowEmptyCollection()]
         [array]$Flags
     )
 
@@ -746,7 +748,13 @@ function Get-PendingRebootFlags {
     }
 
     $script:CurrentFlags = @($flags)
-    $script:RebootCauseDetails = @(Get-RebootCauseDetails -Flags $flags)
+    if ($flags.Count -gt 0) {
+        $script:RebootCauseDetails = @(Get-RebootCauseDetails -Flags $flags)
+    }
+    else {
+        $script:RebootCauseDetails = @()
+        Write-Status 'No pending-reboot flags were detected.' 'INFO'
+    }
     return @($flags)
 }
 

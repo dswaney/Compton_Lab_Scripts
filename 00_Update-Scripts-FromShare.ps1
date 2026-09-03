@@ -1,8 +1,9 @@
 #requires -version 5.1
 # =====================================================================
 # ScriptName: 00_Update-Scripts-FromShare.ps1
-# ScriptVersion: 4.3.0
-# LastUpdated: 2026-08-27
+# ScriptVersion: 4.4.0
+# LastUpdated: 2026-09-02
+# Changes: v4.4.0 approves and supplementally deploys script 19 for Stellarium Location Services.
 # Changes: v4.3.0 approves scripts 17 and 18 for manifest-managed deployment.
 # Purpose:
 #   Manifest-driven, self-bootstrapping updater for C:\Scripts.
@@ -25,7 +26,7 @@ $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 
 $ScriptName = '00_Update-Scripts-FromShare.ps1'
-$ScriptVersion = '4.3.0'
+$ScriptVersion = '4.4.0'
 $PreferredSourceRoot = '\\filesvr\Labscripts'
 $FallbackSourceRoot = '\\10.2.3.30\Labscripts'
 $ManifestName = 'DeploymentManifest.json'
@@ -33,12 +34,14 @@ $FrameworkName = 'Maintenance.Framework.psm1'
 $RegisterTasksName = 'Register-Tasks_SYSTEM.ps1'
 $ElasticAgentScriptName = '15_Install_Elastic_Agent.ps1'
 $DeepFreezeStatusScriptName = '16_Check_Deep_Freeze_Status.ps1'
+$StellariumLocationScriptName = '19_Stellarium_Location_Services.ps1'
 
 # Supplemental files are deployed directly from the active source share even
 # when they are not yet listed in DeploymentManifest.json.
 [string[]]$SupplementalManagedFiles = @(
     $ElasticAgentScriptName,
-    $DeepFreezeStatusScriptName
+    $DeepFreezeStatusScriptName,
+    $StellariumLocationScriptName
 )
 
 # Only these files are permitted to deploy into C:\Scripts.
@@ -62,6 +65,7 @@ $DeepFreezeStatusScriptName = '16_Check_Deep_Freeze_Status.ps1'
     '16_Check_Deep_Freeze_Status.ps1',
     '17_Set_Browser_Homepage.ps1',
     '18_Install_Honorlock_Chrome_Extension.ps1',
+    '19_Stellarium_Location_Services.ps1',
     'Get-MaintenanceFleetStatus.ps1',
     'Invoke-MaintenanceScript.ps1',
     'Maintenance.Framework.psm1',
@@ -505,7 +509,7 @@ try {
     foreach ($entry in $orderedEntries) { [void](Install-ManifestEntry -Entry $entry -SourceRoot $sourceRoot) }
 
     # Deploy supplemental scripts that are intentionally managed outside the
-    # current DeploymentManifest.json. This includes script 15 for Elastic Agent.
+    # current DeploymentManifest.json, including scripts 15, 16, and 19.
     Install-SupplementalManagedFiles -SourceRoot $sourceRoot
 
     $selfEntry = @($approvedManifestEntries | Where-Object Name -eq $ScriptName)[0]

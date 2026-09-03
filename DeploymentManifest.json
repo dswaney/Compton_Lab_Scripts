@@ -2,19 +2,19 @@
     "SchemaVersion":  1,
     "ManifestVersion":  "2.3.4",
     "PackageVersion":  "2.3.4",
-    "GeneratedUtc":  "2026-09-03T19:36:19Z",
+    "GeneratedUtc":  "2026-09-03T21:19:30Z",
     "Files":  [
                   {
                       "Name":  "00_Update-Scripts-FromShare.ps1",
                       "Role":  "Updater",
-                      "Version":  "4.4.0",
-                      "SHA256":  "439C245DDCBF023F959CC25C560A6D348921AA0634F1D02E588C26B47409AF5B"
+                      "Version":  "4.5.0",
+                      "SHA256":  "85664789C7C3A138BA84FA3F1DF82D3EA6640706639FC80FD860963AD30E0A3D"
                   },
                   {
                       "Name":  "01_Enable_Windows_Update_Services.ps1",
                       "Role":  "ManagedFile",
-                      "Version":  "2.8.4",
-                      "SHA256":  "F2F7B12D9B905E1B889FF6BCE4D40667845AC76D9E63C8F153CD52FB4D5D684A"
+                      "Version":  "2.8.5",
+                      "SHA256":  "70C56B640E1CCDCE3165B01CAF00B24BE79D4090F7F7FA0836FC42F453840196"
                   },
                   {
                       "Name":  "02_Remove_User_Profiles.ps1",
@@ -121,14 +121,14 @@
                   {
                       "Name":  "Maintenance.Policy.json",
                       "Role":  "Policy",
-                      "Version":  "1.0.0",
-                      "SHA256":  "3D44DB4ACA1EDF5C9B9CAA34FECF238A686CDA5FCF1F383B25B80F4725B6C316"
+                      "Version":  "1.0.1",
+                      "SHA256":  "4C5D9C9D497E2E298B5A128DA81146F3C1502ED9BB06D5521EA8D941F4332F62"
                   },
                   {
                       "Name":  "Register-Tasks_SYSTEM.ps1",
                       "Role":  "TaskRegistration",
-                      "Version":  "4.5.0",
-                      "SHA256":  "769DB84BF126979D27E14A248C541D15C78F09B8C7084D1398DAA54EB53F57E7"
+                      "Version":  "4.6.0",
+                      "SHA256":  "6F7204C328D87BFF113D6A65F3D3A681D86B3C2B0E3B83EF2C5ED4E08701239E"
                   },
                   {
                       "Name":  "17_Set_Browser_Homepage.ps1",

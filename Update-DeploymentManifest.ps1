@@ -5,16 +5,16 @@
     Updates DeploymentManifest.json from the current files on \\filesvr\Labscripts.
 
 .DESCRIPTION
-    Reads the manifest Files array, checks each referenced source file, extracts
-    its embedded version, and compares it with the manifest version. When the
-    version differs, the script calculates SHA-256 and updates both Version and
-    SHA256 in DeploymentManifest.json.
+    Reconciles DeploymentManifest.json against the approved active-file list,
+    adding newly approved files and removing retired or unapproved entries. It
+    extracts every file's embedded version and always recalculates SHA-256 so a
+    content change cannot be missed merely because its version was not changed.
 
     The manifest is backed up before any write and the updated JSON is validated
     before replacing the original.
 
 .NOTES
-    ScriptVersion: 1.0.0
+    ScriptVersion: 1.1.0
 #>
 
 [CmdletBinding()]
@@ -26,6 +26,30 @@ param(
 
 Set-StrictMode -Version 2.0
 $ErrorActionPreference = 'Stop'
+
+# Keep this list aligned with $ApprovedMaintenanceFiles in
+# 00_Update-Scripts-FromShare.ps1. Order here becomes order in the manifest.
+$ApprovedFileDefinitions = @(
+    [pscustomobject]@{ Name='00_Update-Scripts-FromShare.ps1';                         Role='Updater' },
+    [pscustomobject]@{ Name='01_Enable_Windows_Update_Services.ps1';                  Role='ManagedFile' },
+    [pscustomobject]@{ Name='02_Remove_User_Profiles.ps1';                            Role='ManagedFile' },
+    [pscustomobject]@{ Name='03_Weekend_Apps_Update.ps1';                             Role='ManagedFile' },
+    [pscustomobject]@{ Name='04_Sunday_Lab_Application_Maintenance.ps1';              Role='ManagedFile' },
+    [pscustomobject]@{ Name='05_Weekend_HP_Drivers_Update.ps1';                       Role='ManagedFile' },
+    [pscustomobject]@{ Name='06_Weekend_Windows_Updates.ps1';                         Role='ManagedFile' },
+    [pscustomobject]@{ Name='07_Force_Reboot_Install_Updates.ps1';                    Role='ManagedFile' },
+    [pscustomobject]@{ Name='08_System_Repair.ps1';                                   Role='ManagedFile' },
+    [pscustomobject]@{ Name='09_Disable_Windows_Update_Services.ps1';                 Role='ManagedFile' },
+    [pscustomobject]@{ Name='10_Sync_System_Time.ps1';                                Role='ManagedFile' },
+    [pscustomobject]@{ Name='12_Enable-SystemRestore-And-Create-RestorePoint.ps1';     Role='ManagedFile' },
+    [pscustomobject]@{ Name='14_Endpoint_Health_Inventory.ps1';                       Role='ManagedFile' },
+    [pscustomobject]@{ Name='16_Check_Deep_Freeze_Status.ps1';                        Role='ManagedFile' },
+    [pscustomobject]@{ Name='Get-MaintenanceFleetStatus.ps1';                         Role='ManagedFile' },
+    [pscustomobject]@{ Name='Invoke-MaintenanceScript.ps1';                           Role='Launcher' },
+    [pscustomobject]@{ Name='Maintenance.Framework.psm1';                             Role='Framework' },
+    [pscustomobject]@{ Name='Maintenance.Policy.json';                                Role='Policy' },
+    [pscustomobject]@{ Name='Register-Tasks_SYSTEM.ps1';                              Role='TaskRegistration' }
+)
 
 function Write-Status {
     param(
@@ -137,71 +161,94 @@ if ($null -eq $manifest.PSObject.Properties['Files']) {
     throw 'Manifest does not contain a Files array.'
 }
 
-$changes = @()
-$warnings = @()
+$changes = [System.Collections.Generic.List[object]]::new()
+$existingByName = @{}
 
 foreach ($entry in @($manifest.Files)) {
     $name = [string]$entry.Name
-
-    if ([string]::IsNullOrWhiteSpace($name)) {
-        Write-Status -Level WARN -Message 'Skipping entry with no Name.'
-        $warnings += 'Unnamed manifest entry'
-        continue
+    if (-not [string]::IsNullOrWhiteSpace($name)) {
+        $existingByName[$name.ToLowerInvariant()] = $entry
     }
+}
 
+$approvedNames = @($ApprovedFileDefinitions | ForEach-Object { [string]$_.Name })
+$retiredEntries = @(
+    $manifest.Files |
+    Where-Object { [string]$_.Name -notin $approvedNames }
+)
+
+foreach ($entry in $retiredEntries) {
+    Write-Status -Level CHANGE -Message "Removing retired or unapproved manifest entry: $($entry.Name)"
+    [void]$changes.Add([pscustomobject]@{
+        Name   = [string]$entry.Name
+        Change = 'Removed'
+    })
+}
+
+$rebuiltEntries = [System.Collections.Generic.List[object]]::new()
+
+foreach ($definition in $ApprovedFileDefinitions) {
+    $name = [string]$definition.Name
+    $role = [string]$definition.Role
     $sourcePath = Join-Path $SourceRoot $name
 
     if (-not (Test-Path -LiteralPath $sourcePath -PathType Leaf)) {
-        Write-Status -Level WARN -Message "Missing referenced file: $sourcePath"
-        $warnings += "Missing: $name"
-        continue
+        throw "Required approved file is missing from the source package: $sourcePath"
     }
 
     $currentVersion = Get-EmbeddedVersion -Path $sourcePath
-    $manifestVersion = [string]$entry.Version
-
     if ([string]::IsNullOrWhiteSpace($currentVersion)) {
-        Write-Status -Level WARN -Message "Could not determine version for $name. Entry left unchanged."
-        $warnings += "Version unreadable: $name"
-        continue
+        throw "Could not determine a version for required approved file: $name"
     }
 
-    if ($currentVersion -eq $manifestVersion) {
+    $currentHash = (Get-FileHash -LiteralPath $sourcePath -Algorithm SHA256).Hash.ToUpperInvariant()
+    $key = $name.ToLowerInvariant()
+    $existing = if ($existingByName.ContainsKey($key)) { $existingByName[$key] } else { $null }
+
+    $oldVersion = if ($null -ne $existing) { [string]$existing.Version } else { $null }
+    $oldHash = if ($null -ne $existing) { [string]$existing.SHA256 } else { $null }
+    $oldRole = if ($null -ne $existing) { [string]$existing.Role } else { $null }
+
+    $changeTypes = [System.Collections.Generic.List[string]]::new()
+    if ($null -eq $existing) { [void]$changeTypes.Add('Added') }
+    if ($oldVersion -cne $currentVersion) { [void]$changeTypes.Add('Version') }
+    if ($oldHash -cne $currentHash) { [void]$changeTypes.Add('SHA256') }
+    if ($oldRole -cne $role) { [void]$changeTypes.Add('Role') }
+
+    if ($changeTypes.Count -gt 0) {
+        $description = $changeTypes -join ', '
+        Write-Status -Level CHANGE -Message "$name requires manifest update: $description"
+        [void]$changes.Add([pscustomobject]@{
+            Name       = $name
+            Change     = $description
+            OldVersion = $oldVersion
+            NewVersion = $currentVersion
+            OldSHA256  = $oldHash
+            NewSHA256  = $currentHash
+        })
+    }
+    else {
         Write-Status -Level OK -Message "$name is current. Version=$currentVersion"
-        continue
     }
 
-    $sha256 = (Get-FileHash -LiteralPath $sourcePath -Algorithm SHA256).Hash.ToUpperInvariant()
-
-    Write-Status -Level CHANGE -Message "$name version changed: $manifestVersion -> $currentVersion"
-    Write-Status -Message "SHA256: $sha256"
-
-    $oldHash = [string]$entry.SHA256
-    $entry.Version = $currentVersion
-    $entry.SHA256 = $sha256
-
-    $changes += [pscustomobject]@{
-        Name       = $name
-        OldVersion = $manifestVersion
-        NewVersion = $currentVersion
-        OldSHA256  = $oldHash
-        NewSHA256  = $sha256
-    }
+    [void]$rebuiltEntries.Add([pscustomobject][ordered]@{
+        Name    = $name
+        Role    = $role
+        Version = $currentVersion
+        SHA256  = $currentHash
+    })
 }
 
 if ($changes.Count -eq 0) {
-    Write-Status -Level OK -Message 'No version differences found. Manifest was not changed.'
+    Write-Status -Level OK -Message 'Manifest contents and hashes are current. No changes required.'
 }
 else {
+    $manifest.Files = @($rebuiltEntries)
     if ($null -ne $manifest.PSObject.Properties['GeneratedUtc']) {
         $manifest.GeneratedUtc = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
     }
 
-    Write-Status -Message "Entries requiring update: $($changes.Count)"
-
-    foreach ($change in $changes) {
-        Write-Status -Level CHANGE -Message ("{0}: v{1} -> v{2}" -f $change.Name, $change.OldVersion, $change.NewVersion)
-    }
+    Write-Status -Message "Manifest changes required: $($changes.Count)"
 
     if ($WhatIfOnly) {
         Write-Status -Level WARN -Message 'WhatIfOnly specified. No changes written.'
@@ -211,9 +258,4 @@ else {
     }
 }
 
-if ($warnings.Count -gt 0) {
-    Write-Status -Level WARN -Message "Completed with $($warnings.Count) warning(s)."
-}
-else {
-    Write-Status -Level OK -Message 'Completed successfully.'
-}
+Write-Status -Level OK -Message 'Completed successfully.'

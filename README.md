@@ -330,10 +330,10 @@ The following scripts are retired. Six standalone scripts were consolidated into
 
 | Retired file | Replacement |
 |---|---|
-| `04_Update_Edge_Silent.ps1` | Microsoft Edge application servicing plus health visibility from script 14 |
-| `11_Install_SharpDriver_And_PaperCut.ps1` | SHARP printer driver, PaperCut Print Deploy, and shared printer maintenance |
-| `13_Configure_Autologon_And_Edge.ps1` | Autologon and Edge InPrivate startup configuration |
-| `15_Install_Elastic_Agent.ps1` | Elastic Agent installation, enrollment, and health verification |
-| `17_Set_Browser_Homepage.ps1` | Chrome, Edge, and Firefox homepage/startup policies |
-| `18_Install_Honorlock_Chrome_Extension.ps1` | Honorlock Chrome extension force-install policy |
-| `19_Stellarium_Location_Services.ps1` | Windows Location Services configuration for Stellarium |
+| [`04_Update_Edge_Silent.ps1`](./Retired/04_Update_Edge_Silent.ps1) | Microsoft Edge application servicing plus health visibility from script 14 |
+| [`11_Install_SharpDriver_And_PaperCut.ps1`](./Retired/11_Install_SharpDriver_And_PaperCut.ps1) | SHARP printer driver, PaperCut Print Deploy, and shared printer maintenance |
+| [`13_Configure_Autologon_And_Edge.ps1`](./Retired/13_Configure_Autologon_And_Edge.ps1) | Autologon and Edge InPrivate startup configuration |
+| [`15_Install_Elastic_Agent.ps1`](./Retired/15_Install_Elastic_Agent.ps1) | Elastic Agent installation, enrollment, and health verification |
+| [`17_Set_Browser_Homepage.ps1`](./Retired/17_Set_Browser_Homepage.ps1) | Chrome, Edge, and Firefox homepage/startup policies |
+| [`18_Install_Honorlock_Chrome_Extension.ps1`](./Retired/18_Install_Honorlock_Chrome_Extension.ps1) | Honorlock Chrome extension force-install policy |
+| [`19_Stellarium_Location_Services.ps1`](./Retired/19_Stellarium_Location_Services.ps1) | Windows Location Services configuration for Stellarium |

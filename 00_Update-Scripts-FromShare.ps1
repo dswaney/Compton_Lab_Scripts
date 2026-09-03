@@ -1,8 +1,9 @@
 #requires -version 5.1
 # =====================================================================
 # ScriptName: 00_Update-Scripts-FromShare.ps1
-# ScriptVersion: 4.4.0
-# LastUpdated: 2026-09-02
+# ScriptVersion: 4.5.0
+# LastUpdated: 2026-09-03
+# Changes: v4.5.0 deploys the combined script 04 and safely retires the six scripts it replaces.
 # Changes: v4.4.0 approves and supplementally deploys script 19 for Stellarium Location Services.
 # Changes: v4.3.0 approves scripts 17 and 18 for manifest-managed deployment.
 # Purpose:
@@ -26,22 +27,32 @@ $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 
 $ScriptName = '00_Update-Scripts-FromShare.ps1'
-$ScriptVersion = '4.4.0'
+$ScriptVersion = '4.5.0'
 $PreferredSourceRoot = '\\filesvr\Labscripts'
 $FallbackSourceRoot = '\\10.2.3.30\Labscripts'
 $ManifestName = 'DeploymentManifest.json'
 $FrameworkName = 'Maintenance.Framework.psm1'
 $RegisterTasksName = 'Register-Tasks_SYSTEM.ps1'
-$ElasticAgentScriptName = '15_Install_Elastic_Agent.ps1'
+$CombinedSundayScriptName = '04_Sunday_Lab_Application_Maintenance.ps1'
 $DeepFreezeStatusScriptName = '16_Check_Deep_Freeze_Status.ps1'
-$StellariumLocationScriptName = '19_Stellarium_Location_Services.ps1'
+
+# These scripts are now embedded in 04_Sunday_Lab_Application_Maintenance.ps1.
+# They are removed from C:\Scripts only after the combined replacement has been
+# deployed and passed PowerShell parser validation. A rollback copy is retained.
+[string[]]$RetiredMaintenanceFiles = @(
+    '11_Install_SharpDriver_And_PaperCut.ps1',
+    '13_Configure_Autologon_And_Edge.ps1',
+    '15_Install_Elastic_Agent.ps1',
+    '17_Set_Browser_Homepage.ps1',
+    '18_Install_Honorlock_Chrome_Extension.ps1',
+    '19_Stellarium_Location_Services.ps1'
+)
 
 # Supplemental files are deployed directly from the active source share even
 # when they are not yet listed in DeploymentManifest.json.
 [string[]]$SupplementalManagedFiles = @(
-    $ElasticAgentScriptName,
-    $DeepFreezeStatusScriptName,
-    $StellariumLocationScriptName
+    $CombinedSundayScriptName,
+    $DeepFreezeStatusScriptName
 )
 
 # Only these files are permitted to deploy into C:\Scripts.
@@ -51,21 +62,16 @@ $StellariumLocationScriptName = '19_Stellarium_Location_Services.ps1'
     '01_Enable_Windows_Update_Services.ps1',
     '02_Remove_User_Profiles.ps1',
     '03_Weekend_Apps_Update.ps1',
+    '04_Sunday_Lab_Application_Maintenance.ps1',
     '05_Weekend_HP_Drivers_Update.ps1',
     '06_Weekend_Windows_Updates.ps1',
     '07_Force_Reboot_Install_Updates.ps1',
     '08_System_Repair.ps1',
     '09_Disable_Windows_Update_Services.ps1',
     '10_Sync_System_Time.ps1',
-    '11_Install_SharpDriver_And_PaperCut.ps1',
     '12_Enable-SystemRestore-And-Create-RestorePoint.ps1',
-    '13_Configure_Autologon_And_Edge.ps1',
     '14_Endpoint_Health_Inventory.ps1',
-    '15_Install_Elastic_Agent.ps1',
     '16_Check_Deep_Freeze_Status.ps1',
-    '17_Set_Browser_Homepage.ps1',
-    '18_Install_Honorlock_Chrome_Extension.ps1',
-    '19_Stellarium_Location_Services.ps1',
     'Get-MaintenanceFleetStatus.ps1',
     'Invoke-MaintenanceScript.ps1',
     'Maintenance.Framework.psm1',
@@ -250,6 +256,7 @@ function Test-UpdaterSourceStructure {
         'Read-DeploymentManifest',
         'Add-Result',
         'Install-ManifestEntry',
+        'Remove-RetiredMaintenanceFiles',
         'Import-RequiredFramework',
         'Write-ExecutionRecord',
         'Invoke-TaskReconciliation'
@@ -427,6 +434,46 @@ function Install-SupplementalManagedFiles {
     }
 }
 
+function Remove-RetiredMaintenanceFiles {
+    [CmdletBinding()]
+    param()
+
+    $combinedPath = Join-Path $LocalRoot $CombinedSundayScriptName
+    if (-not (Test-Path -LiteralPath $combinedPath -PathType Leaf)) {
+        throw "The combined replacement is missing; retired scripts will not be removed: $combinedPath"
+    }
+
+    $combinedParserResult = Test-PowerShellFile -Path $combinedPath
+    if (-not $combinedParserResult.Valid) {
+        throw "The combined replacement failed parser validation; retired scripts will not be removed: $combinedPath"
+    }
+
+    foreach ($fileName in $RetiredMaintenanceFiles) {
+        $retiredPath = Join-Path $LocalRoot $fileName
+        if (-not (Test-Path -LiteralPath $retiredPath -PathType Leaf)) {
+            Write-UpdaterStatus -Message "Retired maintenance script is already absent: $fileName" -Level INFO
+            continue
+        }
+
+        $retiredBackupRoot = Join-Path $RollbackRunRoot 'Retired'
+        Ensure-Directory -Path $retiredBackupRoot
+        $backupPath = Join-Path $retiredBackupRoot $fileName
+        Move-Item -LiteralPath $retiredPath -Destination $backupPath -Force -ErrorAction Stop
+
+        Write-UpdaterStatus -Message "Removed retired maintenance script from C:\Scripts and retained a rollback copy: $fileName" -Level OK
+        Add-Result `
+            -Name $fileName `
+            -Role 'RetiredMaintenanceFile' `
+            -Status 'Retired' `
+            -LocalVersion 'Retired' `
+            -ShareVersion 'ReplacedByScript04' `
+            -LocalHash $null `
+            -ShareHash $null `
+            -BackupPath $backupPath `
+            -Message "Replaced by $CombinedSundayScriptName"
+    }
+}
+
 function Import-RequiredFramework {
     $frameworkPath = Join-Path $LocalRoot $FrameworkName
     if (-not (Test-Path -LiteralPath $frameworkPath -PathType Leaf)) { throw "Framework bootstrap failed; file is missing: $frameworkPath" }
@@ -509,8 +556,12 @@ try {
     foreach ($entry in $orderedEntries) { [void](Install-ManifestEntry -Entry $entry -SourceRoot $sourceRoot) }
 
     # Deploy supplemental scripts that are intentionally managed outside the
-    # current DeploymentManifest.json, including scripts 15, 16, and 19.
+    # current DeploymentManifest.json, including combined script 04 and script 16.
     Install-SupplementalManagedFiles -SourceRoot $sourceRoot
+
+    # Remove the six standalone scripts only after their combined replacement
+    # exists locally and has passed parser validation.
+    Remove-RetiredMaintenanceFiles
 
     $selfEntry = @($approvedManifestEntries | Where-Object Name -eq $ScriptName)[0]
     $selfResult = Install-ManifestEntry -Entry $selfEntry -SourceRoot $sourceRoot

@@ -1,907 +1,329 @@
-# 🖥️ Compton Lab Maintenance Automation
+# Compton College Lab Maintenance Scripts
+
+[![PowerShell](https://img.shields.io/badge/PowerShell-5.1-5391FE?logo=powershell&logoColor=white)](https://learn.microsoft.com/powershell/)
+[![Platform](https://img.shields.io/badge/Platform-Windows%2011-0078D4?logo=windows11&logoColor=white)](https://www.microsoft.com/windows/windows-11)
+[![Execution](https://img.shields.io/badge/Execution-SYSTEM-success)](#scheduled-task-deployment)
 
-PowerShell-based maintenance and automation framework designed to manage Windows computer lab workstations in a consistent, repeatable, and observable manner.
+PowerShell-based maintenance automation for Compton College Windows lab computers. The project keeps recurring endpoint maintenance consistent across multiple labs while providing readable logs, structured telemetry, rollback protection, computer-name targeting, and centralized Task Scheduler management.
 
-The project automates common workstation maintenance tasks including:
+The scripts are designed primarily for 64-bit Windows PowerShell 5.1 and normally run as `NT AUTHORITY\SYSTEM` with highest privileges.
 
-- 🔄 Windows Updates
-- 📦 Application Updates
-- 🧹 User Profile Cleanup
-- 🛠️ Windows System Repair
-- 💾 Driver and Firmware Maintenance
-- 🖨️ Printer / PaperCut Deployment
-- 🕐 Time Synchronization
-- ♻️ System Restore Management
-- 🔐 Lab-Specific Configuration
-- 📊 Endpoint Health Collection
-- 📡 Elastic Agent Deployment
-- ❄️ Deep Freeze Status Monitoring
-- 🌐 Browser Homepage and Sign-In Policy
-- 🧩 Honorlock Chrome Extension Deployment
-- 📝 Centralized Maintenance Logging
-- 📈 Maintenance Telemetry
-- 🔎 Deployment Validation
+> [!IMPORTANT]
+> Review all paths, computer-name patterns, service settings, credentials, enrollment information, and maintenance times before deploying these scripts in another environment.
 
-The scripts are designed to operate primarily through **Windows Task Scheduler under the SYSTEM account**, allowing routine maintenance to occur without requiring an administrator to manually visit each workstation.
+## Contents
 
----
+- [Project goals](#project-goals)
+- [Active maintenance scripts](#active-maintenance-scripts)
+- [Detailed script descriptions](#detailed-script-descriptions)
+- [Supporting files](#supporting-files)
+- [Scheduled task deployment](#scheduled-task-deployment)
+- [Sunday maintenance schedule](#sunday-maintenance-schedule)
+- [Deployment workflow](#deployment-workflow)
+- [Logging and telemetry](#logging-and-telemetry)
+- [Security considerations](#security-considerations)
+- [Retired scripts](#retired-scripts)
 
-## 📋 Project Goals
+## Project goals
 
-The goal of this project is to move computer lab maintenance from a collection of individual scripts toward a **centrally managed endpoint maintenance framework**.
+- Automate routine Sunday maintenance on Windows lab computers.
+- Keep the scripts on each endpoint synchronized with a central file share.
+- Run maintenance under SYSTEM without requiring an interactive administrator session.
+- Verify changes instead of assuming that a command succeeded.
+- Preserve human-readable operational logs and structured Elastic-compatible telemetry.
+- Target lab-specific settings using computer-name prefixes and wildcard patterns.
+- Reduce the number of separate scheduled tasks by consolidating related application and lab configuration work.
+- Keep rollback copies before replacing or retiring locally deployed scripts.
 
-The system is designed around several principles:
+## Active maintenance scripts
 
-**Automation**  
-Routine maintenance should occur automatically and consistently.
+| File | Purpose |
+|---|---|
+| [`00_Update-Scripts-FromShare.ps1`](./00_Update-Scripts-FromShare.ps1) | Synchronizes the approved maintenance package from the primary or fallback share, validates PowerShell files, preserves rollback copies, retires replaced scripts, and reconciles scheduled tasks. |
+| [`01_Enable_Windows_Update_Services.ps1`](./01_Enable_Windows_Update_Services.ps1) | Restores Windows Update services, scheduled tasks, policy settings, and required Windows configuration before the update stages begin. |
+| [`02_Remove_User_Profiles.ps1`](./02_Remove_User_Profiles.ps1) | Performs scheduled cleanup of eligible local user profiles while preserving required and protected profiles. |
+| [`03_Weekend_Apps_Update.ps1`](./03_Weekend_Apps_Update.ps1) | Runs the weekend application update stage before driver and operating-system maintenance. |
+| [`04_Sunday_Lab_Application_Maintenance.ps1`](./04_Sunday_Lab_Application_Maintenance.ps1) | Runs the consolidated printer, PaperCut, Autologon, Edge, Elastic Agent, browser homepage, Honorlock, and Stellarium Location Services maintenance. |
+| [`05_Weekend_HP_Drivers_Update.ps1`](./05_Weekend_HP_Drivers_Update.ps1) | Performs HP driver and firmware maintenance with safeguards around sensitive storage-related driver categories. |
+| [`06_Weekend_Windows_Updates.ps1`](./06_Weekend_Windows_Updates.ps1) | Installs Windows Updates and is scheduled for two passes during the Sunday maintenance window. |
+| [`07_Force_Reboot_Install_Updates.ps1`](./07_Force_Reboot_Install_Updates.ps1) | Forces the planned maintenance reboot, supports update completion, and provides startup-resume verification. |
+| [`08_System_Repair.ps1`](./08_System_Repair.ps1) | Runs Windows health and repair operations after the update and reboot stages. |
+| [`09_Disable_Windows_Update_Services.ps1`](./09_Disable_Windows_Update_Services.ps1) | Returns Windows Update services and related settings to the college's post-maintenance state. |
+| [`10_Sync_System_Time.ps1`](./10_Sync_System_Time.ps1) | Synchronizes system time and runs independently every four hours. |
+| [`12_Enable-SystemRestore-And-Create-RestorePoint.ps1`](./12_Enable-SystemRestore-And-Create-RestorePoint.ps1) | Enables System Restore where required and creates a weekly restore point before maintenance changes. |
+| [`14_Endpoint_Health_Inventory.ps1`](./14_Endpoint_Health_Inventory.ps1) | Captures the endpoint's final weekly health and compliance inventory after the other Sunday stages finish. |
+| [`16_Check_Deep_Freeze_Status.ps1`](./16_Check_Deep_Freeze_Status.ps1) | Checks Deep Freeze status at startup and exits safely on systems where Deep Freeze is not installed. |
 
-**Centralized Management**  
-Scripts can be maintained centrally and distributed to endpoints.
+## Detailed script descriptions
 
-**Reliability**  
-Maintenance tasks include logging, error handling, validation, and fallback mechanisms.
+### `00_Update-Scripts-FromShare.ps1`
 
-**Observability**  
-Maintenance results can be collected and forwarded to centralized logging platforms for reporting and troubleshooting.
+The manifest-driven updater maintains `C:\Scripts` from the college deployment share. It prefers `\\filesvr\Labscripts` and uses `\\10.2.3.30\Labscripts` as a fallback.
 
-**Controlled Deployment**  
-Configuration and deployment policies allow changes to be introduced gradually instead of immediately affecting every workstation.
+Major functions include:
 
-**Maintainability**  
-Common functionality is moved into shared framework components instead of being independently recreated in every script.
+- Loads and validates `DeploymentManifest.json`.
+- Limits deployment to an explicit approved-file list.
+- Deploys selected supplemental files even while the manifest is being refreshed.
+- Compares actual source and local SHA-256 hashes.
+- Parses PowerShell files before installation and validates them again afterward.
+- Creates rollback copies before replacing existing files.
+- Updates itself last and relaunches the new version safely.
+- Runs `Register-Tasks_SYSTEM.ps1` after synchronization.
+- Cleans old staging directories and rollback folders according to retention rules.
+- Deploys `04_Sunday_Lab_Application_Maintenance.ps1` and removes the six standalone scripts it replaces.
 
----
+Retired scripts are removed from `C:\Scripts` only after script 04 exists locally and passes PowerShell parser validation. Removed files are moved into the updater's rollback structure and retained for 30 days.
 
-# 🔄 Maintenance Workflow
+### `01_Enable_Windows_Update_Services.ps1`
 
-A typical workstation maintenance cycle follows approximately this process:
+Prepares the endpoint for the Sunday update window by restoring and validating the services, tasks, and settings required by Windows Update.
 
-```text
-                 Central Script Repository
-                          │
-                          ▼
-             00_Update-Scripts-FromShare
-                          │
-                          ▼
-                  C:\Scripts on Endpoint
-                          │
-                          ▼
-                Windows Task Scheduler
-                          │
-          ┌───────────────┼────────────────┐
-          ▼               ▼                ▼
-     Maintenance       Updates        Health Checks
-       Scripts
-          │               │                │
-          └───────────────┼────────────────┘
-                          ▼
-                       C:\Logs
-                          │
-                          ▼
-                Maintenance Telemetry
-                          │
-                          ▼
-               Central Logging / Elastic
-```
+The script includes:
 
-This architecture allows the endpoint to continue performing its scheduled maintenance while also producing structured information that can be used for centralized monitoring and reporting.
+- Bootstrap synchronization through the latest script 00 before loading shared framework components.
+- Service recovery and retry handling for Windows Update-related services.
+- Validation of services such as Windows Update, BITS, Delivery Optimization, Update Orchestrator, Cryptographic Services, and Windows Installer.
+- Recovery of required Microsoft update scheduled tasks.
+- Cleanup of conflicting Windows Update policy values.
+- Windows 11 configuration enforcement used by the maintenance environment.
+- Controlled reboot handling if critical update services cannot be recovered.
+- Scheduled-task reconciliation through `Register-Tasks_SYSTEM.ps1`.
+- A consistent Sunday 1:00 AM validation time for the updater task.
 
----
+### `02_Remove_User_Profiles.ps1`
 
-# 📂 Maintenance Scripts
+Performs the weekly local-profile cleanup stage. The script is intended to reduce stale profile accumulation on shared lab systems while protecting accounts and profiles that must remain available.
 
-## `00_Update-Scripts-FromShare.ps1`
+Review the configured age threshold, exclusions, and account protections before expanding deployment to new computer groups.
 
-### Central Script Synchronization
+### `03_Weekend_Apps_Update.ps1`
 
-Maintains the local maintenance script set on each workstation.
+Runs the general application-update phase of the maintenance window. It is placed before the combined lab configuration, device-driver, and Windows Update stages so application servicing can finish before later reboots.
 
-The script synchronizes the contents of the centralized maintenance repository with the workstation's local script directory, allowing updated versions of maintenance scripts to be deployed without manually copying files to individual computers.
+### `04_Sunday_Lab_Application_Maintenance.ps1`
 
-Key responsibilities include:
+Consolidates six former standalone scripts into one scheduled maintenance runner. Each internal section runs in an isolated 64-bit Windows PowerShell process so duplicate helper functions, strict-mode settings, and a section's final `exit` statement cannot interfere with later work.
 
-- Updating locally installed maintenance scripts.
-- Retrieving files from the configured central source.
-- Supporting alternate/fallback sources when the primary source is unavailable.
-- Validating deployment files.
-- Maintaining the local maintenance framework.
-- Providing logging for synchronization operations.
-- Helping ensure endpoints are running the expected versions of maintenance scripts.
+The combined sections are:
 
-This script acts as the **deployment mechanism for the rest of the maintenance environment**.
+1. SHARP printer driver, PaperCut Print Deploy, and `StudentSecurePrint` connection maintenance.
+2. Autologon configuration and Microsoft Edge InPrivate startup.
+3. Elastic Agent installation, enrollment, health checking, and package fallback handling.
+4. Chrome, Edge, and Firefox homepage/startup policy configuration.
+5. Honorlock Chrome extension force-install policy configuration.
+6. Windows Location Services configuration for Stellarium.
 
----
+The easy-to-edit configuration area near the top contains:
 
-## `01_Enable_Windows_Update_Services.ps1`
+- Autologon computer wildcard patterns.
+- Elastic Agent computer-name prefixes.
+- Honorlock computer wildcard patterns.
+- Stellarium computer wildcard patterns.
+- A `$true` or `$false` switch for each internal section.
+- The shared browser homepage URL.
 
-### Prepare Windows Update
+The runner continues to the next section when one section fails and produces its own combined JSON summary in addition to the preserved per-section logs and telemetry.
 
-Prepares the workstation for its scheduled Windows Update maintenance window.
+> [!CAUTION]
+> This script contains the embedded configuration from the former Autologon and Elastic Agent scripts. Treat access to the file and deployment share as sensitive.
 
-The script ensures that services required by Windows Update are available before the update process begins.
+### `05_Weekend_HP_Drivers_Update.ps1`
 
-This allows Windows Update services to remain restricted outside the maintenance period while still allowing the automated update process to operate when scheduled.
+Runs the device-driver and firmware maintenance stage for supported HP systems. Storage, chipset, Intel RST, VMD, and NVMe-related updates should remain subject to the script's safety controls because unattended installation of those categories can affect boot or storage availability.
 
-Typical responsibilities include:
+### `06_Weekend_Windows_Updates.ps1`
 
-- Checking required Windows Update services.
-- Correcting service startup configuration where appropriate.
-- Starting required update services.
-- Logging service state and maintenance results.
-- Preparing the computer for later Windows Update operations.
+Performs Windows Update installation during two scheduled passes:
 
-This script works together with:
+- The first pass installs the initially available updates.
+- The second pass runs after the planned reboot to find updates that became applicable only after the first pass or reboot.
 
-`06_Weekend_Windows_Updates.ps1`
+### `07_Force_Reboot_Install_Updates.ps1`
 
-and
+Coordinates the planned maintenance reboot and update-completion stage. A companion startup task runs the script with `-StartupResume` so verification can continue after Windows starts again.
 
-`09_Disable_Windows_Update_Services.ps1`
+### `08_System_Repair.ps1`
 
-to create a controlled Windows Update maintenance window.
+Runs system integrity and repair checks after the Windows Update stages. It is given a one-hour window before the final health inventory so repair operations have time to complete.
 
----
+### `09_Disable_Windows_Update_Services.ps1`
 
-## `02_Remove_User_Profiles.ps1`
+Applies the college's post-maintenance Windows Update service configuration after both update passes have finished.
 
-### User Profile Cleanup
+### `10_Sync_System_Time.ps1`
 
-Performs automated cleanup of unnecessary local user profiles on shared lab workstations.
+Maintains reliable system time independently of the weekly Sunday chain. `Register-Tasks_SYSTEM.ps1` creates daily triggers at:
 
-Computer labs can accumulate large numbers of profiles as students and other users sign into machines over time. These profiles consume disk space and can eventually contribute to storage and performance problems.
+- 12:00 AM
+- 4:00 AM
+- 8:00 AM
+- 12:00 PM
+- 4:00 PM
+- 8:00 PM
 
-The script is designed to:
+### `12_Enable-SystemRestore-And-Create-RestorePoint.ps1`
 
-- Identify profiles eligible for removal.
-- Protect required/system profiles.
-- Remove qualifying user profiles.
-- Recover disk space.
-- Record cleanup activity.
-- Report errors encountered during profile removal.
+Ensures System Restore is enabled as required and creates a restore point early in the maintenance window, before application, driver, update, and configuration changes.
 
-Automating this process reduces the need for technicians to manually clean profiles from individual computers.
+### `14_Endpoint_Health_Inventory.ps1`
 
----
+Collects a final weekly endpoint snapshot after the other maintenance stages. The inventory is designed to support proactive troubleshooting, compliance reporting, and Elastic dashboards.
 
-## `03_Weekend_Apps_Update.ps1`
+Collected areas include:
 
-### Application Maintenance
-
-Performs scheduled application updates during the maintenance window.
-
-The goal is to keep commonly installed applications current without requiring technicians to manually update software on individual lab computers.
-
-The script handles the application maintenance process while generating logs that can later be reviewed to determine whether updates completed successfully.
-
-This helps reduce:
-
-- Outdated software.
-- Application vulnerabilities.
-- Version inconsistencies between lab computers.
-- Manual technician workload.
-
----
-
-## `04_Update_Edge_Silent.ps1`
-
-### Microsoft Edge Update
-
-Legacy/dedicated Microsoft Edge update script.
-
-This script was originally used to perform silent Microsoft Edge maintenance independently from the broader application update process.
-
-> **Note:** This functionality may overlap with newer application maintenance processes and is retained primarily for compatibility or historical deployment requirements.
-
----
-
-## `05_Weekend_HP_Drivers_Update.ps1`
-
-### HP Driver and Firmware Maintenance
-
-Automates supported HP workstation maintenance using HP management/update tooling.
-
-The script is designed to keep appropriate device drivers and firmware current while avoiding driver categories that could introduce unnecessary risk to unattended lab systems.
-
-Responsibilities include:
-
-- Detecting applicable HP hardware.
-- Running HP update tooling.
-- Evaluating available updates.
-- Installing approved update categories.
-- Restricting selected storage-related or otherwise sensitive unattended updates.
-- Logging update results and failures.
-
-Driver maintenance is intentionally more controlled than general application updating because certain storage, chipset, firmware, or controller changes can affect system bootability.
-
----
-
-## `06_Weekend_Windows_Updates.ps1`
-
-### Windows Update Installation
-
-Performs the primary scheduled Windows Update maintenance operation.
-
-After Windows Update services have been prepared by script `01`, this script handles installation of available Windows updates during the scheduled maintenance window.
-
-The process is designed for unattended operation and includes logging so update activity can later be reviewed centrally.
-
-Typical responsibilities include:
-
-- Checking for available Windows updates.
-- Installing approved updates.
-- Recording update results.
-- Detecting update failures.
-- Identifying conditions requiring a reboot.
-
-This is one of the primary scripts responsible for keeping lab computers patched.
-
----
-
-## `07_Force_Reboot_Install_Updates.ps1`
-
-### Maintenance Reboot
-
-Handles scheduled reboot operations required to complete maintenance.
-
-Some Windows updates and system changes cannot fully complete until the computer restarts. This script ensures machines do not remain indefinitely in a pending-reboot state.
-
-Responsibilities include:
-
-- Detecting maintenance/reboot conditions.
-- Allowing pending Windows maintenance to complete.
-- Performing scheduled system restarts.
-- Logging reboot-related activity.
-
-This helps ensure that updates installed earlier in the maintenance cycle actually become active.
-
----
-
-## `08_System_Repair.ps1`
-
-### Windows Health and Repair
-
-Performs automated Windows system integrity checks and repair operations.
-
-The script is intended to detect and repair common Windows component and operating system corruption before it develops into a larger support issue.
-
-Maintenance can include Windows servicing and system-file integrity operations such as:
-
-```powershell
-DISM
-SFC
-```
-
-The script records the results of repair operations so recurring integrity problems can be identified instead of silently occurring on individual computers.
-
----
-
-## `09_Disable_Windows_Update_Services.ps1`
-
-### Close Windows Update Maintenance Window
-
-Returns Windows Update-related services to their expected post-maintenance configuration.
-
-This script runs after the scheduled update cycle and complements:
-
-`01_Enable_Windows_Update_Services.ps1`
-
-Together, these scripts provide a controlled update window:
-
-```text
-Enable Update Services
-        │
-        ▼
-Install Windows Updates
-        │
-        ▼
-Reboot / Complete Updates
-        │
-        ▼
-Disable Update Services
-```
-
-The script also accounts for Windows services that may be protected or controlled directly by the operating system.
-
----
-
-## `10_Sync_System_Time.ps1`
-
-### System Time Synchronization
-
-Checks and corrects Windows time synchronization.
-
-Accurate system time is important for:
-
-- Active Directory authentication.
-- Kerberos.
-- Event log correlation.
-- Security investigations.
-- Scheduled tasks.
-- Certificate validation.
-- Centralized logging.
-
-The script helps ensure lab computers remain synchronized with the expected time source and records synchronization results.
-
----
-
-## `11_Install_SharpDriver_And_PaperCut.ps1`
-
-### Printing Environment Deployment
-
-Automates installation and configuration of required Sharp printing components and PaperCut software.
-
-The script reduces the amount of manual printer configuration required when deploying or repairing lab computers.
-
-Responsibilities include installation and validation of the required printing environment while logging deployment results.
-
----
-
-## `12_Enable-SystemRestore-And-Create-RestorePoint.ps1`
-
-### System Restore Protection
-
-Ensures Windows System Restore is available and creates a known restore point.
-
-This provides an additional recovery mechanism before or during maintenance operations.
-
-The script can:
-
-- Enable System Restore.
-- Verify restore configuration.
-- Create a restore point.
-- Record whether the operation succeeded.
-
-This provides another recovery option when maintenance or software changes create an unexpected workstation problem.
-
----
-
-## `13_Configure_Autologon_And_Edge.ps1`
-
-### Lab-Specific Workstation Configuration
-
-Applies configuration settings required by selected computer labs.
-
-Unlike scripts intended to run identically across every workstation, this script uses workstation naming or lab-selection logic to determine where configuration should be applied.
-
-Configuration responsibilities can include:
-
-- Lab autologon configuration.
-- Default user configuration.
-- Domain configuration.
-- Microsoft Edge configuration.
-- Removal or correction of obsolete settings.
-- Lab-specific workstation behavior.
-
-This allows specialized lab requirements to remain automated without applying those settings to unrelated systems.
-
-> ⚠️ Autologon configuration should always be treated as security-sensitive and access to configuration data should be appropriately restricted.
-
----
-
-## `14_Endpoint_Health_Inventory.ps1`
-
-### Endpoint Health and Inventory Collection
-
-Collects a broad health snapshot from each workstation.
-
-Rather than making configuration changes, this script provides visibility into the current condition of the endpoint.
-
-Collected information can include:
-
-- Computer identification.
-- Hardware information.
-- CPU information.
-- Memory utilization.
-- Disk utilization and health.
-- Windows version/build.
-- System uptime.
-- Last boot time.
-- Pending reboot state.
+- CPU, memory, disk utilization, and disk health.
+- Windows edition, version, build, uptime, and last boot.
+- Pending-reboot state.
 - Device Manager problems.
-- Microsoft Defender status.
-- Windows Firewall status.
-- BitLocker status.
-- TPM status.
-- Secure Boot status.
-- Network adapter information.
-- IP configuration.
-- DNS configuration.
-- Windows Update information.
-- Recent crash or critical events.
-- Important Windows service status.
-- Management/monitoring agent status.
+- Microsoft Defender and Windows Firewall status.
+- BitLocker, TPM, and Secure Boot state.
+- Network adapters, IP addressing, gateways, and DNS configuration.
+- Recent update state.
+- Critical system and crash events.
+- Required service health.
+- Management and monitoring agent status.
 
-The resulting data can be used to identify trends and eventually support centralized health dashboards and proactive maintenance.
+### `16_Check_Deep_Freeze_Status.ps1`
 
----
+Runs at startup to capture Deep Freeze status. Systems without Deep Freeze can exit without creating unnecessary maintenance-launcher telemetry.
 
-## `15_Install_Elastic_Agent.ps1`
+## Supporting files
 
-### Elastic Agent Deployment
+### `Maintenance.Framework.psm1`
 
-Automates installation of the Elastic Agent on selected lab computers.
+Shared PowerShell module used by the maintenance scripts. It centralizes recurring functionality such as:
 
-The script supports phased deployment rather than immediately installing the agent across the entire workstation environment.
+- Maintenance environment initialization.
+- Staged text-log creation and publication.
+- Log archival and retention.
+- Structured NDJSON telemetry writes.
+- Windows Event Log entries.
+- Fleet-status publication.
+- Common configuration and policy handling.
 
-Its purpose is to prepare endpoints for centralized collection of maintenance telemetry and other approved log sources.
+### `Maintenance.Policy.json`
 
-The deployment process is designed to support:
+Central maintenance policy consumed by the framework. It provides shared configuration such as fleet-status locations and policy version information.
 
-- Lab-based targeting.
-- Controlled rollout.
-- Local installation packages.
-- Alternate package sources.
-- Download fallback when necessary.
-- Installation validation.
-- Deployment logging.
+### `Invoke-MaintenanceScript.ps1`
 
-Once configured, Elastic Agent provides the connection between workstation telemetry and the centralized Elastic logging environment.
+Standard launcher used by managed scheduled tasks. It provides consistent invocation behavior and launcher-level telemetry around maintenance scripts.
 
----
+### `Get-MaintenanceFleetStatus.ps1`
 
-## `16_Check_Deep_Freeze_Status.ps1`
+Reads and summarizes the latest maintenance status information published by managed endpoints.
 
-### Deep Freeze Monitoring
+### `DeploymentManifest.json`
 
-Checks the current status of Faronics Deep Freeze on applicable lab workstations.
+Lists files managed by the deployment package, including version and hash metadata. The source share remains authoritative, while the manifest provides package structure and traceability.
 
-Deep Freeze state is important during maintenance because updates or configuration changes performed while a system is frozen may be lost after restart.
+### `Update-DeploymentManifest.ps1`
 
-The script provides visibility into whether the workstation is in the expected Deep Freeze state and records that information for maintenance reporting.
+Regenerates or refreshes `DeploymentManifest.json` after maintenance files are added, changed, renamed, or removed.
 
-This information can eventually be correlated with update failures or maintenance anomalies.
+## Scheduled task deployment
 
----
+### `Register-Tasks_SYSTEM.ps1`
 
-## `17_Set_Browser_Homepage.ps1`
+Creates, updates, validates, and removes Compton College maintenance tasks. It is idempotent: running it again leaves correct tasks alone and repairs only managed properties that differ.
 
-### Browser Homepage and Sign-In Policy
+It manages:
 
-Configures a consistent machine-wide homepage and startup page for Mozilla Firefox, Google Chrome, and Microsoft Edge.
+- Weekly Sunday task actions and start times.
+- SYSTEM principals with highest privileges.
+- Task execution settings and time limits.
+- The system-time synchronization task.
+- The post-reboot startup-resume task.
+- The Deep Freeze startup check.
+- Removal of obsolete task names from earlier schedules.
+- Removal of any managed task whose action references one of the retired standalone scripts.
+- Structured task-reconciliation telemetry and verification results.
 
-The default homepage is:
+The script creates the following weekly schedule:
 
-`https://www.compton.edu`
+| Order | Sunday time | Scheduled task | Script |
+|---:|---:|---|---|
+| 1 | 1:00 AM | Check for Updated Scripts | `00_Update-Scripts-FromShare.ps1` |
+| 2 | 1:15 AM | Create Weekly System Restore Point | `12_Enable-SystemRestore-And-Create-RestorePoint.ps1` |
+| 3 | 1:30 AM | Enable Windows Update Services | `01_Enable_Windows_Update_Services.ps1` |
+| 4 | 1:45 AM | Remove User Profiles Weekly | `02_Remove_User_Profiles.ps1` |
+| 5 | 2:15 AM | Weekend Apps Update | `03_Weekend_Apps_Update.ps1` |
+| 6 | 3:15 AM | Sunday Lab Application Maintenance | `04_Sunday_Lab_Application_Maintenance.ps1` |
+| 7 | 4:15 AM | Weekend HP Drivers Update | `05_Weekend_HP_Drivers_Update.ps1` |
+| 8 | 5:15 AM | Weekend Windows Updates—First Pass | `06_Weekend_Windows_Updates.ps1` |
+| 9 | 6:15 AM | Force Reboot and Install Updates | `07_Force_Reboot_Install_Updates.ps1` |
+| 10 | 6:45 AM | Weekend Windows Updates—Second Pass | `06_Weekend_Windows_Updates.ps1` |
+| 11 | 7:45 AM | Disable Windows Update Services | `09_Disable_Windows_Update_Services.ps1` |
+| 12 | 8:00 AM | System Repair | `08_System_Repair.ps1` |
+| 13 | 9:00 AM | Weekly Endpoint Health Inventory | `14_Endpoint_Health_Inventory.ps1` |
 
-The script applies browser policies under the computer-level registry so the configuration is available to every user who signs in to the workstation.
+Additional managed triggers:
 
-Responsibilities include:
+| Trigger | Task | Script and arguments |
+|---|---|---|
+| Every four hours | Sync System Time | `10_Sync_System_Time.ps1` |
+| At system startup | Resume Reboot Verification | `07_Force_Reboot_Install_Updates.ps1 -StartupResume` |
+| At system startup | Check Deep Freeze Status | `16_Check_Deep_Freeze_Status.ps1` |
 
-- Setting the Firefox, Chrome, and Edge homepages.
-- Opening the configured homepage when each browser starts.
-- Enabling the browser Home button where supported.
-- Disabling Chrome browser/profile sign-in prompts and synchronization.
-- Preventing Chrome sign-in interception and promotional sign-in tabs.
-- Preserving the ability to sign in normally to websites.
-- Verifying every applied policy value.
-- Recording changes, verification results, logs, and maintenance telemetry.
+The schedule deliberately leaves larger windows around application maintenance, drivers, Windows Updates, and system repair. Task start times are fixed; they do not guarantee that an earlier task has finished, so execution duration should continue to be monitored through telemetry.
 
-The browser policies take effect after the affected browser is closed and reopened or after its enterprise policies refresh.
+## Deployment workflow
 
----
+1. Place the approved scripts and supporting files in `\\filesvr\Labscripts`.
+2. Keep the fallback share at `\\10.2.3.30\Labscripts` synchronized as required.
+3. Remove retired standalone scripts from the active deployment-share folder or archive them outside the managed folder.
+4. Run `Update-DeploymentManifest.ps1` after files are added, changed, renamed, or removed.
+5. Test `00_Update-Scripts-FromShare.ps1` on a pilot endpoint.
+6. Confirm that `04_Sunday_Lab_Application_Maintenance.ps1` was deployed to `C:\Scripts`.
+7. Confirm that retired files and retired scheduled tasks were removed.
+8. Review `Register-Tasks_SYSTEM.latest.json` and Task Scheduler for the expected task count and times.
+9. Expand deployment after the pilot endpoint completes successfully.
 
-## `18_Install_Honorlock_Chrome_Extension.ps1`
+## Logging and telemetry
 
-### Honorlock Chrome Extension Deployment
-
-Force-installs the Honorlock extension in Google Chrome through machine-wide Chrome enterprise policy.
-
-The script is designed for controlled lab deployment and currently targets computer names matching:
-
-- `SSC-216*`
-- `AHB-146*`
-
-Computers outside the configured pattern list record a successful `NotTargeted` result and make no policy changes.
-
-Responsibilities include:
-
-- Evaluating computer-name wildcard patterns before deployment.
-- Creating Chrome's `ExtensionInstallForcelist` policy when required.
-- Preserving other extensions already present in the force-install list.
-- Updating an existing Honorlock entry when its policy value is incorrect.
-- Selecting the next available numeric policy entry for a new installation.
-- Verifying that the Honorlock policy exists after configuration.
-- Producing local logs and structured maintenance telemetry.
-
-Chrome installs or updates the extension when browser policy refreshes or when Chrome next starts. Additional labs can be introduced by adding their computer-name patterns to the script configuration.
-
----
-
-# 🧰 Maintenance Framework
-
-The repository contains several additional files that provide the underlying deployment, logging, validation, and orchestration framework.
-
----
-
-## `Maintenance.Framework.psm1`
-
-### Shared PowerShell Framework Module
-
-Contains reusable PowerShell functions used throughout the maintenance environment.
-
-Instead of duplicating common functionality in every maintenance script, shared operations can be maintained in this module.
-
-The framework helps standardize areas such as:
-
-- Logging.
-- Error handling.
-- Script initialization.
-- Maintenance result reporting.
-- Telemetry generation.
-- Policy handling.
-- Common validation operations.
-
-Centralizing these functions makes the maintenance environment easier to update and helps scripts produce consistent output.
-
----
-
-## `Maintenance.Policy.json`
-
-### Maintenance Policy Configuration
-
-Provides centralized configuration used by the maintenance framework.
-
-Separating policy from script logic makes it possible to modify operational behavior without rewriting every maintenance script.
-
-Policy configuration can control how framework components behave and provides a common configuration source for maintenance operations.
-
----
-
-## `Invoke-MaintenanceScript.ps1`
-
-### Maintenance Script Wrapper
-
-Provides a standardized method for launching maintenance scripts through the framework.
-
-Rather than every scheduled task independently implementing initialization, validation, execution, logging, and error handling, this wrapper provides a common execution path.
-
-Conceptually:
+Operational logs are normally written beneath:
 
 ```text
-Task Scheduler
-      │
-      ▼
-Invoke-MaintenanceScript
-      │
-      ▼
-Maintenance Framework
-      │
-      ▼
-Selected Maintenance Script
-      │
-      ▼
-Logging / Telemetry
+C:\Logs
 ```
 
-This makes execution behavior more predictable across the maintenance environment.
-
----
-
-# ⏱️ Scheduled Task Management
-
-## `Register-Tasks_SYSTEM.ps1`
-
-Creates and maintains the Windows Scheduled Tasks used to execute the maintenance scripts.
-
-Tasks are configured to run under the Windows **SYSTEM** account so maintenance can occur without requiring an interactive administrator login.
-
-The script centralizes task configuration including:
-
-- Script execution.
-- Maintenance schedules.
-- SYSTEM execution.
-- PowerShell execution parameters.
-- Task replacement/update behavior.
-- Scheduled maintenance sequencing.
-
-This allows scheduled-task changes to be deployed consistently instead of manually modifying Task Scheduler on every computer.
-
-The current rotation includes the browser-homepage policy at **08:40 Sunday** and the Honorlock policy at **08:45 Sunday**. The Honorlock task can exist on every endpoint because Script 18 performs its own computer-name targeting before making changes.
-
----
-
-# 📊 Fleet Status and Monitoring
-
-## `Get-MaintenanceFleetStatus.ps1`
-
-Provides a maintenance status view intended to help determine the condition of deployed endpoints.
-
-The script can be used to aggregate or evaluate maintenance information and identify computers that may require additional attention.
-
-This supports the larger goal of moving from:
-
-> **Reactive workstation support**
-
-toward:
-
-> **Proactive endpoint monitoring and maintenance**
-
----
-
-# 🧪 Testing and Validation
-
-## `Test-AllMaintenanceScripts.ps1`
-
-Performs validation of the maintenance PowerShell scripts.
-
-This provides a way to identify script problems before updated scripts are broadly deployed to lab computers.
-
-Testing the complete script collection helps reduce the possibility that a syntax or framework problem will interrupt an unattended maintenance cycle.
-
----
-
-## `Test-MaintenanceTelemetry.ps1`
-
-Tests maintenance telemetry generation and processing.
-
-This utility is useful when validating the logging pipeline without needing to wait for an actual scheduled maintenance operation.
-
-It helps verify that expected telemetry can be generated before connecting that data to centralized monitoring and dashboards.
-
----
-
-# 📦 Deployment Management
-
-## `DeploymentManifest.json`
-
-### Deployment Manifest
-
-Defines information about the files that make up the expected maintenance deployment.
-
-The manifest provides a structured source that can be used to determine what files belong on an endpoint and assist with deployment validation.
-
----
-
-## `Update-DeploymentManifest.ps1`
-
-### Manifest Generator / Updater
-
-Synchronizes the deployment manifest with the approved maintenance-file catalog.
-
-The utility:
-
-- Adds approved files that are present on the deployment share but missing from the manifest.
-- Includes Scripts 17 and 18 in the approved deployment set.
-- Removes retired Script 19/20 names only after their Script 17/18 replacements are ready.
-- Extracts embedded file versions.
-- Recalculates SHA-256 hashes, including hash-only changes where the version number did not change.
-- Detects duplicate manifest entries.
-- Creates a backup before writing.
-- Validates the generated JSON before replacing the active manifest.
-- Supports `-WhatIfOnly` for a read-only preview.
-
-This reduces manual deployment-metadata maintenance and helps ensure the manifest accurately represents the files currently approved for endpoint deployment.
-
----
-
-## `SHA256SUMS.txt`
-
-### File Integrity Information
-
-Contains SHA-256 hashes for deployment files.
-
-Cryptographic hashes provide a method of verifying that a deployed file matches the expected version and has not been accidentally modified or corrupted.
-
-Example concept:
+Shared structured telemetry is written to:
 
 ```text
-Repository File
-      │
-      ▼
-Calculate SHA-256
-      │
-      ▼
-Compare Expected Hash
-      │
-      ├── MATCH ──► File Valid
-      │
-      └── FAIL ───► Investigate / Replace
+C:\Logs\Maintenance-Telemetry.ndjson
 ```
 
----
+Most scripts also maintain a script-specific `*.latest.json` document containing the most recent execution state. Framework-enabled scripts stage their text logs and publish the completed log only after telemetry finalization so log ingestion receives a stable file.
 
-## `BUILD-VALIDATION.json`
-
-### Build Validation Results
-
-Stores structured information associated with validation of the maintenance script build.
-
-This provides a machine-readable record that can be used as part of deployment validation and testing.
-
----
-
-## `README-Maintenance-Framework.txt`
-
-Contains additional technical documentation specifically related to the maintenance framework.
-
-This file is useful when troubleshooting or modifying the underlying framework rather than simply operating the individual maintenance scripts.
-
----
-
-# 📁 Repository Layout
+The combined script adds:
 
 ```text
-Compton_Lab_Scripts/
-│
-├── 00_Update-Scripts-FromShare.ps1
-├── 01_Enable_Windows_Update_Services.ps1
-├── 02_Remove_User_Profiles.ps1
-├── 03_Weekend_Apps_Update.ps1
-├── 04_Update_Edge_Silent.ps1
-├── 05_Weekend_HP_Drivers_Update.ps1
-├── 06_Weekend_Windows_Updates.ps1
-├── 07_Force_Reboot_Install_Updates.ps1
-├── 08_System_Repair.ps1
-├── 09_Disable_Windows_Update_Services.ps1
-├── 10_Sync_System_Time.ps1
-├── 11_Install_SharpDriver_And_PaperCut.ps1
-├── 12_Enable-SystemRestore-And-Create-RestorePoint.ps1
-├── 13_Configure_Autologon_And_Edge.ps1
-├── 14_Endpoint_Health_Inventory.ps1
-├── 15_Install_Elastic_Agent.ps1
-├── 16_Check_Deep_Freeze_Status.ps1
-├── 17_Set_Browser_Homepage.ps1
-├── 18_Install_Honorlock_Chrome_Extension.ps1
-│
-├── Maintenance.Framework.psm1
-├── Maintenance.Policy.json
-├── Invoke-MaintenanceScript.ps1
-├── Get-MaintenanceFleetStatus.ps1
-├── Register-Tasks_SYSTEM.ps1
-│
-├── Test-AllMaintenanceScripts.ps1
-├── Test-MaintenanceTelemetry.ps1
-│
-├── DeploymentManifest.json
-├── Update-DeploymentManifest.ps1
-├── BUILD-VALIDATION.json
-├── SHA256SUMS.txt
-│
-├── README-Maintenance-Framework.txt
-└── README.md
+C:\Logs\04_Sunday_Lab_Application_Maintenance.log
+C:\Logs\04_Sunday_Lab_Application_Maintenance.latest.json
 ```
 
----
+## Security considerations
 
-# 📝 Logging and Telemetry
+- Run scripts only from a trusted and access-controlled deployment share.
+- Restrict modification rights on `C:\Scripts`, the central share, manifests, framework files, and scheduled tasks.
+- Protect Autologon credentials and Elastic Agent enrollment information contained in script 04.
+- Remember that Base64 encoding is obfuscation, not encryption.
+- Use SYSTEM only where required and keep task actions limited to approved scripts.
+- Review log and telemetry output to prevent accidental exposure of passwords, tokens, or other secrets.
+- Pilot changes before broad deployment.
+- Retain rollback copies only as long as operationally necessary and protect their permissions.
+- Treat computer-name targeting as deployment scope control, not as a security boundary.
 
-Maintenance operations are designed to generate logs rather than silently executing.
+## Retired scripts
 
-This is important because unattended automation without visibility can make troubleshooting more difficult.
+The following standalone scripts were consolidated into [`04_Sunday_Lab_Application_Maintenance.ps1`](./04_Sunday_Lab_Application_Maintenance.ps1). They should no longer remain in `C:\Scripts`, the active deployment-share folder, `DeploymentManifest.json`, or active scheduled tasks.
 
-The logging architecture is intended to provide information such as:
-
-```text
-Computer
-   │
-   ├── Script Executed
-   ├── Start Time
-   ├── Completion Time
-   ├── Result
-   ├── Warnings
-   ├── Errors
-   └── Maintenance Details
-            │
-            ▼
-         Local Logs
-            │
-            ▼
-        Elastic Agent
-            │
-            ▼
-       Elastic Stack
-            │
-            ▼
-     Kibana Dashboards
-```
-
-Centralized telemetry makes it possible to eventually answer questions such as:
-
-- Which computers failed maintenance?
-- Which machines have not reported recently?
-- Which computers are low on disk space?
-- Which systems require a reboot?
-- Which computers have Windows Update failures?
-- Which endpoints have hardware or Device Manager problems?
-- Which systems have unhealthy security services?
-- Which systems have incorrect Deep Freeze states?
-- Which maintenance scripts are failing most frequently?
-- Which lab is experiencing the most maintenance problems?
-
----
-
-# 🔐 Security Considerations
-
-Many scripts in this repository perform privileged system operations and are intended to execute as **SYSTEM**.
-
-Before deploying these scripts in another environment:
-
-1. Review all configuration values.
-2. Review network paths and deployment sources.
-3. Review lab/computer naming rules.
-4. Remove organization-specific credentials or secrets.
-5. Restrict modification rights to deployment locations.
-6. Validate SHA-256 hashes before deployment where appropriate.
-7. Test changes on a limited group of computers before broad deployment.
-8. Protect log data that may contain system or configuration information.
-
-> **Never assume these scripts are appropriate for another environment without reviewing and testing them first.**
-
----
-
-# ⚠️ Environment Specificity
-
-This project was developed for a specific Windows computer-lab environment.
-
-Several scripts may contain assumptions regarding:
-
-- Computer naming conventions
-- Active Directory/domain configuration
-- Network paths
-- Printer configuration
-- Installed applications
-- HP hardware
-- Deep Freeze
-- Elastic infrastructure
-- Scheduled maintenance windows
-
-Anyone adapting the project for another environment should review these dependencies before deployment.
-
----
-
-# 🚧 Project Status
-
-This project is under active development.
-
-The maintenance framework continues to evolve toward increased:
-
-- Centralized logging
-- Deployment validation
-- Endpoint health visibility
-- Automated failure detection
-- Fleet-level reporting
-- Elastic/Kibana integration
-- Proactive alerting
-- Maintenance dashboards
-
-The long-term objective is to provide a centralized view of workstation health and maintenance status while reducing repetitive hands-on support work.
-
----
-
-# 🛠️ Technologies
-
-![PowerShell](https://img.shields.io/badge/PowerShell-5.1%2B-blue?logo=powershell)
-![Windows](https://img.shields.io/badge/Windows-10%20%7C%2011-blue?logo=windows)
-![Elastic](https://img.shields.io/badge/Elastic-Logging-005571?logo=elastic)
-![Kibana](https://img.shields.io/badge/Kibana-Dashboards-005571?logo=kibana)
-![License](https://img.shields.io/badge/Status-Active%20Development-orange)
-
-Primary technologies include:
-
-- PowerShell
-- Windows Task Scheduler
-- Windows Update
-- Windows Event Logs
-- Elastic Agent
-- Elasticsearch
-- Kibana
-- JSON configuration
-- SHA-256 integrity validation
-
----
-
-# 👤 Author
-
-**Daniel Swaney**
-
-PowerShell automation, endpoint maintenance, infrastructure monitoring, and security-focused systems administration.
-
----
-
-## 📌 Disclaimer
-
-These scripts are provided as examples of automation developed for a specific computer lab environment.
-
-Administrative scripts can make significant changes to Windows systems. Review and test all scripts before using them in a production environment.
-
-Use at your own risk.
+| Retired file | Replacement section in script 04 |
+|---|---|
+| `11_Install_SharpDriver_And_PaperCut.ps1` | SHARP printer driver, PaperCut Print Deploy, and shared printer maintenance |
+| `13_Configure_Autologon_And_Edge.ps1` | Autologon and Edge InPrivate startup configuration |
+| `15_Install_Elastic_Agent.ps1` | Elastic Agent installation, enrollment, and health verification |
+| `17_Set_Browser_Homepage.ps1` | Chrome, Edge, and Firefox homepage/startup policies |
+| `18_Install_Honorlock_Chrome_Extension.ps1` | Honorlock Chrome extension force-install policy |
+| `19_Stellarium_Location_Services.ps1` | Windows Location Services configuration for Stellarium |

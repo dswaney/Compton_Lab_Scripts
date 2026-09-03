@@ -2,13 +2,13 @@
     "SchemaVersion":  1,
     "ManifestVersion":  "2.3.4",
     "PackageVersion":  "2.3.4",
-    "GeneratedUtc":  "2026-08-19T16:40:28Z",
+    "GeneratedUtc":  "2026-09-03T19:36:19Z",
     "Files":  [
                   {
                       "Name":  "00_Update-Scripts-FromShare.ps1",
                       "Role":  "Updater",
-                      "Version":  "4.2.3",
-                      "SHA256":  "A313A21962278461507F1B7872209EED7C6DBD8267CFB06BFB745A3291B0C6D8"
+                      "Version":  "4.4.0",
+                      "SHA256":  "439C245DDCBF023F959CC25C560A6D348921AA0634F1D02E588C26B47409AF5B"
                   },
                   {
                       "Name":  "01_Enable_Windows_Update_Services.ps1",
@@ -31,8 +31,8 @@
                   {
                       "Name":  "05_Weekend_HP_Drivers_Update.ps1",
                       "Role":  "ManagedFile",
-                      "Version":  "3.0.3",
-                      "SHA256":  "AD64ACC09256FBA981888031A7A66D0922F56162F89A0A2FCC104E12CD7524A3"
+                      "Version":  "3.0.4",
+                      "SHA256":  "43287096D522CB4F62A36F1B6C940D3E2F8A7CCEAF3C63293787FF5C66700CF0"
                   },
                   {
                       "Name":  "06_Weekend_Windows_Updates.ps1",
@@ -43,8 +43,8 @@
                   {
                       "Name":  "07_Force_Reboot_Install_Updates.ps1",
                       "Role":  "ManagedFile",
-                      "Version":  "2.0.5",
-                      "SHA256":  "785A37F2A24F7814E79912DA2690A47AA3CF9B86086437A78ADF145874293396"
+                      "Version":  "2.0.6",
+                      "SHA256":  "B4F49B5A1E95A3CBB05134615B39742682C78ABAE6FBDE0D32D2B92EFBF2617E"
                   },
                   {
                       "Name":  "08_System_Repair.ps1",
@@ -79,8 +79,8 @@
                   {
                       "Name":  "13_Configure_Autologon_And_Edge.ps1",
                       "Role":  "ManagedFile",
-                      "Version":  "2.1.3",
-                      "SHA256":  "E202B3B248806B5C52F0FFF630FC9CAD278B9AB3A96BE8A1E99F533069132CAF"
+                      "Version":  "2.2.0",
+                      "SHA256":  "864D2A64C5F3DFF84258FA8EE9151978B727104E179DD57458A77ECA57F3D764"
                   },
                   {
                       "Name":  "14_Endpoint_Health_Inventory.ps1",
@@ -104,13 +104,13 @@
                       "Name":  "Get-MaintenanceFleetStatus.ps1",
                       "Role":  "ManagedFile",
                       "Version":  "1.0.0",
-                      "SHA256":  "071ED09BE35D47CCD03B0A15B5F337E88F9C03EC43A273FD46820099F061EFE3"
+                      "SHA256":  "38B190E1368492228E53C9E6A914A0246BC42690CFE63536C9F1DE8746C74B12"
                   },
                   {
                       "Name":  "Invoke-MaintenanceScript.ps1",
                       "Role":  "Launcher",
                       "Version":  "1.0.0",
-                      "SHA256":  "B8EBDFD4DDFA0E271A4572EEA973F3FDC9E2A14E3A449A5A9B8CAE61CA2795B4"
+                      "SHA256":  "E50EB5C53CA29419F20E7BA725EBBD23D9E31B2170884633D30D1E2638E730C7"
                   },
                   {
                       "Name":  "Maintenance.Framework.psm1",
@@ -127,8 +127,26 @@
                   {
                       "Name":  "Register-Tasks_SYSTEM.ps1",
                       "Role":  "TaskRegistration",
-                      "Version":  "4.3.2",
-                      "SHA256":  "CC1ADF00025979A076FC801C8087313EC0CFE59CF9FE824EBF69E2ADE6E043B4"
+                      "Version":  "4.5.0",
+                      "SHA256":  "769DB84BF126979D27E14A248C541D15C78F09B8C7084D1398DAA54EB53F57E7"
+                  },
+                  {
+                      "Name":  "17_Set_Browser_Homepage.ps1",
+                      "Role":  "MaintenanceScript",
+                      "Version":  "1.0.1",
+                      "SHA256":  "45EAC04229A0E6605808F34720D670BA4448B9DEEE47137D954DFAD48D622882"
+                  },
+                  {
+                      "Name":  "18_Install_Honorlock_Chrome_Extension.ps1",
+                      "Role":  "MaintenanceScript",
+                      "Version":  "1.1.2",
+                      "SHA256":  "BDEEFEC45F91B8EBF23EF75282D238DE8133D1A35D86B8F033B2ECC049A584B9"
+                  },
+                  {
+                      "Name":  "19_Stellarium_Location_Services.ps1",
+                      "Role":  "MaintenanceScript",
+                      "Version":  "1.0.0",
+                      "SHA256":  "7957BEB9AA04983380E4CE8C3F1F59DB5CBAF7F3CFBE07A10A1E3C2A0375CDF2"
                   }
               ]
 }

@@ -1,5 +1,8 @@
 #requires -Version 5.1
 #requires -RunAsAdministrator
+# ScriptName:    Register-Tasks_SYSTEM.ps1
+# ScriptVersion: 4.7.0
+# LastUpdated:   2026-09-08
 <#
 .SYNOPSIS
     Reconciles Compton College managed scheduled tasks under SYSTEM.
@@ -11,10 +14,13 @@
 
 .NOTES
     ScriptName:    Register-Tasks_SYSTEM.ps1
-    ScriptVersion: 4.6.0
+    ScriptVersion: 4.7.0
     Change: Replaces six standalone weekly tasks with combined script 04, removes
             tasks that reference retired scripts, and refactors Sunday timing.
-    LastUpdated:   2026-09-03
+    LastUpdated:   2026-09-08
+    Changes:       v4.7.0 confirms only consolidated script 04 is scheduled for
+                   the retired application/configuration sections. Retired
+                   filenames remain only in cleanup safeguards that remove stale tasks.
     Changes:       v4.6.0 adds the combined weekly lab maintenance task and cleans up retired tasks.
     Changes:       v4.5.0 adds the weekly Stellarium Location Services task.
     Changes:       v4.4.0 adds weekly browser-homepage and Honorlock policy tasks.
@@ -33,7 +39,7 @@ Set-StrictMode -Version 2.0
 $ErrorActionPreference = 'Stop'
 
 $script:ScriptName       = 'Register-Tasks_SYSTEM.ps1'
-$script:ScriptVersion    = '4.6.0'
+$script:ScriptVersion    = '4.7.0'
 $script:RunId            = [guid]::NewGuid().Guid
 $script:StartTime        = Get-Date
 $script:WarningCount     = 0
@@ -722,6 +728,8 @@ try {
         [pscustomobject]@{ Name='13. Weekly Endpoint Health Inventory';      Script='14_Endpoint_Health_Inventory.ps1';                    Time='09:00'; Args='' }
     )
 
+    # Cleanup-only list: these files are never registered as desired tasks.
+    # Keep this guard so existing PCs lose stale tasks from older deployments.
     $retiredScriptNames = @(
         '11_Install_SharpDriver_And_PaperCut.ps1',
         '13_Configure_Autologon_And_Edge.ps1',

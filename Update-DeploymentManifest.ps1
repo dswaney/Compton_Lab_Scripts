@@ -1,4 +1,7 @@
 ﻿#requires -Version 5.1
+# ScriptName:    Update-DeploymentManifest.ps1
+# ScriptVersion: 2.0.0
+# LastUpdated:   2026-09-08
 
 <#
 .SYNOPSIS
@@ -14,7 +17,12 @@
     before replacing the original.
 
 .NOTES
-    ScriptVersion: 1.1.0
+    ScriptName:    Update-DeploymentManifest.ps1
+    ScriptVersion: 2.0.0
+    LastUpdated:   2026-09-08
+    Changes:       v2.0.0 makes the consolidated active-file catalog explicit.
+                   Standalone scripts 11, 13, 15, 17, 18, and Stellarium 19
+                   are excluded and are removed from any manifest being rebuilt.
 #>
 
 [CmdletBinding()]

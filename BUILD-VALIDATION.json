@@ -1,10 +1,12 @@
 {
-  "PackageVersion": "2.3.5",
+  "PackageVersion": "2.4.0",
   "PowerShellParserExecuted": false,
   "StructuralChecks": [
     "Manifest hashes generated",
     "Approved exported verbs preserved",
-    "Launcher and policy included"
+    "Launcher and policy included",
+    "Consolidated script 04 included",
+    "Retired standalone scripts excluded from active manifest and task rotation"
   ],
   "RequiresWindowsPowerShellValidation": true
 }

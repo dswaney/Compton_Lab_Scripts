@@ -1,8 +1,9 @@
 #requires -version 5.1
 # =====================================================================
 # ScriptName: 00_Update-Scripts-FromShare.ps1
-# ScriptVersion: 4.6.0
-# LastUpdated: 2026-09-08
+# ScriptVersion: 4.7.0
+# LastUpdated: 2026-09-09
+# Changes: v4.7.0 requires, approves, and supplementally deploys script 16 for the Monday Deep Freeze status audit.
 # Changes: v4.6.0 retires script 12 after its System Restore workflow was embedded in script 04 v1.3.0.
 # Changes: v4.5.0 deploys the combined script 04 and safely retires the six scripts it previously replaced.
 # Changes: v4.4.0 approves and supplementally deploys script 19 for Stellarium Location Services.
@@ -28,7 +29,7 @@ $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 
 $ScriptName = '00_Update-Scripts-FromShare.ps1'
-$ScriptVersion = '4.6.0'
+$ScriptVersion = '4.7.0'
 $PreferredSourceRoot = '\\filesvr\Labscripts'
 $FallbackSourceRoot = '\\10.2.3.30\Labscripts'
 $ManifestName = 'DeploymentManifest.json'
@@ -226,6 +227,7 @@ function Read-DeploymentManifest {
     if (-not ($files | Where-Object Name -eq $FrameworkName)) { throw "Manifest does not contain required framework: $FrameworkName" }
     if (-not ($files | Where-Object Name -eq $ScriptName)) { throw "Manifest does not contain updater: $ScriptName" }
     if (-not ($files | Where-Object Name -eq $RegisterTasksName)) { throw "Manifest does not contain task-registration script: $RegisterTasksName" }
+    if (-not ($files | Where-Object Name -eq $DeepFreezeStatusScriptName)) { throw "Manifest does not contain required Deep Freeze audit script: $DeepFreezeStatusScriptName" }
     $manifest
 }
 
@@ -560,7 +562,7 @@ try {
     # current DeploymentManifest.json, including combined script 04 and script 16.
     Install-SupplementalManagedFiles -SourceRoot $sourceRoot
 
-    # Remove the seven standalone scripts only after their combined replacement
+    # Remove the six standalone scripts only after their combined replacement
     # exists locally and has passed parser validation.
     Remove-RetiredMaintenanceFiles
 

@@ -1,8 +1,8 @@
 #requires -Version 5.1
 #requires -RunAsAdministrator
 # ScriptName:    Register-Tasks_SYSTEM.ps1
-# ScriptVersion: 4.8.0
-# LastUpdated:   2026-09-08
+# ScriptVersion: 4.9.0
+# LastUpdated:   2026-09-09
 <#
 .SYNOPSIS
     Reconciles Compton College managed scheduled tasks under SYSTEM.
@@ -14,10 +14,16 @@
 
 .NOTES
     ScriptName:    Register-Tasks_SYSTEM.ps1
-    ScriptVersion: 4.8.0
+    ScriptVersion: 4.9.0
     Change: Replaces seven standalone weekly tasks with combined script 04, removes
             tasks that reference retired scripts, and refactors Sunday timing.
-    LastUpdated:   2026-09-08
+    LastUpdated:   2026-09-09
+    Changes:       v4.9.0 replaces the script 16 startup trigger with a Monday
+                   7:00 AM weekly trigger and enables StartWhenAvailable so a
+                   computer runs the check after a missed scheduled start.
+                   Script 16 runs directly and publishes an explicit
+                   Installed=false state for computers without Deep Freeze so
+                   the latest-state dashboard can exclude them accurately.
     Changes:       v4.8.0 removes the standalone script 12 task because System
                    Restore is now the first section of consolidated script 04.
                    Script 04 runs before script 03 so the restore point remains
@@ -44,7 +50,7 @@ Set-StrictMode -Version 2.0
 $ErrorActionPreference = 'Stop'
 
 $script:ScriptName       = 'Register-Tasks_SYSTEM.ps1'
-$script:ScriptVersion    = '4.8.0'
+$script:ScriptVersion    = '4.9.0'
 $script:RunId            = [guid]::NewGuid().Guid
 $script:StartTime        = Get-Date
 $script:WarningCount     = 0
@@ -176,6 +182,8 @@ function New-ManagedTaskPrincipal {
 }
 
 function New-ManagedTaskSettings {
+    param([bool]$StartWhenAvailable = $false)
+
     $settings = New-ScheduledTaskSettingsSet `
         -AllowStartIfOnBatteries `
         -DontStopIfGoingOnBatteries `
@@ -183,6 +191,14 @@ function New-ManagedTaskSettings {
         -MultipleInstances IgnoreNew `
         -RestartCount 2 `
         -RestartInterval (New-TimeSpan -Minutes 5)
+
+    $startWhenAvailableProperty = $settings.PSObject.Properties['StartWhenAvailable']
+    if ($null -ne $startWhenAvailableProperty) {
+        $settings.StartWhenAvailable = $StartWhenAvailable
+    }
+    elseif ($StartWhenAvailable) {
+        throw 'This ScheduledTasks module does not expose StartWhenAvailable, which is required for the Deep Freeze weekly task.'
+    }
 
     # On some Windows PowerShell 5.1 / ScheduledTasks module versions,
     # AllowDemandStart exists on the settings object but is not accepted as a
@@ -207,7 +223,8 @@ function New-ManagedTaskSettings {
 function Test-CommonTaskProperties {
     param(
         [Parameter(Mandatory)]$ExistingTask,
-        [Parameter(Mandatory)][string]$ExpectedArguments
+        [Parameter(Mandatory)][string]$ExpectedArguments,
+        [bool]$ExpectedStartWhenAvailable = $false
     )
 
     $issues = New-Object System.Collections.Generic.List[string]
@@ -231,8 +248,8 @@ function Test-CommonTaskProperties {
     if ([string]$ExistingTask.Principal.RunLevel -ne 'Highest') {
         [void]$issues.Add("Run level differs: $($ExistingTask.Principal.RunLevel)")
     }
-    if ($ExistingTask.Settings.StartWhenAvailable) {
-        [void]$issues.Add('Run-as-soon-as-possible-after-missed-start is enabled.')
+    if ([bool]$ExistingTask.Settings.StartWhenAvailable -ne $ExpectedStartWhenAvailable) {
+        [void]$issues.Add("Run-as-soon-as-possible-after-missed-start differs: $($ExistingTask.Settings.StartWhenAvailable)")
     }
     if (-not $ExistingTask.Settings.AllowDemandStart) {
         [void]$issues.Add('Run-on-demand is disabled.')
@@ -254,11 +271,15 @@ function Test-WeeklyTaskMatches {
     param(
         [Parameter(Mandatory)]$ExistingTask,
         [Parameter(Mandatory)][string]$ExpectedArguments,
-        [Parameter(Mandatory)][string]$StartTime
+        [Parameter(Mandatory)][string]$StartTime,
+        [ValidateSet('Sunday','Monday','Tuesday','Wednesday','Thursday','Friday','Saturday')]
+        [string]$DayOfWeek = 'Sunday',
+        [bool]$ExpectedStartWhenAvailable = $false
     )
 
     $issues = New-Object System.Collections.Generic.List[string]
-    foreach ($issue in @(Test-CommonTaskProperties -ExistingTask $ExistingTask -ExpectedArguments $ExpectedArguments)) {
+    foreach ($issue in @(Test-CommonTaskProperties -ExistingTask $ExistingTask -ExpectedArguments $ExpectedArguments `
+        -ExpectedStartWhenAvailable $ExpectedStartWhenAvailable)) {
         [void]$issues.Add($issue)
     }
 
@@ -270,7 +291,9 @@ function Test-WeeklyTaskMatches {
         if ([string]$trigger.CimClass.CimClassName -notmatch 'Weekly') {
             [void]$issues.Add('Trigger is not weekly.')
         }
-        if ([int]$trigger.DaysOfWeek -ne 1) {
+        $dayEnumValue = [DayOfWeek]([Enum]::Parse([DayOfWeek], $DayOfWeek, $true))
+        $expectedDaysValue = 1 -shl [int]$dayEnumValue
+        if ([int]$trigger.DaysOfWeek -ne $expectedDaysValue) {
             [void]$issues.Add("Weekly day differs: $($trigger.DaysOfWeek)")
         }
         if ([int]$trigger.WeeksInterval -ne 1) {
@@ -380,7 +403,11 @@ function Ensure-WeeklyTask {
         [Parameter(Mandatory)][string]$Name,
         [Parameter(Mandatory)][string]$ScriptPath,
         [Parameter(Mandatory)][string]$StartTime,
-        [string]$ExtraArguments = ''
+        [string]$ExtraArguments = '',
+        [ValidateSet('Sunday','Monday','Tuesday','Wednesday','Thursday','Friday','Saturday')]
+        [string]$DayOfWeek = 'Sunday',
+        [bool]$StartWhenAvailable = $false,
+        [switch]$RunScriptDirectly
     )
 
     $scriptExists = Test-Path -LiteralPath $ScriptPath -PathType Leaf
@@ -389,15 +416,30 @@ function Ensure-WeeklyTask {
         Write-Log -Level 'WARN' -Message "Managed script is currently missing; task will still be reconciled: $ScriptPath"
     }
 
-    $arguments = Get-DesiredActionArguments -ScriptPath $ScriptPath -ExtraArguments $ExtraArguments
+    if ($RunScriptDirectly) {
+        $arguments = '-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "{0}"' -f $ScriptPath
+        if (-not [string]::IsNullOrWhiteSpace($ExtraArguments)) {
+            $arguments += ' ' + $ExtraArguments.Trim()
+        }
+    }
+    else {
+        $arguments = Get-DesiredActionArguments -ScriptPath $ScriptPath -ExtraArguments $ExtraArguments
+    }
+
+    $scheduleText = '{0} {1}' -f $DayOfWeek,$StartTime
+    if ($StartWhenAvailable) {
+        $scheduleText += ' (run after a missed start)'
+    }
+
     $existing = Get-ScheduledTask -TaskName $Name -TaskPath $TaskPath -ErrorAction SilentlyContinue
     $issues = @()
 
     if ($existing) {
-        $issues = @(Test-WeeklyTaskMatches -ExistingTask $existing -ExpectedArguments $arguments -StartTime $StartTime)
+        $issues = @(Test-WeeklyTaskMatches -ExistingTask $existing -ExpectedArguments $arguments `
+            -StartTime $StartTime -DayOfWeek $DayOfWeek -ExpectedStartWhenAvailable $StartWhenAvailable)
         if ($issues.Count -eq 0) {
             Write-Log -Level 'OK' -Message "Task is already correct: $TaskPath$Name"
-            Add-TaskResult -Name $Name -ScriptPath $ScriptPath -Schedule "Sunday $StartTime" `
+            Add-TaskResult -Name $Name -ScriptPath $ScriptPath -Schedule $scheduleText `
                 -Result 'Current' -ScriptExists $scriptExists
             return
         }
@@ -411,7 +453,7 @@ function Ensure-WeeklyTask {
     try {
         $action = New-ScheduledTaskAction -Execute $WindowsPowerShellExe -Argument $arguments
         $startAt = [datetime]::Today.Add([timespan]::Parse($StartTime))
-        $trigger = New-ScheduledTaskTrigger -Weekly -DaysOfWeek Sunday -WeeksInterval 1 -At $startAt
+        $trigger = New-ScheduledTaskTrigger -Weekly -DaysOfWeek $DayOfWeek -WeeksInterval 1 -At $startAt
 
         Register-ScheduledTask `
             -TaskName $Name `
@@ -419,22 +461,23 @@ function Ensure-WeeklyTask {
             -Action $action `
             -Trigger $trigger `
             -Principal (New-ManagedTaskPrincipal) `
-            -Settings (New-ManagedTaskSettings) `
+            -Settings (New-ManagedTaskSettings -StartWhenAvailable $StartWhenAvailable) `
             -Force `
             -ErrorAction Stop | Out-Null
 
         $verified = Get-ScheduledTask -TaskName $Name -TaskPath $TaskPath -ErrorAction Stop
-        $verifyIssues = @(Test-WeeklyTaskMatches -ExistingTask $verified -ExpectedArguments $arguments -StartTime $StartTime)
+        $verifyIssues = @(Test-WeeklyTaskMatches -ExistingTask $verified -ExpectedArguments $arguments `
+            -StartTime $StartTime -DayOfWeek $DayOfWeek -ExpectedStartWhenAvailable $StartWhenAvailable)
         if ($verifyIssues.Count -gt 0) {
             throw "Post-registration verification failed: $($verifyIssues -join '; ')"
         }
 
         $result = if ($existing) { 'Updated' } else { 'Created' }
-        Write-Log -Level 'OK' -Message "Task $result and verified: $TaskPath$Name at Sunday $StartTime"
-        Add-TaskResult -Name $Name -ScriptPath $ScriptPath -Schedule "Sunday $StartTime" `
+        Write-Log -Level 'OK' -Message "Task $result and verified: $TaskPath$Name at $scheduleText"
+        Add-TaskResult -Name $Name -ScriptPath $ScriptPath -Schedule $scheduleText `
             -Result $result -ScriptExists $scriptExists -Issues $issues
     } catch {
-        Add-TaskResult -Name $Name -ScriptPath $ScriptPath -Schedule "Sunday $StartTime" `
+        Add-TaskResult -Name $Name -ScriptPath $ScriptPath -Schedule $scheduleText `
             -Result 'Failed' -ScriptExists $scriptExists -Issues $issues -ErrorMessage $_.Exception.Message
         throw
     }
@@ -782,15 +825,16 @@ try {
         '14. Maintain SHARP Driver and PaperCut',
         '13. Configure Autologon and Edge',
         '08A. Resume Reboot Verification at Startup',
-        '18. Check Deep Freeze Status at Startup'
+        '18. Check Deep Freeze Status at Startup',
+        '14. Check Deep Freeze Status at Startup'
     )
 
     $rebootResumeStartupTaskName = '09A. Resume Reboot Verification at Startup'
-    $deepFreezeStartupTaskName = '14. Check Deep Freeze Status at Startup'
+    $deepFreezeWeeklyTaskName = '13. Check Deep Freeze Status'
     $desiredTaskNames = @($taskDefinitions.Name) + @(
         '00. Sync System Time Every 4 Hours',
         $rebootResumeStartupTaskName,
-        $deepFreezeStartupTaskName
+        $deepFreezeWeeklyTaskName
     )
     Remove-TasksReferencingRetiredScripts -RetiredScriptNames $retiredScriptNames
 
@@ -807,9 +851,16 @@ try {
         -ScriptPath (Join-Path $ScriptsRoot '07_Force_Reboot_Install_Updates.ps1') `
         -ExtraArguments '-StartupResume'
 
-    Ensure-StartupTask `
-        -Name $deepFreezeStartupTaskName `
-        -ScriptPath (Join-Path $ScriptsRoot '16_Check_Deep_Freeze_Status.ps1')
+    # Run script 16 directly so its purpose-built Installed=false event can replace
+    # stale prior Deep Freeze state without generic launcher telemetry. The dashboard
+    # excludes those records. StartWhenAvailable catches computers that miss Monday.
+    Ensure-WeeklyTask `
+        -Name $deepFreezeWeeklyTaskName `
+        -ScriptPath (Join-Path $ScriptsRoot '16_Check_Deep_Freeze_Status.ps1') `
+        -StartTime '07:00' `
+        -DayOfWeek 'Monday' `
+        -StartWhenAvailable $true `
+        -RunScriptDirectly
 
     foreach ($definition in $taskDefinitions) {
         Ensure-WeeklyTask `

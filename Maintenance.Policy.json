@@ -1,6 +1,6 @@
 {
   "SchemaVersion": 1,
-  "PolicyVersion": "1.0.1",
+  "PolicyVersion": "1.0.2",
   "FleetStatusRoots": [
     "\\\\filesvr\\MaintenanceStatus",
     "\\\\10.2.3.30\\MaintenanceStatus"
@@ -138,18 +138,6 @@
         "Days": [],
         "Start": "00:00",
         "End": "23:59"
-      },
-      "Dependencies": []
-    },
-    {
-      "Name": "12_Enable-SystemRestore-And-Create-RestorePoint.ps1",
-      "Window": {
-        "Enforce": true,
-        "Days": [
-          "Sunday"
-        ],
-        "Start": "00:00",
-        "End": "10:00"
       },
       "Dependencies": []
     },

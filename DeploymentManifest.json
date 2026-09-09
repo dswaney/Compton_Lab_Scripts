@@ -1,14 +1,14 @@
 {
   "SchemaVersion": 1,
-  "ManifestVersion": "2.4.0",
-  "PackageVersion": "2.4.0",
-  "GeneratedUtc": "2026-09-08T21:10:00Z",
+  "ManifestVersion": "2.5.0",
+  "PackageVersion": "2.5.0",
+  "GeneratedUtc": "2026-09-08T22:24:01Z",
   "Files": [
     {
       "Name": "00_Update-Scripts-FromShare.ps1",
       "Role": "Updater",
-      "Version": "4.5.0",
-      "SHA256": "181FD5FCE5128A1B9F73CEDBBAF3633AE93F95C47F3D52F12B136587FA0AADCC"
+      "Version": "4.6.0",
+      "SHA256": "867F9EC248E3F5FFA885325D5C3C9E88A1DE48DAA0A0C317B0D583BB4F483F26"
     },
     {
       "Name": "01_Enable_Windows_Update_Services.ps1",
@@ -31,8 +31,8 @@
     {
       "Name": "04_Sunday_Lab_Application_Maintenance.ps1",
       "Role": "ManagedFile",
-      "Version": "1.1.0",
-      "SHA256": "96703EFA54C967BC73BA4C89C4EC52438E994C6C3CBC9B39D60B9D2494D6362E"
+      "Version": "1.3.0",
+      "SHA256": "C7ACBD1E73362E9946349251A5EA6DE453B8328D081ED4E4F0EBC8762FC4536E"
     },
     {
       "Name": "05_Weekend_HP_Drivers_Update.ps1",
@@ -71,12 +71,6 @@
       "SHA256": "2E86E56458BFAF1718E50C08AEFA2820B0CBF1433BEB252B6E5E0C881E700F51"
     },
     {
-      "Name": "12_Enable-SystemRestore-And-Create-RestorePoint.ps1",
-      "Role": "ManagedFile",
-      "Version": "2.0.8",
-      "SHA256": "7D430F9347CBEC6DD6D0988FFEA9C9113FDCB98E26F84F685E7583CE07723B62"
-    },
-    {
       "Name": "14_Endpoint_Health_Inventory.ps1",
       "Role": "ManagedFile",
       "Version": "1.2.8",
@@ -109,14 +103,14 @@
     {
       "Name": "Maintenance.Policy.json",
       "Role": "Policy",
-      "Version": "1.0.1",
-      "SHA256": "4C5D9C9D497E2E298B5A128DA81146F3C1502ED9BB06D5521EA8D941F4332F62"
+      "Version": "1.0.2",
+      "SHA256": "73D53B7ADD3B9DFD4A86B62E50E50F4B332B506C120D00A13FE0BBD5D4DF7DE4"
     },
     {
       "Name": "Register-Tasks_SYSTEM.ps1",
       "Role": "TaskRegistration",
-      "Version": "4.7.0",
-      "SHA256": "E43D2253821A5563E99857132662635C296E433939A7EB38E839117A3244833C"
+      "Version": "4.8.0",
+      "SHA256": "824900C37B696E18B1FF5F44CE3125BEC83587EAAC862EB8D5A746189B361C44"
     }
   ]
 }

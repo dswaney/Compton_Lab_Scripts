@@ -1,9 +1,10 @@
 #requires -version 5.1
 # =====================================================================
 # ScriptName: 00_Update-Scripts-FromShare.ps1
-# ScriptVersion: 4.5.0
-# LastUpdated: 2026-09-03
-# Changes: v4.5.0 deploys the combined script 04 and safely retires the six scripts it replaces.
+# ScriptVersion: 4.6.0
+# LastUpdated: 2026-09-08
+# Changes: v4.6.0 retires script 12 after its System Restore workflow was embedded in script 04 v1.3.0.
+# Changes: v4.5.0 deploys the combined script 04 and safely retires the six scripts it previously replaced.
 # Changes: v4.4.0 approves and supplementally deploys script 19 for Stellarium Location Services.
 # Changes: v4.3.0 approves scripts 17 and 18 for manifest-managed deployment.
 # Purpose:
@@ -27,7 +28,7 @@ $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 
 $ScriptName = '00_Update-Scripts-FromShare.ps1'
-$ScriptVersion = '4.5.0'
+$ScriptVersion = '4.6.0'
 $PreferredSourceRoot = '\\filesvr\Labscripts'
 $FallbackSourceRoot = '\\10.2.3.30\Labscripts'
 $ManifestName = 'DeploymentManifest.json'
@@ -41,6 +42,7 @@ $DeepFreezeStatusScriptName = '16_Check_Deep_Freeze_Status.ps1'
 # deployed and passed PowerShell parser validation. A rollback copy is retained.
 [string[]]$RetiredMaintenanceFiles = @(
     '11_Install_SharpDriver_And_PaperCut.ps1',
+    '12_Enable-SystemRestore-And-Create-RestorePoint.ps1',
     '13_Configure_Autologon_And_Edge.ps1',
     '15_Install_Elastic_Agent.ps1',
     '17_Set_Browser_Homepage.ps1',
@@ -69,7 +71,6 @@ $DeepFreezeStatusScriptName = '16_Check_Deep_Freeze_Status.ps1'
     '08_System_Repair.ps1',
     '09_Disable_Windows_Update_Services.ps1',
     '10_Sync_System_Time.ps1',
-    '12_Enable-SystemRestore-And-Create-RestorePoint.ps1',
     '14_Endpoint_Health_Inventory.ps1',
     '16_Check_Deep_Freeze_Status.ps1',
     'Get-MaintenanceFleetStatus.ps1',
@@ -559,7 +560,7 @@ try {
     # current DeploymentManifest.json, including combined script 04 and script 16.
     Install-SupplementalManagedFiles -SourceRoot $sourceRoot
 
-    # Remove the six standalone scripts only after their combined replacement
+    # Remove the seven standalone scripts only after their combined replacement
     # exists locally and has passed parser validation.
     Remove-RetiredMaintenanceFiles
 

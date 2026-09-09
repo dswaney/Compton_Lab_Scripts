@@ -43,14 +43,13 @@ The scripts are designed primarily for 64-bit Windows PowerShell 5.1 and normall
 | [`01_Enable_Windows_Update_Services.ps1`](./01_Enable_Windows_Update_Services.ps1) | Restores Windows Update services, scheduled tasks, policy settings, and required Windows configuration before the update stages begin. |
 | [`02_Remove_User_Profiles.ps1`](./02_Remove_User_Profiles.ps1) | Removes eligible stale local profiles while preserving protected profiles and maintains the configured legacy Edge InPrivate startup behavior. |
 | [`03_Weekend_Apps_Update.ps1`](./03_Weekend_Apps_Update.ps1) | Updates applications through WinGet and services Microsoft Office Click-to-Run before driver and operating-system maintenance. |
-| [`04_Sunday_Lab_Application_Maintenance.ps1`](./04_Sunday_Lab_Application_Maintenance.ps1) | Runs the consolidated printer, PaperCut, Autologon, Edge, Elastic Agent, browser homepage, Honorlock, and Stellarium Location Services maintenance. |
+| [`04_Sunday_Lab_Application_Maintenance.ps1`](./04_Sunday_Lab_Application_Maintenance.ps1) | Creates and verifies the weekly restore point, then runs consolidated printer, PaperCut, Office activation, Autologon, Edge, Elastic Agent, browser homepage, Honorlock, and Stellarium Location Services maintenance. |
 | [`05_Weekend_HP_Drivers_Update.ps1`](./05_Weekend_HP_Drivers_Update.ps1) | Performs supported HP and Dell driver and firmware maintenance, with safeguards around sensitive storage-related driver categories. |
 | [`06_Weekend_Windows_Updates.ps1`](./06_Weekend_Windows_Updates.ps1) | Installs Windows Updates in two Sunday passes and records detailed compliance, result, and reboot telemetry. |
 | [`07_Force_Reboot_Install_Updates.ps1`](./07_Force_Reboot_Install_Updates.ps1) | Coordinates as many as three planned reboot/update cycles and resumes verification at startup. |
 | [`08_System_Repair.ps1`](./08_System_Repair.ps1) | Runs Windows image, file-system, disk, service, management-agent, and cleanup diagnostics and repairs. |
 | [`09_Disable_Windows_Update_Services.ps1`](./09_Disable_Windows_Update_Services.ps1) | Applies the college's post-maintenance Windows Update service, policy, and scheduled-task state. |
 | [`10_Sync_System_Time.ps1`](./10_Sync_System_Time.ps1) | Synchronizes system time and runs independently every four hours. |
-| [`12_Enable-SystemRestore-And-Create-RestorePoint.ps1`](./12_Enable-SystemRestore-And-Create-RestorePoint.ps1) | Enables System Restore, creates and verifies a weekly restore point, and enforces restore-point retention. |
 | [`14_Endpoint_Health_Inventory.ps1`](./14_Endpoint_Health_Inventory.ps1) | Captures the endpoint's final weekly health and compliance inventory after the other Sunday stages finish. |
 | [`16_Check_Deep_Freeze_Status.ps1`](./16_Check_Deep_Freeze_Status.ps1) | Records Frozen, Thawed, or Unknown Deep Freeze state at startup and alerts on Thawed or Unknown systems. |
 
@@ -71,7 +70,7 @@ Major functions include:
 - Updates itself last and relaunches the new version safely.
 - Runs `Register-Tasks_SYSTEM.ps1` after synchronization.
 - Cleans old staging directories and rollback folders according to retention rules.
-- Deploys `04_Sunday_Lab_Application_Maintenance.ps1` and removes the six standalone scripts it replaces.
+- Deploys `04_Sunday_Lab_Application_Maintenance.ps1` and removes the seven standalone scripts it replaces.
 
 Retired scripts are removed from `C:\Scripts` only after script 04 exists locally and passes PowerShell parser validation. Removed files are moved into the updater's rollback structure and retained for 30 days.
 
@@ -101,20 +100,22 @@ The script also retains legacy computer-name-based Edge InPrivate startup handli
 
 ### `03_Weekend_Apps_Update.ps1`
 
-Runs the general application-update phase through WinGet, including configured handling for pinned packages, unknown versions, and Microsoft Store sources. It can also initiate and wait for Microsoft Office Click-to-Run servicing. The stage runs before combined lab configuration, device-driver, and Windows Update maintenance so application servicing can finish before later reboots.
+Runs the general application-update phase through WinGet, including configured handling for pinned packages, unknown versions, and Microsoft Store sources. It can also initiate and wait for Microsoft Office Click-to-Run servicing. The stage runs after script 04 creates its verified restore point and completes combined lab configuration, but before device-driver and Windows Update maintenance.
 
 ### `04_Sunday_Lab_Application_Maintenance.ps1`
 
-Consolidates six former standalone scripts into one scheduled maintenance runner. Each internal section runs in an isolated 64-bit Windows PowerShell process so duplicate helper functions, strict-mode settings, and a section's final `exit` statement cannot interfere with later work.
+Consolidates seven former standalone scripts into one scheduled maintenance runner. Each embedded section runs in an isolated 64-bit Windows PowerShell process so duplicate helper functions, strict-mode settings, and a section's final `exit` statement cannot interfere with later work.
 
 The combined sections are:
 
-1. SHARP printer driver, PaperCut Print Deploy, and `StudentSecurePrint` connection maintenance.
-2. Autologon configuration and Microsoft Edge InPrivate startup.
-3. Elastic Agent installation, enrollment, health checking, and package fallback handling.
-4. Chrome, Edge, and Firefox homepage/startup policy configuration.
-5. Honorlock Chrome extension force-install policy configuration.
-6. Windows Location Services configuration for Stellarium.
+1. System Restore enablement, verified restore-point creation, and managed retention.
+2. SHARP printer driver, PaperCut Print Deploy, and `StudentSecurePrint` connection maintenance.
+3. Microsoft Office 2024 activation-status verification and activation when required.
+4. Autologon configuration and Microsoft Edge InPrivate startup.
+5. Elastic Agent installation, enrollment, health checking, and package fallback handling.
+6. Chrome, Edge, and Firefox homepage/startup policy configuration.
+7. Honorlock Chrome extension force-install policy configuration.
+8. Windows Location Services configuration for Stellarium.
 
 The easy-to-edit configuration area near the top contains:
 
@@ -123,6 +124,9 @@ The easy-to-edit configuration area near the top contains:
 - Honorlock computer wildcard patterns.
 - Stellarium computer wildcard patterns.
 - A `$true` or `$false` switch for each internal section.
+
+The System Restore section runs first. Script 04 is scheduled before the general
+application-update stage so its restore point remains a pre-maintenance checkpoint.
 - The shared browser homepage URL.
 
 The runner continues to the next section when one section fails and produces its own combined JSON summary in addition to the preserved per-section logs and telemetry.
@@ -170,10 +174,6 @@ Maintains reliable system time independently of the weekly Sunday chain. `Regist
 - 12:00 PM
 - 4:00 PM
 - 8:00 PM
-
-### `12_Enable-SystemRestore-And-Create-RestorePoint.ps1`
-
-Ensures System Restore is enabled as required, creates and verifies a restore point early in the maintenance window, and retains the configured number of recent restore points (two by default). This occurs before application, driver, update, and configuration changes.
 
 ### `14_Endpoint_Health_Inventory.ps1`
 
@@ -254,18 +254,17 @@ The script creates the following weekly schedule:
 | Order | Sunday time | Scheduled task | Script |
 |---:|---:|---|---|
 | 1 | 1:00 AM | Check for Updated Scripts | `00_Update-Scripts-FromShare.ps1` |
-| 2 | 1:15 AM | Create Weekly System Restore Point | `12_Enable-SystemRestore-And-Create-RestorePoint.ps1` |
-| 3 | 1:30 AM | Enable Windows Update Services | `01_Enable_Windows_Update_Services.ps1` |
-| 4 | 1:45 AM | Remove User Profiles Weekly | `02_Remove_User_Profiles.ps1` |
-| 5 | 2:15 AM | Weekend Apps Update | `03_Weekend_Apps_Update.ps1` |
-| 6 | 3:15 AM | Sunday Lab Application Maintenance | `04_Sunday_Lab_Application_Maintenance.ps1` |
-| 7 | 4:15 AM | Weekend HP Drivers Update | `05_Weekend_HP_Drivers_Update.ps1` |
-| 8 | 5:15 AM | Weekend Windows Updates—First Pass | `06_Weekend_Windows_Updates.ps1` |
-| 9 | 6:15 AM | Force Reboot and Install Updates | `07_Force_Reboot_Install_Updates.ps1` |
-| 10 | 6:45 AM | Weekend Windows Updates—Second Pass | `06_Weekend_Windows_Updates.ps1` |
-| 11 | 7:45 AM | Disable Windows Update Services | `09_Disable_Windows_Update_Services.ps1` |
-| 12 | 8:00 AM | System Repair | `08_System_Repair.ps1` |
-| 13 | 9:00 AM | Weekly Endpoint Health Inventory | `14_Endpoint_Health_Inventory.ps1` |
+| 2 | 1:15 AM | Enable Windows Update Services | `01_Enable_Windows_Update_Services.ps1` |
+| 3 | 1:30 AM | Remove User Profiles Weekly | `02_Remove_User_Profiles.ps1` |
+| 4 | 2:00 AM | Sunday Lab Application Maintenance | `04_Sunday_Lab_Application_Maintenance.ps1` |
+| 5 | 3:15 AM | Weekend Apps Update | `03_Weekend_Apps_Update.ps1` |
+| 6 | 4:15 AM | Weekend HP Drivers Update | `05_Weekend_HP_Drivers_Update.ps1` |
+| 7 | 5:15 AM | Weekend Windows Updates—First Pass | `06_Weekend_Windows_Updates.ps1` |
+| 8 | 6:15 AM | Force Reboot and Install Updates | `07_Force_Reboot_Install_Updates.ps1` |
+| 9 | 6:45 AM | Weekend Windows Updates—Second Pass | `06_Weekend_Windows_Updates.ps1` |
+| 10 | 7:45 AM | Disable Windows Update Services | `09_Disable_Windows_Update_Services.ps1` |
+| 11 | 8:00 AM | System Repair | `08_System_Repair.ps1` |
+| 12 | 9:00 AM | Weekly Endpoint Health Inventory | `14_Endpoint_Health_Inventory.ps1` |
 
 Additional managed triggers:
 
@@ -326,12 +325,13 @@ C:\Logs\04_Sunday_Lab_Application_Maintenance.latest.json
 
 ## Retired scripts
 
-The following scripts are retired. Six standalone scripts were consolidated into [`04_Sunday_Lab_Application_Maintenance.ps1`](./04_Sunday_Lab_Application_Maintenance.ps1), while the former Edge MSI updater had already become a retirement stub. These files should no longer remain in `C:\Scripts`, the active deployment-share folder, `DeploymentManifest.json`, or active scheduled tasks.
+The following scripts are retired. Seven standalone scripts were consolidated into [`04_Sunday_Lab_Application_Maintenance.ps1`](./04_Sunday_Lab_Application_Maintenance.ps1), while the former Edge MSI updater had already become a retirement stub. These files should no longer remain in `C:\Scripts`, the active deployment-share folder, `DeploymentManifest.json`, or active scheduled tasks.
 
 | Retired file | Replacement |
 |---|---|
 | [`04_Update_Edge_Silent.ps1`](./Retired/04_Update_Edge_Silent.ps1) | Microsoft Edge application servicing plus health visibility from script 14 |
 | [`11_Install_SharpDriver_And_PaperCut.ps1`](./Retired/11_Install_SharpDriver_And_PaperCut.ps1) | SHARP printer driver, PaperCut Print Deploy, and shared printer maintenance |
+| [`12_Enable-SystemRestore-And-Create-RestorePoint.ps1`](./Retired/12_Enable-SystemRestore-And-Create-RestorePoint.ps1) | System Restore enablement, verified restore-point creation, and managed retention |
 | [`13_Configure_Autologon_And_Edge.ps1`](./Retired/13_Configure_Autologon_And_Edge.ps1) | Autologon and Edge InPrivate startup configuration |
 | [`15_Install_Elastic_Agent.ps1`](./Retired/15_Install_Elastic_Agent.ps1) | Elastic Agent installation, enrollment, and health verification |
 | [`17_Set_Browser_Homepage.ps1`](./Retired/17_Set_Browser_Homepage.ps1) | Chrome, Edge, and Firefox homepage/startup policies |

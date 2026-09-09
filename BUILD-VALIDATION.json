@@ -1,12 +1,14 @@
 {
-  "PackageVersion": "2.4.0",
+  "PackageVersion": "2.5.0",
   "PowerShellParserExecuted": false,
   "StructuralChecks": [
     "Manifest hashes generated",
     "Approved exported verbs preserved",
     "Launcher and policy included",
     "Consolidated script 04 included",
-    "Retired standalone scripts excluded from active manifest and task rotation"
+    "Retired standalone scripts excluded from active manifest and task rotation",
+    "System Restore embedded in script 04 and standalone script 12 retired",
+    "Public script 04 credential fields blank and credential-dependent sections disabled"
   ],
   "RequiresWindowsPowerShellValidation": true
 }

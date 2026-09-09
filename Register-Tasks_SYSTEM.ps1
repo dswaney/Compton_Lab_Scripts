@@ -1,7 +1,7 @@
 #requires -Version 5.1
 #requires -RunAsAdministrator
 # ScriptName:    Register-Tasks_SYSTEM.ps1
-# ScriptVersion: 4.7.0
+# ScriptVersion: 4.8.0
 # LastUpdated:   2026-09-08
 <#
 .SYNOPSIS
@@ -14,10 +14,15 @@
 
 .NOTES
     ScriptName:    Register-Tasks_SYSTEM.ps1
-    ScriptVersion: 4.7.0
-    Change: Replaces six standalone weekly tasks with combined script 04, removes
+    ScriptVersion: 4.8.0
+    Change: Replaces seven standalone weekly tasks with combined script 04, removes
             tasks that reference retired scripts, and refactors Sunday timing.
     LastUpdated:   2026-09-08
+    Changes:       v4.8.0 removes the standalone script 12 task because System
+                   Restore is now the first section of consolidated script 04.
+                   Script 04 runs before script 03 so the restore point remains
+                   a pre-maintenance checkpoint. The remaining weekly tasks are
+                   renumbered and superseded task names are removed.
     Changes:       v4.7.0 confirms only consolidated script 04 is scheduled for
                    the retired application/configuration sections. Retired
                    filenames remain only in cleanup safeguards that remove stale tasks.
@@ -39,7 +44,7 @@ Set-StrictMode -Version 2.0
 $ErrorActionPreference = 'Stop'
 
 $script:ScriptName       = 'Register-Tasks_SYSTEM.ps1'
-$script:ScriptVersion    = '4.7.0'
+$script:ScriptVersion    = '4.8.0'
 $script:RunId            = [guid]::NewGuid().Guid
 $script:StartTime        = Get-Date
 $script:WarningCount     = 0
@@ -714,24 +719,24 @@ try {
     # the completed weekly maintenance state.
     $taskDefinitions = @(
         [pscustomobject]@{ Name='01. Check for Updated Scripts';             Script='00_Update-Scripts-FromShare.ps1';                    Time='01:00'; Args='' },
-        [pscustomobject]@{ Name='02. Create Weekly System Restore Point';    Script='12_Enable-SystemRestore-And-Create-RestorePoint.ps1'; Time='01:15'; Args='' },
-        [pscustomobject]@{ Name='03. Enable Windows Update Services';        Script='01_Enable_Windows_Update_Services.ps1';              Time='01:30'; Args='' },
-        [pscustomobject]@{ Name='04. Remove User Profiles Weekly';           Script='02_Remove_User_Profiles.ps1';                         Time='01:45'; Args='' },
-        [pscustomobject]@{ Name='05. Weekend Apps Update';                   Script='03_Weekend_Apps_Update.ps1';                          Time='02:15'; Args='' },
-        [pscustomobject]@{ Name='06. Sunday Lab Application Maintenance';    Script='04_Sunday_Lab_Application_Maintenance.ps1';           Time='03:15'; Args='' },
-        [pscustomobject]@{ Name='07. Weekend HP Drivers Update';             Script='05_Weekend_HP_Drivers_Update.ps1';                    Time='04:15'; Args='' },
-        [pscustomobject]@{ Name='08. Weekend Windows Updates - 1st Pass';    Script='06_Weekend_Windows_Updates.ps1';                      Time='05:15'; Args='' },
-        [pscustomobject]@{ Name='09. Force Reboot Install Updates';          Script='07_Force_Reboot_Install_Updates.ps1';                 Time='06:15'; Args='' },
-        [pscustomobject]@{ Name='10. Weekend Windows Updates - 2nd Pass';    Script='06_Weekend_Windows_Updates.ps1';                      Time='06:45'; Args='' },
-        [pscustomobject]@{ Name='11. Disable Windows Update Services';       Script='09_Disable_Windows_Update_Services.ps1';              Time='07:45'; Args='' },
-        [pscustomobject]@{ Name='12. System Repair';                         Script='08_System_Repair.ps1';                                Time='08:00'; Args='' },
-        [pscustomobject]@{ Name='13. Weekly Endpoint Health Inventory';      Script='14_Endpoint_Health_Inventory.ps1';                    Time='09:00'; Args='' }
+        [pscustomobject]@{ Name='02. Enable Windows Update Services';        Script='01_Enable_Windows_Update_Services.ps1';              Time='01:15'; Args='' },
+        [pscustomobject]@{ Name='03. Remove User Profiles Weekly';           Script='02_Remove_User_Profiles.ps1';                         Time='01:30'; Args='' },
+        [pscustomobject]@{ Name='04. Sunday Lab Application Maintenance';    Script='04_Sunday_Lab_Application_Maintenance.ps1';           Time='02:00'; Args='' },
+        [pscustomobject]@{ Name='05. Weekend Apps Update';                   Script='03_Weekend_Apps_Update.ps1';                          Time='03:15'; Args='' },
+        [pscustomobject]@{ Name='06. Weekend HP Drivers Update';             Script='05_Weekend_HP_Drivers_Update.ps1';                    Time='04:15'; Args='' },
+        [pscustomobject]@{ Name='07. Weekend Windows Updates - 1st Pass';    Script='06_Weekend_Windows_Updates.ps1';                      Time='05:15'; Args='' },
+        [pscustomobject]@{ Name='08. Force Reboot Install Updates';          Script='07_Force_Reboot_Install_Updates.ps1';                 Time='06:15'; Args='' },
+        [pscustomobject]@{ Name='09. Weekend Windows Updates - 2nd Pass';    Script='06_Weekend_Windows_Updates.ps1';                      Time='06:45'; Args='' },
+        [pscustomobject]@{ Name='10. Disable Windows Update Services';       Script='09_Disable_Windows_Update_Services.ps1';              Time='07:45'; Args='' },
+        [pscustomobject]@{ Name='11. System Repair';                         Script='08_System_Repair.ps1';                                Time='08:00'; Args='' },
+        [pscustomobject]@{ Name='12. Weekly Endpoint Health Inventory';      Script='14_Endpoint_Health_Inventory.ps1';                    Time='09:00'; Args='' }
     )
 
     # Cleanup-only list: these files are never registered as desired tasks.
     # Keep this guard so existing PCs lose stale tasks from older deployments.
     $retiredScriptNames = @(
         '11_Install_SharpDriver_And_PaperCut.ps1',
+        '12_Enable-SystemRestore-And-Create-RestorePoint.ps1',
         '13_Configure_Autologon_And_Edge.ps1',
         '15_Install_Elastic_Agent.ps1',
         '17_Set_Browser_Homepage.ps1',
@@ -741,6 +746,18 @@ try {
 
     $obsoleteManagedTaskNames = @(
         '01A. Create Weekly System Restore Point',
+        '02. Create Weekly System Restore Point',
+        '03. Enable Windows Update Services',
+        '04. Remove User Profiles Weekly',
+        '05. Weekend Apps Update',
+        '06. Sunday Lab Application Maintenance',
+        '07. Weekend HP Drivers Update',
+        '08. Weekend Windows Updates - 1st Pass',
+        '09. Force Reboot Install Updates',
+        '10. Weekend Windows Updates - 2nd Pass',
+        '11. Disable Windows Update Services',
+        '12. System Repair',
+        '13. Weekly Endpoint Health Inventory',
         '02. Enable Windows Update Services',
         '03. Remove User Profiles Weekly',
         '04. Weekend Apps Update',

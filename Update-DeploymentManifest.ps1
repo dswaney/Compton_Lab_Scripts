@@ -1,6 +1,6 @@
 ﻿#requires -Version 5.1
 # ScriptName:    Update-DeploymentManifest.ps1
-# ScriptVersion: 2.0.0
+# ScriptVersion: 2.1.0
 # LastUpdated:   2026-09-08
 
 <#
@@ -18,9 +18,11 @@
 
 .NOTES
     ScriptName:    Update-DeploymentManifest.ps1
-    ScriptVersion: 2.0.0
+    ScriptVersion: 2.1.0
     LastUpdated:   2026-09-08
-    Changes:       v2.0.0 makes the consolidated active-file catalog explicit.
+    Changes:       v2.1.0 removes standalone script 12 after its System Restore
+                   workflow was consolidated into script 04 v1.3.0.
+                   v2.0.0 makes the consolidated active-file catalog explicit.
                    Standalone scripts 11, 13, 15, 17, 18, and Stellarium 19
                    are excluded and are removed from any manifest being rebuilt.
 #>
@@ -49,7 +51,6 @@ $ApprovedFileDefinitions = @(
     [pscustomobject]@{ Name='08_System_Repair.ps1';                                   Role='ManagedFile' },
     [pscustomobject]@{ Name='09_Disable_Windows_Update_Services.ps1';                 Role='ManagedFile' },
     [pscustomobject]@{ Name='10_Sync_System_Time.ps1';                                Role='ManagedFile' },
-    [pscustomobject]@{ Name='12_Enable-SystemRestore-And-Create-RestorePoint.ps1';     Role='ManagedFile' },
     [pscustomobject]@{ Name='14_Endpoint_Health_Inventory.ps1';                       Role='ManagedFile' },
     [pscustomobject]@{ Name='16_Check_Deep_Freeze_Status.ps1';                        Role='ManagedFile' },
     [pscustomobject]@{ Name='Get-MaintenanceFleetStatus.ps1';                         Role='ManagedFile' },

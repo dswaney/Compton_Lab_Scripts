@@ -116,6 +116,7 @@ The combined sections are:
 6. Chrome, Edge, and Firefox homepage/startup policy configuration.
 7. Honorlock Chrome extension force-install policy configuration.
 8. Windows Location Services configuration for Stellarium.
+9. Uninstalls any Microsoft Office versions that is older than 2024 edition and install 2024 LTS. Computers with Office 365 installed are skipped.
 
 The easy-to-edit configuration area near the top contains:
 

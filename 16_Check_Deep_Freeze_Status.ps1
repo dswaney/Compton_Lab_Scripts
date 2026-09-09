@@ -1,12 +1,18 @@
-﻿#requires -Version 5.1
+#requires -Version 5.1
 <#
 .SYNOPSIS
     Checks Faronics Deep Freeze state and writes one Elastic-friendly JSON event file per run.
 .NOTES
     Script: 16_Check_Deep_Freeze_Status.ps1
-    Version: 1.2.2
-    Updated: 2026-08-19
-    Changes: 1.2.2 adds unified Maintenance-Telemetry.ndjson and latest-event telemetry while preserving the existing atomic Deep Freeze JSON events.
+    Version: 1.3.0
+    Updated: 2026-09-09
+    Changes: 1.3.0 tracks the first observation of the current state and publishes
+             ThawedSinceUtc, ThawedForDays, ThawedForHours, PreviousState, and
+             StateChanged fields for an Elastic/Kibana latest-state dashboard.
+             Systems without DFC.exe publish Installed=false/NotInstalled so a
+             latest-state dashboard can remove stale prior records, while its
+             Installed=true filter excludes those computers from all totals.
+             1.2.2 adds unified Maintenance-Telemetry.ndjson and latest-event telemetry while preserving the existing atomic Deep Freeze JSON events.
              Adds mapping-safe DFC output, explicit overall result/failure stage, and alert fields for Frozen/Thawed/Unknown state.
              1.2.1 adds 14-day cleanup of completed Deep Freeze JSON event files.
              Per-run JSON event files remain atomic and are not converted to staged text logging.
@@ -18,9 +24,11 @@ Set-StrictMode -Version 2.0
 $ErrorActionPreference = 'Stop'
 
 $ScriptName = '16_Check_Deep_Freeze_Status.ps1'
-$ScriptVersion = '1.2.2'
+$ScriptVersion = '1.3.0'
 $LogDirectory = 'C:\Logs'
 $DeepFreezeLogDirectory = Join-Path $LogDirectory 'DeepFreeze'
+$DeepFreezeStateDirectory = Join-Path $env:ProgramData 'Compton\DeepFreeze'
+$DeepFreezeStatePath = Join-Path $DeepFreezeStateDirectory '16_Check_Deep_Freeze_Status.state.json'
 $ComputerName = $env:COMPUTERNAME
 $RunId = [guid]::NewGuid().ToString()
 $DeepFreezeLogRetentionDays = 14
@@ -28,6 +36,7 @@ $TelemetryPath = Join-Path $LogDirectory 'Maintenance-Telemetry.ndjson'
 $LatestTelemetryPath = Join-Path $LogDirectory '16_Check_Deep_Freeze_Status.latest.json'
 $StartTime = Get-Date
 $script:CurrentStage = 'Initialization'
+$dfcPath = $null
 
 
 function New-StringArrayForJson {
@@ -59,6 +68,80 @@ function Write-JsonAtomically {
     Move-Item -LiteralPath $temporary -Destination $Path -Force
 }
 
+function Update-DeepFreezeStateTracking {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [ValidateSet('Frozen','Thawed','Unknown','NotInstalled')]
+        [string]$State,
+
+        [Parameter(Mandatory)]
+        [datetime]$ObservedAt
+    )
+
+    $previousState = $null
+    $previousStateSince = $null
+
+    if (Test-Path -LiteralPath $DeepFreezeStatePath -PathType Leaf) {
+        try {
+            $prior = Get-Content -LiteralPath $DeepFreezeStatePath -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
+            $previousState = [string]$prior.State
+
+            $parsedStateSince = [datetimeoffset]::MinValue
+            if (-not [string]::IsNullOrWhiteSpace([string]$prior.StateSinceUtc) -and
+                [datetimeoffset]::TryParse([string]$prior.StateSinceUtc, [ref]$parsedStateSince)) {
+                $previousStateSince = $parsedStateSince.UtcDateTime
+            }
+        }
+        catch {
+            # A damaged tracking file starts a new observation period. The status
+            # audit itself must continue and publish the current DFC result.
+            $previousState = $null
+            $previousStateSince = $null
+        }
+    }
+
+    $stateChanged = [string]::IsNullOrWhiteSpace($previousState) -or $previousState -ne $State
+    $stateSince = $ObservedAt.ToUniversalTime()
+
+    if (-not $stateChanged -and $null -ne $previousStateSince -and $previousStateSince -le $ObservedAt.ToUniversalTime()) {
+        $stateSince = $previousStateSince
+    }
+
+    $thawedSinceUtc = $null
+    $thawedForDays = $null
+    $thawedForHours = $null
+
+    if ($State -eq 'Thawed') {
+        $thawedSinceUtc = $stateSince.ToString('o')
+        $elapsed = $ObservedAt.ToUniversalTime() - $stateSince
+        $thawedForDays = [int][math]::Floor([math]::Max(0, $elapsed.TotalDays))
+        $thawedForHours = [math]::Round([math]::Max(0, $elapsed.TotalHours), 1)
+    }
+
+    if (-not (Test-Path -LiteralPath $DeepFreezeStateDirectory -PathType Container)) {
+        New-Item -Path $DeepFreezeStateDirectory -ItemType Directory -Force -ErrorAction Stop | Out-Null
+    }
+
+    $stateRecord = [ordered]@{
+        SchemaVersion  = '1.0'
+        ComputerName   = $ComputerName
+        State          = $State
+        StateSinceUtc  = $stateSince.ToString('o')
+        LastObservedUtc = $ObservedAt.ToUniversalTime().ToString('o')
+    }
+    Write-JsonAtomically -Path $DeepFreezeStatePath -Json ($stateRecord | ConvertTo-Json -Depth 4)
+
+    return [pscustomobject]@{
+        PreviousState   = $previousState
+        StateChanged    = $stateChanged
+        StateSinceUtc   = $stateSince.ToString('o')
+        ThawedSinceUtc  = $thawedSinceUtc
+        ThawedForDays   = $thawedForDays
+        ThawedForHours  = $thawedForHours
+    }
+}
+
 function Remove-ExpiredDeepFreezeLogs {
     [CmdletBinding()]
     param()
@@ -77,12 +160,13 @@ function Remove-ExpiredDeepFreezeLogs {
 function Write-DeepFreezeLog {
     param(
         [ValidateSet('INFO','WARN','ERROR')][string]$Level,
-        [ValidateSet('Frozen','Thawed','Unknown')][string]$State,
+        [ValidateSet('Frozen','Thawed','Unknown','NotInstalled')][string]$State,
         [string]$Message,
+        [bool]$Installed = $true,
         [Nullable[int]]$DfcExitCode = $null,
         [string]$DfcPath = $null,
         [AllowNull()]$DfcOutput = $null,
-        [ValidateSet('Frozen','Thawed','QueryFailed','UnhandledError')][string]$OverallResult = 'QueryFailed',
+        [ValidateSet('Frozen','Thawed','NotInstalled','QueryFailed','UnhandledError')][string]$OverallResult = 'QueryFailed',
         [int]$ScriptExitCode = 0,
         [string]$FailureStage = $null
     )
@@ -98,6 +182,12 @@ function Write-DeepFreezeLog {
     $eventTime = Get-Date
     $isFrozen = if ($State -eq 'Frozen') { $true } elseif ($State -eq 'Thawed') { $false } else { $null }
     $alertRequired = ($State -eq 'Thawed' -or $State -eq 'Unknown')
+    $stateTracking = Update-DeepFreezeStateTracking -State $State -ObservedAt $eventTime
+
+    if ($State -eq 'Thawed') {
+        $Message = '{0} First observed thawed at {1}; {2} complete day(s) and {3} hour(s) thawed as of this check.' -f `
+            $Message,$stateTracking.ThawedSinceUtc,$stateTracking.ThawedForDays,$stateTracking.ThawedForHours
+    }
 
     # Preserve the original simple per-run Deep Freeze JSON event.
     $record = [ordered]@{
@@ -110,6 +200,13 @@ function Write-DeepFreezeLog {
         event_type            = 'deep_freeze_status'
         deep_freeze_state     = $State
         deep_freeze_is_frozen = $isFrozen
+        deep_freeze_installed = $Installed
+        deep_freeze_previous_state = $stateTracking.PreviousState
+        deep_freeze_state_changed = $stateTracking.StateChanged
+        deep_freeze_state_since_utc = $stateTracking.StateSinceUtc
+        deep_freeze_thawed_since_utc = $stateTracking.ThawedSinceUtc
+        deep_freeze_thawed_for_days = $stateTracking.ThawedForDays
+        deep_freeze_thawed_for_hours = $stateTracking.ThawedForHours
         alert_required        = $alertRequired
         dfc_exit_code         = $DfcExitCode
         dfc_path              = $DfcPath
@@ -161,9 +258,15 @@ function Write-DeepFreezeLog {
         FailureMessage  = if ($ScriptExitCode -ne 0) { $Message } else { $null }
 
         DeepFreeze = [ordered]@{
-            Installed     = $true
+            Installed     = $Installed
             State         = $State
             IsFrozen      = $isFrozen
+            PreviousState = $stateTracking.PreviousState
+            StateChanged  = $stateTracking.StateChanged
+            StateSinceUtc = $stateTracking.StateSinceUtc
+            ThawedSinceUtc = $stateTracking.ThawedSinceUtc
+            ThawedForDays = $stateTracking.ThawedForDays
+            ThawedForHours = $stateTracking.ThawedForHours
             AlertRequired = $alertRequired
             DfcExitCode   = $DfcExitCode
             DfcPath       = $DfcPath
@@ -196,14 +299,10 @@ function Find-DfcExecutable {
 
 try {
     # Treat the presence of DFC.exe as the local Deep Freeze installation check.
-    # Systems without Deep Freeze are intentionally ignored: no Elastic telemetry
-    # is generated and no C:\Logs directory is created solely for this script.
+    # An explicit NotInstalled event supersedes any older Frozen/Thawed event for
+    # this hostname. The dashboard filters Installed=false computers out.
     $script:CurrentStage = 'DetectDeepFreeze'
     $dfcPath = Find-DfcExecutable
-    if ([string]::IsNullOrWhiteSpace($dfcPath)) {
-        # Preserve existing behavior: systems without Deep Freeze produce no telemetry.
-        exit 0
-    }
 
     $script:CurrentStage = 'LoadMaintenanceFramework'
     $MaintenanceFrameworkPath = 'C:\Scripts\Maintenance.Framework.psm1'
@@ -213,6 +312,13 @@ try {
     $currentFrameworkVersion = [version](Get-MaintenanceFrameworkVersion)
     if ($currentFrameworkVersion -lt $requiredFrameworkVersion) {
         throw "Script 16 requires Maintenance.Framework.psm1 version $requiredFrameworkVersion or newer. Installed version: $currentFrameworkVersion"
+    }
+
+    if ([string]::IsNullOrWhiteSpace($dfcPath)) {
+        Write-DeepFreezeLog -Level INFO -State 'NotInstalled' -Installed $false `
+            -OverallResult 'NotInstalled' -ScriptExitCode 0 `
+            -Message 'Deep Freeze is not installed; this computer is excluded from Deep Freeze compliance totals.'
+        exit 0
     }
 
     # Deep Freeze is installed. Remove only this script's completed JSON event
@@ -251,7 +357,8 @@ catch {
     $failureMessage = "Unhandled Deep Freeze status check error: $($_.Exception.Message)"
     try {
         if (Get-Command Write-MaintenanceTelemetryLine -ErrorAction SilentlyContinue) {
-            Write-DeepFreezeLog -Level ERROR -State 'Unknown' -DfcPath $dfcPath -DfcOutput @() `
+            Write-DeepFreezeLog -Level ERROR -State 'Unknown' -Installed (-not [string]::IsNullOrWhiteSpace($dfcPath)) `
+                -DfcPath $dfcPath -DfcOutput @() `
                 -OverallResult 'UnhandledError' -ScriptExitCode 1 -FailureStage $script:CurrentStage `
                 -Message $failureMessage
         }

@@ -2,7 +2,7 @@
   "SchemaVersion": 1,
   "ManifestVersion": "2.5.0",
   "PackageVersion": "2.5.0",
-  "GeneratedUtc": "2026-09-08T22:24:01Z",
+  "GeneratedUtc": "2026-09-14T20:34:26Z",
   "Files": [
     {
       "Name": "00_Update-Scripts-FromShare.ps1",
@@ -19,8 +19,8 @@
     {
       "Name": "02_Remove_User_Profiles.ps1",
       "Role": "ManagedFile",
-      "Version": "2.3.3",
-      "SHA256": "E011B72B2397B2C4A48BB8291720DBE00EFEE947257EE04DECE58021C007AC04"
+      "Version": "2.4.0",
+      "SHA256": "158DEF5E9CD69A2B30D95DB0E82DD76391B36EEE7F05F5B7563454905A96FC37"
     },
     {
       "Name": "03_Weekend_Apps_Update.ps1",

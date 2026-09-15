@@ -1,8 +1,8 @@
 #requires -Version 5.1
 #requires -RunAsAdministrator
 # ScriptName:    04_Sunday_Lab_Application_Maintenance.ps1
-# ScriptVersion: 1.4.0
-# LastUpdated:   2026-09-09
+# ScriptVersion: 1.6.0
+# LastUpdated:   2026-09-15
 <#
 .SYNOPSIS
     Runs the Sunday lab application and configuration maintenance in one script.
@@ -25,11 +25,26 @@
 
 .NOTES
     ScriptName:    04_Sunday_Lab_Application_Maintenance.ps1
-    ScriptVersion: 1.4.0
-    LastUpdated:   2026-09-09
+    ScriptVersion: 1.6.0
+    LastUpdated:   2026-09-15
     Requires:      64-bit Windows PowerShell 5.1, Administrator or SYSTEM
 
-    Changes:       v1.4.0 detects Microsoft 365, Office 2024, and older Office
+    Changes:       v1.6.0 expands Chrome lab policy enforcement to suppress the
+                   browser sign-in/onboarding experience and default-browser prompt
+                   on every computer, and enriches Honorlock telemetry with
+                   Building/Lab/DeviceIdentifier and target-pattern information for
+                   scalable Kibana deployment dashboards.
+                   v1.5.0 replaces all Gzip/Base64 embedded payloads with directly
+                   readable plain-text source blocks. Sections are still staged and
+                   executed in isolated child PowerShell processes, preserving the
+                   existing behavior while making future maintenance much easier.
+                   v1.4.2 normalizes SHARP/PaperCut SuccessRebootRequired (3010)
+                   from the child section telemetry so a required reboot is not
+                   misclassified as a section failure by the parent runner.
+                   v1.4.1 fixes Office registry detection under StrictMode, Honorlock
+                   ExtensionSettings creation when the value does not yet exist,
+                   and the PowerShell 5.1 generic-list summary serialization error.
+                   v1.4.0 detects Microsoft 365, Office 2024, and older Office
                    LTSC/perpetual suites. Microsoft 365 is skipped. Supported
                    older Click-to-Run suites are removed with targeted Office
                    Deployment Tool XML; older MSI suites require the supported
@@ -45,9 +60,11 @@
                    retains prefix targeting and verification, and removes any
                    runtime dependency on a separately deployed numbered script.
 
-    This single file contains compressed copies of the seven source scripts. The
-    Autologon password and Elastic enrollment token therefore remain sensitive,
-    just as they were in the original files. Restrict access to the script/share.
+    This single file contains plain-text embedded copies of the seven source scripts.
+    They are staged to temporary files only so each section can run in an isolated
+    64-bit Windows PowerShell process. No compression or Base64 regeneration is
+    required when maintaining an embedded section. The Autologon password and
+    Elastic enrollment token remain sensitive; restrict access to the script/share.
 #>
 
 [CmdletBinding()]
@@ -80,12 +97,19 @@ $ErrorActionPreference = 'Stop'
 
 # --- Elastic Agent installation targets (former script 15) -----------------
 [string[]]$ElasticAgentComputerPrefixes = @(
-    'IB1-103'
+    'IB1-103',
+	'SSC-216*'
 )
 
 # --- Honorlock Chrome extension targets (former script 18) -----------------
-# This list is included because Honorlock was also targeted in the attached
-# script. Leave the array empty, @(), only if Honorlock should target all PCs.
+# Add one wildcard/prefix per lab that requires Honorlock. The same list is
+# passed into the embedded Honorlock section and is also written to telemetry,
+# allowing Kibana to show which labs are targeted and which computers verified
+# the machine-wide policy. Examples:
+#   'SSC-216*'
+#   'AHB-146*'
+#   'IB1-103*'
+# Leave the array empty, @(), ONLY if Honorlock should target every computer.
 [string[]]$HonorlockComputerPatterns = @(
     'SSC-216*',
     'AHB-146*'
@@ -118,7 +142,7 @@ $ErrorActionPreference = 'Stop'
 [string]$Office2024ConfigurationFile = 'office2024config.xml'
 [string]$LogDirectory = 'C:\Logs'
 [string]$RunnerScriptName = '04_Sunday_Lab_Application_Maintenance.ps1'
-[string]$RunnerVersion = '1.4.0'
+[string]$RunnerVersion = '1.6.0'
 [string]$RunnerLogPath = Join-Path $LogDirectory '04_Sunday_Lab_Application_Maintenance.log'
 [string]$RunnerLatestPath = Join-Path $LogDirectory '04_Sunday_Lab_Application_Maintenance.latest.json'
 [string]$RunnerTelemetryPath = Join-Path $LogDirectory 'Maintenance-Telemetry.ndjson'
@@ -128,58 +152,4644 @@ $RunnerStartTime = Get-Date
 $RunnerRunId = [guid]::NewGuid().Guid
 
 # ============================================================================
-# EMBEDDED SECTION PAYLOADS -- DO NOT EDIT
+# EMBEDDED SECTION SOURCE -- EDIT THESE BLOCKS WHEN MAINTAINING A SECTION
 # ============================================================================
 $EmbeddedSections = [ordered]@{
     SystemRestore = [ordered]@{
-        # Internal temporary filename; no external script 12 is read.
         FileName = 'Embedded_SystemRestore.ps1'
-        Sha256   = 'FBD3A648D01610AF38040B64C0E0DCDEBEA7F14D91DE3EDD38CA187B18F66609'
-        GzipBase64 = @'
-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
+        # Plain-text source is intentionally embedded for maintainability.
+        Source = @'
+﻿<#
+.SYNOPSIS
+    Enables System Restore on the Windows client operating-system drive, creates a verified
+    restore point, and retains a configurable number of restore points created by this script.
+
+.NOTES
+    ScriptName: 12_Enable-SystemRestore-And-Create-RestorePoint.ps1
+    ScriptVersion: 2.0.8
+    LastUpdated: 2026-08-17
+    Changes: v2.0.8 normalizes restore-point enumeration to arrays in retention and latest-point logic so a single restore point does not trigger a StrictMode Count-property failure.
+              v2.0.7 allows an empty restore-point inventory during pre/post checks, which is valid on systems with no existing restore points.
+              v2.0.6 adds Elastic mapping-safe array serialization for services, restore-point inventories, and retention results; normalizes Windows 11 product naming; and adds a concise Elastic restore-point summary.
+              v2.0.5 uses Maintenance.Framework v2.4 staged text logging.
+    Designed for Windows PowerShell 5.1 on Windows 10/11.
+#>
+
+[CmdletBinding()]
+param(
+    [ValidateNotNullOrEmpty()]
+    [string]$RestorePointDescription = 'Compton IT - Weekly Restore Point',
+
+    [ValidateRange(1, 30)]
+    [int]$VerificationTimeoutMinutes = 5,
+
+    [ValidateRange(1, 20)]
+    [int]$MaxManagedRestorePoints = 2,
+
+    [ValidateRange(30, 3600)]
+    [int]$ServiceStartTimeoutSeconds = 60,
+
+    [switch]$SkipRetentionCleanup
+)
+
+Set-StrictMode -Version 2.0
+$ErrorActionPreference = 'Stop'
+
+$ScriptName = '12_Enable-SystemRestore-And-Create-RestorePoint.ps1'
+$ScriptVersion = '2.0.8'
+$RunId = [guid]::NewGuid().Guid
+$RunStart = Get-Date
+$LogDirectory = 'C:\Logs'
+$LogPath = $null
+$PublishedLogPath = $null
+$LogSession = $null
+$TelemetryPath = Join-Path $LogDirectory 'Maintenance-Telemetry.ndjson'
+$LatestTelemetryPath = Join-Path $LogDirectory '12_Enable-SystemRestore-And-Create-RestorePoint.latest.json'
+
+$script:WarningCount = 0
+$script:ErrorCount = 0
+$script:FailureMessage = $null
+$script:FinalStatus = 'Running'
+$script:FinalExitCode = 1
+$script:RestoreProtectionEnableAttempted = $false
+$script:RestoreProtectionEnabled = $false
+$script:RestorePointCreationAttempted = $false
+$script:RestorePointVerified = $false
+$script:CreatedRestorePoint = $null
+$script:RetentionResults = New-Object System.Collections.Generic.List[object]
+$script:ServiceResults = New-Object System.Collections.Generic.List[object]
+$script:RestorePointsBefore = @()
+$script:RestorePointsAfter = @()
+$script:FrequencyBefore = $null
+$script:FrequencyAfter = $null
+$script:FrequencyChanged = $false
+
+# Load the shared framework from the same directory as this script.
+$MaintenanceFrameworkPath = 'C:\Scripts\Maintenance.Framework.psm1'
+Import-Module -Name $MaintenanceFrameworkPath -Force -DisableNameChecking -ErrorAction Stop
+$MaintenanceConfig = Initialize-MaintenanceEnvironment -ScriptRoot 'C:\Scripts' -LogRoot $LogDirectory
+
+$requiredFrameworkVersion = [version]'2.4.0'
+$currentFrameworkVersion = [version](Get-MaintenanceFrameworkVersion)
+
+if ($currentFrameworkVersion -lt $requiredFrameworkVersion) {
+    throw "Script 12 requires Maintenance.Framework.psm1 version $requiredFrameworkVersion or newer. Installed version: $currentFrameworkVersion"
+}
+
+Archive-MaintenanceLogs `
+    -ScriptName $ScriptName `
+    -LogRoot $LogDirectory `
+    -AdditionalPatterns @(
+        '12_Enable-SystemRestore-And-Create-RestorePoint.log',
+        '*-12_Enable-SystemRestore-And-Create-RestorePoint-*.log'
+    ) | Out-Null
+
+$LogSession = New-MaintenanceStagedLog `
+    -ScriptName $ScriptName `
+    -LogRoot $LogDirectory `
+    -StagingRoot $MaintenanceConfig.LogStagingRoot `
+    -ComputerName $env:COMPUTERNAME `
+    -Timestamp $RunStart
+
+$LogPath = [string]$LogSession.WorkingPath
+$PublishedLogPath = [string]$LogSession.PublishedPath
+
+function Ensure-Directory {
+    param([Parameter(Mandatory)][string]$Path)
+
+    if (-not (Test-Path -LiteralPath $Path)) {
+        New-Item -Path $Path -ItemType Directory -Force -ErrorAction Stop | Out-Null
+    }
+}
+
+function Write-Log {
+    param(
+        [Parameter(Mandatory)][string]$Message,
+        [ValidateSet('INFO', 'OK', 'WARN', 'ERROR')][string]$Level = 'INFO'
+    )
+
+    if ($Level -eq 'WARN') { $script:WarningCount++ }
+    if ($Level -eq 'ERROR') { $script:ErrorCount++ }
+
+    $timestamp = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
+    $computerName = if ($env:COMPUTERNAME) { $env:COMPUTERNAME } else { 'UNKNOWN' }
+    $normalizedLevel = switch ($Level) {
+        'OK'   { 'SUCCESS' }
+        'WARN' { 'WARNING' }
+        default { $Level }
+    }
+    $line = '{0} [{1}] [{2}] {3}' -f $timestamp, $computerName, $normalizedLevel, $Message
+
+    switch ($Level) {
+        'OK'    { Write-Host $line -ForegroundColor Green }
+        'WARN'  { Write-Host $line -ForegroundColor Yellow }
+        'ERROR' { Write-Host $line -ForegroundColor Red }
+        default { Write-Host $line }
+    }
+
+    try {
+        $activeLogDirectory = Split-Path -Parent $LogPath
+        Ensure-Directory -Path $activeLogDirectory
+        Add-Content -LiteralPath $LogPath -Value $line -Encoding UTF8
+    }
+    catch {
+        Write-Warning ('Unable to write to the log file: {0}' -f $_.Exception.Message)
+    }
+}
+
+function Test-IsAdministrator {
+    try {
+        $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+        $principal = New-Object Security.Principal.WindowsPrincipal($identity)
+        return $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+    }
+    catch {
+        return $false
+    }
+}
+
+function Invoke-SelfElevation {
+    if (Test-IsAdministrator) {
+        return
+    }
+
+    if (-not $PSCommandPath) {
+        throw 'Administrative privileges are required. Open Windows PowerShell as Administrator and run the script again.'
+    }
+
+    Write-Host 'Administrative privileges are required. Requesting elevation...' -ForegroundColor Yellow
+
+    $escapedDescription = $RestorePointDescription.Replace('"', '\"')
+    $argumentParts = @(
+        '-NoProfile'
+        '-ExecutionPolicy Bypass'
+        ('-File "{0}"' -f $PSCommandPath)
+        ('-RestorePointDescription "{0}"' -f $escapedDescription)
+        ('-VerificationTimeoutMinutes {0}' -f $VerificationTimeoutMinutes)
+        ('-MaxManagedRestorePoints {0}' -f $MaxManagedRestorePoints)
+        ('-ServiceStartTimeoutSeconds {0}' -f $ServiceStartTimeoutSeconds)
+    )
+
+    if ($SkipRetentionCleanup) {
+        $argumentParts += '-SkipRetentionCleanup'
+    }
+
+    Start-Process `
+        -FilePath "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe" `
+        -ArgumentList ($argumentParts -join ' ') `
+        -Verb RunAs | Out-Null
+
+    exit 0
+}
+
+function Convert-ToIsoUtc {
+    param([AllowNull()]$Date)
+
+    if ($null -eq $Date) { return $null }
+    return $Date.ToUniversalTime().ToString('o')
+}
+
+function Get-WindowsIdentity {
+    $os = Get-CimInstance -ClassName Win32_OperatingSystem -ErrorAction Stop
+    $cvPath = 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion'
+    $cv = Get-ItemProperty -LiteralPath $cvPath -ErrorAction SilentlyContinue
+
+    $productName = if ($cv) { [string]$cv.ProductName } else { [string]$os.Caption }
+    $buildText = [string]$os.BuildNumber
+    $buildNumber = 0
+    [void][int]::TryParse($buildText, [ref]$buildNumber)
+
+    if ($buildNumber -ge 22000 -and $productName -match '^Windows 10') {
+        $productName = $productName -replace '^Windows 10', 'Windows 11'
+    }
+
+    [pscustomobject]@{
+        ProductName    = $productName
+        EditionId      = if ($cv) { [string]$cv.EditionID } else { $null }
+        DisplayVersion = if ($cv) { [string]$cv.DisplayVersion } else { $null }
+        ReleaseId      = if ($cv) { [string]$cv.ReleaseId } else { $null }
+        Build          = $buildText
+        UBR            = if ($cv -and $null -ne $cv.UBR) { [int]$cv.UBR } else { $null }
+        FullBuild      = if ($cv -and $null -ne $cv.UBR) { '{0}.{1}' -f $buildText, $cv.UBR } else { $buildText }
+        ProductType    = [int]$os.ProductType
+        SystemDrive    = [string]$os.SystemDrive
+    }
+}
+
+function Get-OperatingSystemDrive {
+    param([Parameter(Mandatory)]$WindowsIdentity)
+
+    if ([string]::IsNullOrWhiteSpace([string]$WindowsIdentity.SystemDrive)) {
+        throw 'Unable to determine the Windows operating-system drive.'
+    }
+
+    return ('{0}\' -f ([string]$WindowsIdentity.SystemDrive).TrimEnd('\'))
+}
+
+function Get-RestorePointCreationFrequency {
+    $registryPath = 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\SystemRestore'
+    $valueName = 'SystemRestorePointCreationFrequency'
+
+    try {
+        $value = Get-ItemPropertyValue -LiteralPath $registryPath -Name $valueName -ErrorAction Stop
+        return [int]$value
+    }
+    catch {
+        return $null
+    }
+}
+
+function Set-RestorePointCreationFrequency {
+    $registryPath = 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\SystemRestore'
+    $valueName = 'SystemRestorePointCreationFrequency'
+
+    $script:FrequencyBefore = Get-RestorePointCreationFrequency
+
+    if (-not (Test-Path -LiteralPath $registryPath)) {
+        New-Item -Path $registryPath -Force -ErrorAction Stop | Out-Null
+    }
+
+    if ($script:FrequencyBefore -ne 0) {
+        New-ItemProperty `
+            -LiteralPath $registryPath `
+            -Name $valueName `
+            -PropertyType DWord `
+            -Value 0 `
+            -Force `
+            -ErrorAction Stop | Out-Null
+
+        $script:FrequencyChanged = $true
+        Write-Log 'Configured Windows to permit restore-point creation on each scheduled run.' 'OK'
+    }
+    else {
+        Write-Log 'Restore-point creation frequency is already configured for each run.'
+    }
+
+    $script:FrequencyAfter = Get-RestorePointCreationFrequency
+    if ($script:FrequencyAfter -ne 0) {
+        throw 'SystemRestorePointCreationFrequency could not be verified as 0.'
+    }
+}
+
+
+function Test-SystemRestorePolicy {
+    [CmdletBinding()]
+    param()
+
+    $policyPath = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\SystemRestore'
+    $disableSr = $null
+    $disableConfig = $null
+
+    if (Test-Path -LiteralPath $policyPath) {
+        try {
+            $policy = Get-ItemProperty -LiteralPath $policyPath -ErrorAction Stop
+            if ($null -ne $policy.DisableSR) {
+                $disableSr = [int]$policy.DisableSR
+            }
+            if ($null -ne $policy.DisableConfig) {
+                $disableConfig = [int]$policy.DisableConfig
+            }
+        }
+        catch {
+            Write-Log ('Unable to read System Restore policy: {0}' -f $_.Exception.Message) 'WARN'
+        }
+    }
+
+    if ($disableSr -eq 1) {
+        throw 'System Restore is disabled by policy (DisableSR=1). Remove or change the policy before restore points can be created.'
+    }
+
+    if ($disableConfig -eq 1) {
+        Write-Log 'System Restore configuration is restricted by policy (DisableConfig=1), but restore-point creation will still be attempted.' 'WARN'
+    }
+
+    Write-Log 'System Restore policy does not explicitly disable restore-point creation.' 'OK'
+}
+
+function Enable-SystemRestoreProtection {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$Drive,
+        [ValidateRange(5,120)]
+        [int]$InitializationWaitSeconds = 20
+    )
+
+    $script:RestoreProtectionEnableAttempted = $true
+    Write-Log ('Ensuring System Restore protection is enabled for {0}' -f $Drive) 'INFO'
+
+    # Keep the supported PowerShell cmdlet call.
+    Enable-ComputerRestore -Drive $Drive -ErrorAction Stop
+    $script:RestoreProtectionEnabled = $true
+    Write-Log ('System Restore protection enable command completed for {0}' -f $Drive) 'OK'
+
+    # Call the underlying SystemRestore.Enable() method directly as well so
+    # we can capture its return code. Microsoft documents that this method
+    # returns before monitoring/filter-driver initialization is complete.
+    try {
+        $restoreClass = Get-WmiObject `
+            -Namespace 'root\default' `
+            -List `
+            -Class 'SystemRestore' `
+            -ErrorAction Stop
+
+        if ($restoreClass) {
+            $enableResult = $restoreClass.Enable($Drive)
+            $enableCode = [int]$enableResult.ReturnValue
+
+            if ($enableCode -eq 0) {
+                Write-Log ('Native SystemRestore.Enable returned success for {0}.' -f $Drive) 'OK'
+            }
+            else {
+                Write-Log ('Native SystemRestore.Enable returned code {0} for {1}.' -f $enableCode, $Drive) 'WARN'
+            }
+        }
+    }
+    catch {
+        Write-Log ('Unable to obtain native SystemRestore.Enable return code: {0}' -f $_.Exception.Message) 'WARN'
+    }
+
+    Write-Log ('Waiting {0} second(s) for System Restore monitoring to initialize...' -f $InitializationWaitSeconds) 'INFO'
+    Start-Sleep -Seconds $InitializationWaitSeconds
+}
+
+function Get-ServiceSnapshot {
+    param([Parameter(Mandatory)][string]$Name)
+
+    $service = Get-CimInstance -ClassName Win32_Service -Filter ("Name='{0}'" -f $Name.Replace("'", "''")) -ErrorAction SilentlyContinue
+    if (-not $service) {
+        return [pscustomobject]@{
+            Name      = $Name
+            Exists    = $false
+            State     = $null
+            StartMode = $null
+            ProcessId = $null
+        }
+    }
+
+    [pscustomobject]@{
+        Name      = [string]$service.Name
+        Exists    = $true
+        State     = [string]$service.State
+        StartMode = [string]$service.StartMode
+        ProcessId = [int]$service.ProcessId
+    }
+}
+
+function Initialize-ShadowCopyServices {
+    # VSS and swprv are always expected. srservice is checked when present.
+    # On some Windows builds the System Restore service is not exposed as a
+    # separate service, so absence of srservice is informational rather than fatal.
+    $serviceDefinitions = @(
+        [pscustomobject]@{ Name = 'VSS';       DesiredStartup = 'Manual'; Required = $true  },
+        [pscustomobject]@{ Name = 'swprv';     DesiredStartup = 'Manual'; Required = $true  },
+        [pscustomobject]@{ Name = 'srservice'; DesiredStartup = 'Manual'; Required = $false }
+    )
+
+    foreach ($definition in $serviceDefinitions) {
+        $serviceName = $definition.Name
+        $before = Get-ServiceSnapshot -Name $serviceName
+        $attempted = $false
+        $operationStatus = 'NoChange'
+        $message = $null
+
+        if (-not $before.Exists) {
+            if ($definition.Required) {
+                $operationStatus = 'NotFound'
+                $message = 'Required service was not found.'
+                Write-Log ('Required service {0} was not found.' -f $serviceName) 'WARN'
+            }
+            else {
+                $operationStatus = 'NotPresentOnBuild'
+                $message = 'Optional System Restore service is not present on this Windows build.'
+                Write-Log ('Optional service {0} is not present on this Windows build.' -f $serviceName) 'INFO'
+            }
+        }
+        else {
+            # A disabled dependency causes Checkpoint-Computer to fail with
+            # "the service cannot be started because it is disabled".
+            if ($before.StartMode -eq 'Disabled') {
+                $attempted = $true
+                Write-Log ('Service {0} is disabled. Changing startup type to {1}...' -f $serviceName, $definition.DesiredStartup) 'INFO'
+
+                try {
+                    Set-Service -Name $serviceName -StartupType $definition.DesiredStartup -ErrorAction Stop
+                    Write-Log ('Startup type for {0} changed to {1}.' -f $serviceName, $definition.DesiredStartup) 'OK'
+                }
+                catch {
+                    # Some protected services reject Set-Service; try sc.exe.
+                    $scStart = if ($definition.DesiredStartup -eq 'Manual') { 'demand' } else { 'auto' }
+                    $scOutput = & "$env:SystemRoot\System32\sc.exe" config $serviceName start= $scStart 2>&1
+
+                    if ($LASTEXITCODE -ne 0) {
+                        $operationStatus = 'Failed'
+                        $message = ($scOutput -join ' ')
+                        Write-Log ('Unable to change startup type for service {0}: {1}' -f $serviceName, $message) 'WARN'
+                    }
+                    else {
+                        Write-Log ('Startup type for {0} changed through sc.exe.' -f $serviceName) 'OK'
+                    }
+                }
+            }
+
+            $current = Get-ServiceSnapshot -Name $serviceName
+
+            if ($current.State -ne 'Running') {
+                $attempted = $true
+                Write-Log ('Starting restore-point dependency service {0}...' -f $serviceName) 'INFO'
+
+                try {
+                    Start-Service -Name $serviceName -ErrorAction Stop
+                    $serviceController = Get-Service -Name $serviceName -ErrorAction Stop
+                    $serviceController.WaitForStatus(
+                        [System.ServiceProcess.ServiceControllerStatus]::Running,
+                        [TimeSpan]::FromSeconds($ServiceStartTimeoutSeconds)
+                    )
+                    $operationStatus = 'Started'
+                    Write-Log ('Service {0} is running.' -f $serviceName) 'OK'
+                }
+                catch {
+                    $operationStatus = 'Failed'
+                    $message = $_.Exception.Message
+                    Write-Log ('Service {0} could not be started: {1}' -f $serviceName, $message) 'WARN'
+                }
+            }
+            else {
+                Write-Log ('Required service {0} is already running.' -f $serviceName) 'INFO'
+            }
+        }
+
+        $after = Get-ServiceSnapshot -Name $serviceName
+        $verified = if (-not $after.Exists -and -not $definition.Required) {
+            $true
+        }
+        else {
+            ($after.Exists -and $after.State -eq 'Running')
+        }
+
+        [void]$script:ServiceResults.Add([pscustomobject]@{
+            Name            = $serviceName
+            Required        = [bool]$definition.Required
+            Before          = $before
+            StartAttempted  = $attempted
+            OperationStatus = $operationStatus
+            Message         = $message
+            After           = $after
+            VerifiedRunning = $verified
+        })
+
+        $serviceLogLevel = if ($verified) { 'OK' } else { 'WARN' }
+        Write-Log ('Restore service state: Name={0}; Required={1}; State={2} -> {3}; StartMode={4} -> {5}; VerifiedRunning={6}; Operation={7}.' -f `
+            $serviceName, $definition.Required, $before.State, $after.State, $before.StartMode, $after.StartMode, $verified, $operationStatus) $serviceLogLevel
+
+        if (-not $verified -and $definition.Required) {
+            throw ('Required restore-point service {0} could not be verified as running.' -f $serviceName)
+        }
+    }
+}
+
+function Convert-RestorePointTime {
+    param([AllowNull()][string]$CreationTime)
+
+    if ([string]::IsNullOrWhiteSpace($CreationTime)) {
+        return $null
+    }
+
+    try {
+        return [Management.ManagementDateTimeConverter]::ToDateTime($CreationTime)
+    }
+    catch {
+        return $null
+    }
+}
+
+function Convert-RestorePointRecord {
+    param([Parameter(Mandatory)]$RestorePoint)
+
+    $created = Convert-RestorePointTime -CreationTime ([string]$RestorePoint.CreationTime)
+
+    [pscustomobject]@{
+        SequenceNumber = [uint32]$RestorePoint.SequenceNumber
+        Description    = [string]$RestorePoint.Description
+        CreationTime   = Convert-ToIsoUtc -Date $created
+        RestorePointType = if ($null -ne $RestorePoint.RestorePointType) { [int]$RestorePoint.RestorePointType } else { $null }
+        EventType      = if ($null -ne $RestorePoint.EventType) { [int]$RestorePoint.EventType } else { $null }
+        Managed        = ([string]$RestorePoint.Description -eq $RestorePointDescription)
+    }
+}
+
+function Get-AllRestorePoints {
+    try {
+        [object[]]$points = @(
+            Get-ComputerRestorePoint -ErrorAction Stop |
+            Sort-Object -Property SequenceNumber -Descending
+        )
+
+        return $points
+    }
+    catch {
+        Write-Log ('Unable to enumerate restore points: {0}' -f $_.Exception.Message) 'WARN'
+        return @()
+    }
+}
+
+function Write-RestorePointInventorySummary {
+    param(
+        [Parameter(Mandatory)][string]$Label,
+        [Parameter(Mandatory)][AllowEmptyCollection()][object[]]$RestorePoints
+    )
+
+    $managed = @($RestorePoints | Where-Object { $_.Managed })
+    $nonManaged = @($RestorePoints | Where-Object { -not $_.Managed })
+    $latest = $RestorePoints | Sort-Object -Property SequenceNumber -Descending | Select-Object -First 1
+
+    Write-Log ('Restore-point inventory {0}: Total={1}; Managed={2}; NonManaged={3}.' -f `
+        $Label, $RestorePoints.Count, $managed.Count, $nonManaged.Count)
+
+    if ($latest) {
+        Write-Log ('Latest restore point {0}: SequenceNumber={1}; Created={2}; Managed={3}; Description={4}.' -f `
+            $Label, $latest.SequenceNumber, $latest.CreationTime, $latest.Managed, $latest.Description)
+    }
+    else {
+        Write-Log ('Latest restore point {0}: none found.' -f $Label) 'INFO'
+    }
+}
+
+function Get-LatestRestorePoint {
+    $points = @(Get-AllRestorePoints)
+    if ($points.Count -eq 0) { return $null }
+    return $points[0]
+}
+
+function Initialize-SystemRestoreNativeApi {
+    if ('SystemRestore.NativeMethods' -as [type]) {
+        return
+    }
+
+    $source = @"
+using System;
+using System.Runtime.InteropServices;
+
+namespace SystemRestore
+{
+    public static class NativeMethods
+    {
+        [DllImport("SrClient.dll", SetLastError = true)]
+        public static extern uint SRRemoveRestorePoint(uint restorePointSequenceNumber);
+    }
+}
+"@
+
+    Add-Type -TypeDefinition $source -Language CSharp -ErrorAction Stop
+}
+
+function Remove-RestorePointBySequenceNumber {
+    param([Parameter(Mandatory)][uint32]$SequenceNumber)
+
+    Initialize-SystemRestoreNativeApi
+    $result = [SystemRestore.NativeMethods]::SRRemoveRestorePoint($SequenceNumber)
+
+    if ($result -eq 0) {
+        return
+    }
+
+    $message = (New-Object ComponentModel.Win32Exception([int]$result)).Message
+    throw ('SRRemoveRestorePoint failed for sequence {0}. Win32Result={1}; Message={2}' -f $SequenceNumber, $result, $message)
+}
+
+function Remove-ObsoleteManagedRestorePoints {
+    param(
+        [Parameter(Mandatory)][string]$ManagedDescription,
+        [Parameter(Mandatory)][int]$KeepCount
+    )
+
+    $all = @(Get-AllRestorePoints)
+    $managed = @($all |
+        Where-Object { [string]$_.Description -eq $ManagedDescription } |
+        Sort-Object -Property SequenceNumber -Descending)
+
+    $toKeep = @($managed | Select-Object -First $KeepCount)
+    $toRemove = @($managed | Select-Object -Skip $KeepCount)
+
+    Write-Log (
+        'Managed restore-point retention: ManagedTotal={0}; Keeping={1}; Removing={2}; NonManagedPreserved={3}' -f
+        $managed.Count,
+        $toKeep.Count,
+        $toRemove.Count,
+        ($all.Count - $managed.Count)
+    )
+
+    foreach ($restorePoint in $toRemove) {
+        $created = Convert-RestorePointTime -CreationTime ([string]$restorePoint.CreationTime)
+        $createdText = if ($created) { $created.ToString('yyyy-MM-dd HH:mm:ss') } else { 'Unknown' }
+        $resultStatus = 'Failed'
+        $failure = $null
+
+        Write-Log (
+            'Deleting obsolete managed restore point: SequenceNumber={0}; Created={1}; Description={2}' -f
+            $restorePoint.SequenceNumber,
+            $createdText,
+            $restorePoint.Description
+        )
+
+        try {
+            Remove-RestorePointBySequenceNumber -SequenceNumber ([uint32]$restorePoint.SequenceNumber)
+            $resultStatus = 'Deleted'
+            Write-Log ('Deleted managed restore point sequence {0}.' -f $restorePoint.SequenceNumber) 'OK'
+        }
+        catch {
+            $failure = $_.Exception.Message
+            Write-Log ('Unable to delete managed restore point sequence {0}: {1}' -f $restorePoint.SequenceNumber, $failure) 'WARN'
+        }
+
+        [void]$script:RetentionResults.Add([pscustomobject]@{
+            SequenceNumber = [uint32]$restorePoint.SequenceNumber
+            Description    = [string]$restorePoint.Description
+            CreationTime   = Convert-ToIsoUtc -Date $created
+            Status         = $resultStatus
+            Error          = $failure
+        })
+    }
+}
+
+
+function New-NativeSystemRestorePoint {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$Description
+    )
+
+    Write-Log ('Attempting native SystemRestore.CreateRestorePoint fallback: {0}' -f $Description) 'INFO'
+
+    $restoreClass = Get-WmiObject `
+        -Namespace 'root\default' `
+        -List `
+        -Class 'SystemRestore' `
+        -ErrorAction Stop
+
+    if (-not $restoreClass) {
+        throw 'The root\default:SystemRestore WMI class is not available.'
+    }
+
+    # EventType 100 = BEGIN_SYSTEM_CHANGE
+    # RestorePointType 12 = MODIFY_SETTINGS
+    try {
+        $result = $restoreClass.CreateRestorePoint(
+            $Description,
+            12,
+            100
+        )
+
+        $returnCode = [int]$result.ReturnValue
+        Write-Log ('Native SystemRestore.CreateRestorePoint returned code {0}.' -f $returnCode) `
+            $(if ($returnCode -eq 0) { 'OK' } else { 'WARN' })
+
+        if ($returnCode -ne 0) {
+            throw ('Native SystemRestore.CreateRestorePoint failed with return code {0}.' -f $returnCode)
+        }
+
+        return $true
+    }
+    catch {
+        throw
+    }
+}
+
+function New-VerifiedRestorePoint {
+    param(
+        [Parameter(Mandatory)][string]$Description,
+        [Parameter(Mandatory)][int]$TimeoutMinutes
+    )
+
+    $startedAt = Get-Date
+    $safeDescription = $Description.Trim()
+
+    if ($safeDescription.Length -gt 256) {
+        $safeDescription = $safeDescription.Substring(0, 256)
+        Write-Log 'Restore-point description exceeded 256 characters and was truncated.' 'WARN'
+    }
+
+    $sequenceNumbersBefore = @(
+        Get-AllRestorePoints | ForEach-Object { [uint32]$_.SequenceNumber }
+    )
+
+    $script:RestorePointCreationAttempted = $true
+    Write-Log ('Creating restore point: {0}' -f $safeDescription)
+
+    $creationSucceeded = $false
+    $maxCreationAttempts = 6
+    $retryDelaySeconds = 10
+    $lastCreationError = $null
+
+    for ($attempt = 1; $attempt -le $maxCreationAttempts; $attempt++) {
+        try {
+            Write-Log ('Restore-point creation attempt {0} of {1} using Checkpoint-Computer.' -f $attempt, $maxCreationAttempts) 'INFO'
+
+            Checkpoint-Computer `
+                -Description $safeDescription `
+                -RestorePointType MODIFY_SETTINGS `
+                -ErrorAction Stop
+
+            Write-Log 'Checkpoint-Computer completed without error.' 'OK'
+            $creationSucceeded = $true
+            break
+        }
+        catch {
+            $lastCreationError = $_.Exception.Message
+            Write-Log ('Checkpoint-Computer attempt {0} failed: {1}' -f $attempt, $lastCreationError) 'WARN'
+
+            $serviceDisabledCondition = (
+                $lastCreationError -match 'service cannot be started because it is disabled' -or
+                $lastCreationError -match 'does not have enabled devices associated with it' -or
+                $lastCreationError -match 'ServiceDisabled' -or
+                $lastCreationError -match '0x80070422'
+            )
+
+            if (-not $serviceDisabledCondition) {
+                throw
+            }
+
+            # Try the lower-level WMI interface too. If System Restore is still
+            # initializing, it can fail with the same underlying condition.
+            try {
+                $null = New-NativeSystemRestorePoint -Description $safeDescription
+                Write-Log 'Native SystemRestore.CreateRestorePoint completed successfully.' 'OK'
+                $creationSucceeded = $true
+                break
+            }
+            catch {
+                $lastCreationError = $_.Exception.Message
+                Write-Log ('Native fallback attempt {0} also failed: {1}' -f $attempt, $lastCreationError) 'WARN'
+            }
+
+            if ($attempt -lt $maxCreationAttempts) {
+                Write-Log ('System Restore may still be initializing. Waiting {0} seconds before retrying...' -f $retryDelaySeconds) 'INFO'
+                Start-Sleep -Seconds $retryDelaySeconds
+            }
+        }
+    }
+
+    if (-not $creationSucceeded) {
+        throw ('Restore-point creation failed after {0} attempts. Last error: {1}' -f $maxCreationAttempts, $lastCreationError)
+    }
+
+    $deadline = (Get-Date).AddMinutes($TimeoutMinutes)
+
+    do {
+        Start-Sleep -Seconds 5
+        $points = @(Get-AllRestorePoints)
+        $candidate = $points |
+            Where-Object {
+                $sequenceNumbersBefore -notcontains [uint32]$_.SequenceNumber -and
+                [string]$_.Description -eq $safeDescription
+            } |
+            Sort-Object -Property SequenceNumber -Descending |
+            Select-Object -First 1
+
+        if ($candidate) {
+            $creationDate = Convert-RestorePointTime -CreationTime ([string]$candidate.CreationTime)
+
+            if ($creationDate -and $creationDate -ge $startedAt.AddMinutes(-1)) {
+                $script:RestorePointVerified = $true
+                $script:CreatedRestorePoint = Convert-RestorePointRecord -RestorePoint $candidate
+
+                Write-Log (
+                    'Restore point verified: SequenceNumber={0}; Created={1}; Description={2}' -f
+                    $candidate.SequenceNumber,
+                    $creationDate.ToString('yyyy-MM-dd HH:mm:ss'),
+                    $candidate.Description
+                ) 'OK'
+
+                return $candidate
+            }
+        }
+    }
+    while ((Get-Date) -lt $deadline)
+
+    throw ('The restore point could not be verified within {0} minute(s).' -f $TimeoutMinutes)
+}
+
+function Write-JsonAtomically {
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)][string]$Json
+    )
+
+    $directory = Split-Path -Parent $Path
+    Ensure-Directory -Path $directory
+
+    $temporaryPath = '{0}.{1}.tmp' -f $Path, $RunId
+    [System.IO.File]::WriteAllText($temporaryPath, $Json, (New-Object System.Text.UTF8Encoding($false)))
+    Move-Item -LiteralPath $temporaryPath -Destination $Path -Force
+}
+
+
+function New-ObjectArrayForJson {
+    [CmdletBinding()]
+    param([AllowNull()]$InputObject)
+
+    [object[]]$items = @(
+        $InputObject |
+        ForEach-Object { $_ }
+    )
+
+    if ($items.Count -eq 0) {
+        return ,([object[]]@())
+    }
+
+    return ,([object[]]$items)
+}
+
+function Write-Telemetry {
+    param([AllowNull()]$WindowsIdentity)
+
+    try {
+        Ensure-Directory -Path $LogDirectory
+
+        $runEnd = Get-Date
+        $duration = [math]::Round(($runEnd - $RunStart).TotalSeconds, 3)
+
+        $managedBefore = @($script:RestorePointsBefore | Where-Object { $_.Managed })
+        $managedAfter = @($script:RestorePointsAfter | Where-Object { $_.Managed })
+        $nonManagedBefore = @($script:RestorePointsBefore | Where-Object { -not $_.Managed })
+        $nonManagedAfter = @($script:RestorePointsAfter | Where-Object { -not $_.Managed })
+
+        $event = [ordered]@{
+            '@timestamp' = (Get-Date).ToUniversalTime().ToString('o')
+            EventType = 'maintenance.system_restore'
+            ComputerName = $env:COMPUTERNAME
+            Domain = if ($env:USERDNSDOMAIN) { $env:USERDNSDOMAIN } else { $env:USERDOMAIN }
+            ScriptName = $ScriptName
+            ScriptVersion = $ScriptVersion
+            RunId = $RunId
+            Status = $script:FinalStatus
+            ExitCode = $script:FinalExitCode
+            StartTime = Convert-ToIsoUtc -Date $RunStart
+            EndTime = Convert-ToIsoUtc -Date $runEnd
+            DurationSeconds = $duration
+            WarningCount = $script:WarningCount
+            ErrorCount = $script:ErrorCount
+            FailureMessage = $script:FailureMessage
+            TextLogPath = $PublishedLogPath
+            RunningAccount = [Security.Principal.WindowsIdentity]::GetCurrent().Name
+            IsSystem = ([Security.Principal.WindowsIdentity]::GetCurrent().IsSystem)
+            Windows = $WindowsIdentity
+            RestorePointDescription = $RestorePointDescription
+            VerificationTimeoutMinutes = $VerificationTimeoutMinutes
+            MaxManagedRestorePoints = $MaxManagedRestorePoints
+            SkipRetentionCleanup = [bool]$SkipRetentionCleanup
+            RestoreProtection = [ordered]@{
+                Drive = if ($WindowsIdentity) { '{0}\' -f ([string]$WindowsIdentity.SystemDrive).TrimEnd('\') } else { $null }
+                EnableAttempted = $script:RestoreProtectionEnableAttempted
+                EnableCommandSucceeded = $script:RestoreProtectionEnabled
+            }
+            CreationFrequency = [ordered]@{
+                Before = $script:FrequencyBefore
+                After = $script:FrequencyAfter
+                Changed = $script:FrequencyChanged
+                Verified = ($script:FrequencyAfter -eq 0)
+            }
+            ShadowCopyServices = New-ObjectArrayForJson -InputObject $script:ServiceResults
+            RestorePointCreation = [ordered]@{
+                Attempted = $script:RestorePointCreationAttempted
+                Verified = $script:RestorePointVerified
+                CreatedRestorePoint = $script:CreatedRestorePoint
+            }
+            RestorePointInventory = [ordered]@{
+                TotalBefore = $script:RestorePointsBefore.Count
+                TotalAfter = $script:RestorePointsAfter.Count
+                ManagedBefore = $managedBefore.Count
+                ManagedAfter = $managedAfter.Count
+                NonManagedBefore = $nonManagedBefore.Count
+                NonManagedAfter = $nonManagedAfter.Count
+                RestorePointsBefore = New-ObjectArrayForJson -InputObject $script:RestorePointsBefore
+                RestorePointsAfter = New-ObjectArrayForJson -InputObject $script:RestorePointsAfter
+            }
+            Retention = [ordered]@{
+                CleanupSkipped = [bool]$SkipRetentionCleanup
+                DeletedCount = @($script:RetentionResults | ForEach-Object { $_ } | Where-Object { $_.Status -eq 'Deleted' }).Count
+                FailedCount = @($script:RetentionResults | ForEach-Object { $_ } | Where-Object { $_.Status -eq 'Failed' }).Count
+                Results = New-ObjectArrayForJson -InputObject $script:RetentionResults
+                NonManagedRestorePointsPreserved = $true
+            }
+        }
+
+        try {
+            Write-Log ('Elastic system-restore summary: Status={0}; ProtectionEnabled={1}; RestorePointVerified={2}; TotalBefore={3}; TotalAfter={4}; ManagedBefore={5}; ManagedAfter={6}; RetentionDeleted={7}; RetentionFailed={8}.' -f `
+                $event.Status,
+                $event.RestoreProtection.EnableCommandSucceeded,
+                $event.RestorePointCreation.Verified,
+                $event.RestorePointInventory.TotalBefore,
+                $event.RestorePointInventory.TotalAfter,
+                $event.RestorePointInventory.ManagedBefore,
+                $event.RestorePointInventory.ManagedAfter,
+                $event.Retention.DeletedCount,
+                $event.Retention.FailedCount) 'INFO'
+        }
+        catch { }
+
+        $prettyJson = $event | ConvertTo-Json -Depth 12
+        $compactJson = $event | ConvertTo-Json -Depth 12 -Compress
+
+        Write-JsonAtomically -Path $LatestTelemetryPath -Json $prettyJson
+        Write-MaintenanceTelemetryLine -Path $TelemetryPath -JsonLine $compactJson
+    }
+    catch {
+        Write-Warning ('Unable to write telemetry: {0}' -f $_.Exception.Message)
+    }
+}
+
+$windowsIdentity = $null
+
+try {
+    Invoke-SelfElevation
+    Ensure-Directory -Path $LogDirectory
+    Write-Log ('===== System Restore script v{0} started; RunId={1} =====' -f $ScriptVersion, $RunId)
+    Write-Log ('Active staged text log: {0}' -f $LogPath)
+    Write-Log ('Completed text log publish path: {0}' -f $PublishedLogPath)
+
+    if (-not (Test-IsAdministrator)) {
+        throw 'Administrative privileges are required.'
+    }
+
+    $windowsIdentity = Get-WindowsIdentity
+
+    if ($windowsIdentity.ProductType -ne 1) {
+        throw 'System Restore checkpoints are supported on Windows client operating systems, not Windows Server.'
+    }
+
+    $osDrive = Get-OperatingSystemDrive -WindowsIdentity $windowsIdentity
+    Write-Log ('Detected operating-system drive: {0}' -f $osDrive)
+
+    $script:RestorePointsBefore = @(
+        Get-AllRestorePoints | ForEach-Object { Convert-RestorePointRecord -RestorePoint $_ }
+    )
+    Write-RestorePointInventorySummary -Label 'before' -RestorePoints $script:RestorePointsBefore
+
+    Test-SystemRestorePolicy
+    Enable-SystemRestoreProtection -Drive $osDrive -InitializationWaitSeconds 20
+    Set-RestorePointCreationFrequency
+    Initialize-ShadowCopyServices
+
+    try {
+        $systemRestoreClass = Get-WmiObject -Namespace 'root\default' -List -Class 'SystemRestore' -ErrorAction Stop
+        if ($systemRestoreClass) {
+            Write-Log 'SystemRestore WMI provider is available.' 'OK'
+        }
+    }
+    catch {
+        Write-Log ('SystemRestore WMI provider pre-check failed: {0}' -f $_.Exception.Message) 'WARN'
+    }
+
+
+    [void](New-VerifiedRestorePoint `
+        -Description $RestorePointDescription `
+        -TimeoutMinutes $VerificationTimeoutMinutes)
+
+    if ($SkipRetentionCleanup) {
+        Write-Log 'Managed restore-point retention cleanup was skipped by parameter.' 'WARN'
+    }
+    else {
+        Remove-ObsoleteManagedRestorePoints `
+            -ManagedDescription $RestorePointDescription `
+            -KeepCount $MaxManagedRestorePoints
+    }
+
+    $script:RestorePointsAfter = @(
+        Get-AllRestorePoints | ForEach-Object { Convert-RestorePointRecord -RestorePoint $_ }
+    )
+    Write-RestorePointInventorySummary -Label 'after' -RestorePoints $script:RestorePointsAfter
+
+    $retentionFailures = @($script:RetentionResults | ForEach-Object { $_ } | Where-Object { $_.Status -eq 'Failed' }).Count
+    if ($retentionFailures -gt 0 -or $script:WarningCount -gt 0) {
+        $script:FinalStatus = 'SuccessWithWarnings'
+    }
+    else {
+        $script:FinalStatus = 'Success'
+    }
+
+    $script:FinalExitCode = 0
+    Write-Log 'System Restore is enabled and the new restore point was created and verified.' 'OK'
+    Write-Log ('===== System Restore script completed with status {0} =====' -f $script:FinalStatus) 'OK'
+}
+catch {
+    $script:FailureMessage = $_.Exception.Message
+    $script:FinalStatus = 'Failed'
+    $script:FinalExitCode = 1
+    Write-Log ('System Restore operation failed: {0}' -f $script:FailureMessage) 'ERROR'
+    Write-Log '===== System Restore script completed with errors =====' 'ERROR'
+}
+finally {
+    if ($script:RestorePointsAfter.Count -eq 0) {
+        $script:RestorePointsAfter = @(
+            Get-AllRestorePoints | ForEach-Object { Convert-RestorePointRecord -RestorePoint $_ }
+        )
+    }
+
+    if (-not $windowsIdentity) {
+        try { $windowsIdentity = Get-WindowsIdentity } catch { $windowsIdentity = $null }
+    }
+
+    try {
+        Write-Telemetry -WindowsIdentity $windowsIdentity
+    }
+    catch {
+        Write-Log ('Telemetry write failed: {0}' -f $_.Exception.Message) 'ERROR'
+        if ($script:FinalExitCode -eq 0) {
+            $script:FinalStatus = 'TelemetryFailure'
+            $script:FinalExitCode = 4
+        }
+    }
+
+    # Final append before the completed immutable text log enters C:\Logs.
+    Write-Log ('Finalizing {0}. Status={1}; ExitCode={2}; Warnings={3}; Errors={4}' -f `
+        $ScriptName,
+        $script:FinalStatus,
+        $script:FinalExitCode,
+        $script:WarningCount,
+        $script:ErrorCount) $(if ($script:FinalExitCode -eq 0) { 'OK' } else { 'ERROR' })
+
+    if ($null -ne $LogSession) {
+        $publishResult = Publish-MaintenanceLog -LogSession $LogSession
+
+        if ($publishResult.Published) {
+            Write-Host ("Published completed script 12 text log for Elastic: {0}" -f $PublishedLogPath) -ForegroundColor Green
+        }
+        else {
+            Write-Warning ("Script 12 completed text log remains in staging because publication failed: {0}" -f $publishResult.Path)
+        }
+    }
+}
+
+exit $script:FinalExitCode
 '@
     }
     PrinterAndPaperCut = [ordered]@{
         FileName = '11_Install_SharpDriver_And_PaperCut.ps1'
-        Sha256   = '29BA7D355D3DC79A4C3D0E3D5939B1E112464200EB85D295DBA02127E63242E4'
-        GzipBase64 = @'
-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
+        # Plain-text source is intentionally embedded for maintainability.
+        Source = @'
+<#
+.SYNOPSIS
+    Installs and maintains the SHARP printer driver, PaperCut Print Deploy client,
+    and StudentSecurePrint shared printer connection.
+
+.DESCRIPTION
+    Performs idempotent before/after validation of the SHARP driver, PaperCut
+    client, and shared printer connection. Driver package deployment is based on
+    a deterministic SHA-256 fingerprint. Structured telemetry is written for
+    Elastic ingestion while preserving a readable operational log.
+
+.VERSION
+    1.2.8
+
+.DATE
+    2026-08-17
+
+.CHANGELOG
+    1.2.8
+    - Fixes empty process-result telemetry so Processes serializes as [] instead of [null].
+    - Corrects Windows 11 product-name reporting on builds 22000+ when the legacy registry ProductName still reports Windows 10.
+    - Preserves all v1.2.7 Elastic mapping-safety changes and printer/PaperCut compliance telemetry.
+
+    1.2.7
+    - Normalizes reboot-reason collections as true JSON string arrays for stable Elastic mappings.
+    - Renames reboot reason fields to ReasonNamesBefore/ReasonNamesAfter to avoid collisions with older generic reboot fields.
+    - Normalizes process-result telemetry as a true JSON array when empty.
+    - Preserves the existing maintenance.printerDeployment namespace and all v1.2.6 compliance/remediation fields.
+
+    1.2.6
+    - Replaced mapping-conflicting ChangedComponents telemetry with stable boolean Changes.Driver/PaperCut/PrinterConnection fields.
+    - Preserves all v1.2.5 remediation and before/after telemetry.
+
+    1.2.5
+    - Preserves immutable pre-remediation snapshots for SHARP, PaperCut, and printer connection telemetry.
+    - Adds explicit remediation Required/Attempted/Succeeded/ExitCode/FailureMessage fields.
+    - InstallRequired and InstalledThisRun are calculated from immutable before/after snapshots at telemetry time.
+
+    1.2.4
+    - Fixed strict-mode failure when Win32_PrinterDriver does not expose DriverVersion.
+    - Printer-driver version collection now safely checks Version/DriverVersion and the actual driver file version.
+
+    1.2.3
+    - Added explicit DriverInstallRequired/DriverInstalledThisRun and PaperCutInstallRequired/PaperCutInstalledThisRun telemetry.
+    - Added retry/fallback SHARP printer-driver verification after Add-PrinterDriver.
+    - Normalized generic-list telemetry collections for Windows PowerShell 5.1.
+
+    1.2.2
+    - Added Maintenance.Framework v2.4 staged text logging.
+    - Completed text logs are published into C:\Logs only after telemetry finishes.
+    - Previous script 11 text logs are archived under C:\Logs\Old Logs.
+
+    1.2.1
+    - Added Elastic-friendly computer and normalized severity fields to text logs.
+    - Added readable before/after SHARP driver, PaperCut, and printer summaries.
+    - Added detailed installed printer-driver version and file metadata.
+    - Added PaperCut source-MSI product metadata when the package is available.
+
+    1.2.0
+    - Added common maintenance execution telemetry and latest-state JSON.
+    - Added before/after compliance verification for driver, PaperCut, and printer.
+    - Added external-process timeouts and captured exit codes/durations.
+    - Reordered source validation so an unavailable share does not block unrelated
+      validation when the corresponding component is already compliant.
+    - Added PaperCut post-install verification and MSI product details.
+    - Added driver package, printer connection, reboot, and Windows build telemetry.
+    - Added meaningful final statuses and exit codes.
+    - Added atomic deployment-state writes and damaged-state backup handling.
+
+.NOTES
+    Designed for elevated 64-bit Windows PowerShell 5.1 and SYSTEM scheduled tasks.
+#>
+
+[CmdletBinding()]
+param(
+    [ValidateRange(60, 7200)]
+    [int]$DriverInstallTimeoutSeconds = 900,
+
+    [ValidateRange(60, 7200)]
+    [int]$PaperCutInstallTimeoutSeconds = 900,
+
+    [ValidateRange(1, 120)]
+    [int]$PrinterVerificationDelaySeconds = 5
+)
+
+Set-StrictMode -Version 2.0
+$ErrorActionPreference = 'Stop'
+
+# =========================
+# Configuration
+# =========================
+$ScriptName = '11_Install_SharpDriver_And_PaperCut.ps1'
+$ScriptVersion = '1.2.8'
+$DriverSourcePath = '\\papercut\Printer Drivers\MFP\win\SH_D31_PCL6_PS_2410a_EnglishUS_64bit'
+$PrinterDriverName = 'Sharp BP-70C31 PCL6'
+$PaperCutMsiPath = '\\papercut\Print Deploy Clients\win\pc-print-deploy-client[10.2.3.44].msi'
+$PrinterSharePath = '\\papercut\StudentSecurePrint'
+$LocalDriverStage = 'C:\ProgramData\Compton\Drivers\Sharp'
+$StateDirectory = 'C:\ProgramData\Compton\State'
+$StatePath = Join-Path $StateDirectory 'SharpDriver-PaperCut-State.json'
+$LogDirectory = 'C:\Logs'
+$LogPath = $null
+$PublishedLogPath = $null
+$LogSession = $null
+$TelemetryPath = Join-Path $LogDirectory 'Maintenance-Telemetry.ndjson'
+$LatestTelemetryPath = Join-Path $LogDirectory '11_Install_SharpDriver_And_PaperCut.latest.json'
+
+$script:RunId = [guid]::NewGuid().Guid
+$script:StartTime = Get-Date
+$script:WarningCount = 0
+$script:ErrorCount = 0
+$script:RebootRequired = $false
+$script:FailureMessage = $null
+$script:ChangedComponents = New-Object System.Collections.Generic.List[string]
+$script:ProcessResults = New-Object System.Collections.Generic.List[object]
+$script:DriverInstallRequired = $false
+$script:DriverInstalledThisRun = $false
+$script:PaperCutInstallRequired = $false
+$script:PaperCutInstalledThisRun = $false
+$script:DriverRemediationAttempted = $false
+$script:DriverRemediationSucceeded = $false
+$script:DriverRemediationExitCode = $null
+$script:DriverRemediationFailureMessage = $null
+$script:PaperCutRemediationAttempted = $false
+$script:PaperCutRemediationSucceeded = $false
+$script:PaperCutRemediationExitCode = $null
+$script:PaperCutRemediationFailureMessage = $null
+
+
+
+# Load the shared framework from the same directory as this script.
+$MaintenanceFrameworkPath = 'C:\Scripts\Maintenance.Framework.psm1'
+Import-Module -Name $MaintenanceFrameworkPath -Force -ErrorAction Stop
+$MaintenanceConfig = Initialize-MaintenanceEnvironment -ScriptRoot 'C:\Scripts' -LogRoot $LogDirectory
+
+$requiredFrameworkVersion = [version]'2.4.0'
+$currentFrameworkVersion = [version](Get-MaintenanceFrameworkVersion)
+
+if ($currentFrameworkVersion -lt $requiredFrameworkVersion) {
+    throw "Script 11 requires Maintenance.Framework.psm1 version $requiredFrameworkVersion or newer. Installed version: $currentFrameworkVersion"
+}
+
+Archive-MaintenanceLogs `
+    -ScriptName $ScriptName `
+    -LogRoot $LogDirectory `
+    -AdditionalPatterns @(
+        'Install-SharpDriver-And-PaperCut.log',
+        '11_Install_SharpDriver_And_PaperCut.log',
+        '*-11_Install_SharpDriver_And_PaperCut-*.log'
+    ) | Out-Null
+
+$LogSession = New-MaintenanceStagedLog `
+    -ScriptName $ScriptName `
+    -LogRoot $LogDirectory `
+    -StagingRoot $MaintenanceConfig.LogStagingRoot `
+    -ComputerName $env:COMPUTERNAME `
+    -Timestamp $script:StartTime
+
+$LogPath = [string]$LogSession.WorkingPath
+$PublishedLogPath = [string]$LogSession.PublishedPath
+
+function Write-Log {
+    param(
+        [Parameter(Mandatory)][string]$Message,
+        [ValidateSet('INFO','ACTION','WARN','ERROR','SUCCESS')][string]$Level = 'INFO'
+    )
+    if ($Level -eq 'WARN') { $script:WarningCount++ }
+    if ($Level -eq 'ERROR') { $script:ErrorCount++ }
+    $timestamp = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
+    $computerName = if ($env:COMPUTERNAME) { $env:COMPUTERNAME } else { 'UNKNOWN' }
+    $normalizedLevel = if ($Level -eq 'WARN') { 'WARNING' } else { $Level }
+    $line = '{0} [{1}] [{2}] {3}' -f $timestamp, $computerName, $normalizedLevel, $Message
+    $color = switch ($Level) {
+        'ACTION' { 'Yellow' }
+        'SUCCESS' { 'Green' }
+        'WARN' { 'DarkYellow' }
+        'ERROR' { 'Red' }
+        default { 'White' }
+    }
+    Write-Host $line -ForegroundColor $color
+    try {
+        $activeLogDirectory = Split-Path -Parent $LogPath
+        if (-not (Test-Path -LiteralPath $activeLogDirectory -PathType Container)) {
+            New-Item -Path $activeLogDirectory -ItemType Directory -Force | Out-Null
+        }
+        Add-Content -LiteralPath $LogPath -Value $line -Encoding UTF8
+    }
+    catch { }
+}
+
+function Write-Banner {
+    $border = '=' * 72
+    Write-Host ''
+    Write-Host $border -ForegroundColor Cyan
+    Write-Host '     SHARP Driver and PaperCut Print Deploy Maintenance' -ForegroundColor Cyan
+    Write-Host $border -ForegroundColor Cyan
+    Write-Host ''
+}
+
+function Test-IsAdministrator {
+    $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+    $principal = New-Object Security.Principal.WindowsPrincipal($identity)
+    return $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+}
+
+function Test-IsSystemAccount {
+    try { return ([Security.Principal.WindowsIdentity]::GetCurrent().User.Value -eq 'S-1-5-18') }
+    catch { return $false }
+}
+
+function Get-WindowsInfo {
+    try {
+        $cv = Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion' -ErrorAction Stop
+
+        $productName = [string]$cv.ProductName
+        $currentBuild = [string]$cv.CurrentBuild
+        $buildNumber = 0
+        [void][int]::TryParse($currentBuild, [ref]$buildNumber)
+
+        # Windows 11 can retain a legacy "Windows 10" ProductName in this registry key.
+        # Build 22000 and later are Windows 11 client builds, so normalize the display name.
+        if ($buildNumber -ge 22000 -and $productName -match '^Windows 10') {
+            $productName = $productName -replace '^Windows 10', 'Windows 11'
+        }
+
+        [ordered]@{
+            ProductName = $productName
+            EditionID = [string]$cv.EditionID
+            DisplayVersion = [string]$cv.DisplayVersion
+            CurrentBuild = $currentBuild
+            UBR = [int]$cv.UBR
+            FullBuild = '{0}.{1}' -f $currentBuild, $cv.UBR
+        }
+    }
+    catch { [ordered]@{} }
+}
+
+function Get-PendingRebootState {
+    $reasons = New-Object System.Collections.Generic.List[string]
+    if (Test-Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending') { $reasons.Add('ComponentBasedServicing') }
+    if (Test-Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired') { $reasons.Add('WindowsUpdate') }
+    try {
+        $session = Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager' -ErrorAction Stop
+        if ($session.PendingFileRenameOperations) { $reasons.Add('PendingFileRenameOperations') }
+    } catch { }
+    [pscustomobject]@{ Pending = ($reasons.Count -gt 0); Reasons = @($reasons) }
+}
+
+function Invoke-ExternalProcess {
+    param(
+        [Parameter(Mandatory)][string]$FilePath,
+        [Parameter(Mandatory)][string[]]$ArgumentList,
+        [int[]]$SuccessExitCodes = @(0),
+        [ValidateRange(1,7200)][int]$TimeoutSeconds = 900,
+        [Parameter(Mandatory)][string]$Operation
+    )
+    Write-Log ("Running {0}: {1} {2}" -f $Operation, $FilePath, ($ArgumentList -join ' ')) 'ACTION'
+    $started = Get-Date
+    $process = Start-Process -FilePath $FilePath -ArgumentList $ArgumentList -PassThru -WindowStyle Hidden
+    $completed = $process.WaitForExit($TimeoutSeconds * 1000)
+    if (-not $completed) {
+        try { $process.Kill() } catch { }
+        $duration = [math]::Round(((Get-Date) - $started).TotalSeconds, 2)
+        $result = [pscustomobject]@{ Operation=$Operation; FilePath=$FilePath; ExitCode=$null; DurationSeconds=$duration; TimedOut=$true; Succeeded=$false }
+        $script:ProcessResults.Add($result)
+        throw "$Operation timed out after $TimeoutSeconds seconds."
+    }
+    $process.Refresh()
+    $duration = [math]::Round(((Get-Date) - $started).TotalSeconds, 2)
+    $exitCode = [int]$process.ExitCode
+    $succeeded = ($exitCode -in $SuccessExitCodes)
+    $result = [pscustomobject]@{ Operation=$Operation; FilePath=$FilePath; ExitCode=$exitCode; DurationSeconds=$duration; TimedOut=$false; Succeeded=$succeeded }
+    $script:ProcessResults.Add($result)
+    Write-Log ("{0} exit code: {1}; duration: {2}s" -f $Operation, $exitCode, $duration)
+    if (-not $succeeded) { throw "$Operation failed with exit code $exitCode." }
+    return $exitCode
+}
+
+function Get-PrinterInfFiles {
+    param([Parameter(Mandatory)][string]$Path)
+    $allInfFiles = @(Get-ChildItem -LiteralPath $Path -Filter '*.inf' -File -Recurse -ErrorAction Stop)
+    if ($allInfFiles.Count -eq 0) { throw "No INF files were found under: $Path" }
+    $printerInfFiles = foreach ($inf in $allInfFiles) {
+        $content = Get-Content -LiteralPath $inf.FullName -ErrorAction SilentlyContinue
+        if ($content -match '^\s*Class\s*=\s*Printer\s*$') { $inf }
+    }
+    if (@($printerInfFiles).Count -gt 0) { return @($printerInfFiles) }
+    Write-Log 'No INF explicitly declared Class=Printer; all INF files will be staged.' 'WARN'
+    return $allInfFiles
+}
+
+function Get-DriverPackageFingerprint {
+    param([Parameter(Mandatory)][string]$Path)
+    $files = @(Get-ChildItem -LiteralPath $Path -File -Recurse -ErrorAction Stop | Sort-Object FullName)
+    if ($files.Count -eq 0) { throw "No files were found in the driver source package: $Path" }
+    $root = $Path.TrimEnd('\')
+    $manifestLines = foreach ($file in $files) {
+        $relativePath = $file.FullName.Substring($root.Length).TrimStart('\')
+        $hash = Get-FileHash -LiteralPath $file.FullName -Algorithm SHA256 -ErrorAction Stop
+        '{0}|{1}|{2}' -f $relativePath.ToLowerInvariant(), $file.Length, $hash.Hash
+    }
+    $sha256 = [Security.Cryptography.SHA256]::Create()
+    try {
+        $bytes = [Text.Encoding]::UTF8.GetBytes(($manifestLines -join "`n"))
+        return ([BitConverter]::ToString($sha256.ComputeHash($bytes))).Replace('-','')
+    }
+    finally { $sha256.Dispose() }
+}
+
+function Get-DeploymentState {
+    if (-not (Test-Path -LiteralPath $StatePath -PathType Leaf)) { return $null }
+    try { return (Get-Content -LiteralPath $StatePath -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop) }
+    catch {
+        $backup = "$StatePath.corrupt.$(Get-Date -Format 'yyyyMMddHHmmss')"
+        try { Move-Item -LiteralPath $StatePath -Destination $backup -Force -ErrorAction Stop } catch { }
+        Write-Log "Deployment state was invalid and has been backed up: $backup" 'WARN'
+        return $null
+    }
+}
+
+function Save-DeploymentState {
+    param([Parameter(Mandatory)][string]$Fingerprint)
+    New-Item -Path $StateDirectory -ItemType Directory -Force | Out-Null
+    $state = [ordered]@{
+        DriverName=$PrinterDriverName
+        SourcePath=$DriverSourcePath
+        SourceFingerprintSHA256=$Fingerprint
+        LastSuccessfulUpdate=(Get-Date).ToUniversalTime().ToString('o')
+        ComputerName=$env:COMPUTERNAME
+        ScriptVersion=$ScriptVersion
+    }
+    $temp = "$StatePath.tmp"
+    $state | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $temp -Encoding UTF8 -Force
+    Move-Item -LiteralPath $temp -Destination $StatePath -Force
+}
+
+function Convert-PrinterDriverVersion {
+    param($DriverVersion)
+
+    if ($null -eq $DriverVersion) { return $null }
+    try {
+        $value = [uint64]$DriverVersion
+        return '{0}.{1}.{2}.{3}' -f `
+            (($value -shr 48) -band 0xFFFF), `
+            (($value -shr 32) -band 0xFFFF), `
+            (($value -shr 16) -band 0xFFFF), `
+            ($value -band 0xFFFF)
+    }
+    catch { return [string]$DriverVersion }
+}
+
+function Get-SafePropertyValue {
+    [CmdletBinding()]
+    param(
+        [AllowNull()]$InputObject,
+        [Parameter(Mandatory)][string[]]$PropertyNames
+    )
+
+    if ($null -eq $InputObject) {
+        return $null
+    }
+
+    foreach ($propertyName in $PropertyNames) {
+        $property = $InputObject.PSObject.Properties[$propertyName]
+        if ($null -ne $property) {
+            try {
+                $value = $property.Value
+                if ($null -ne $value -and -not [string]::IsNullOrWhiteSpace([string]$value)) {
+                    return $value
+                }
+            }
+            catch { }
+        }
+    }
+
+    return $null
+}
+
+function Get-InstalledPrinterDriverState {
+    [CmdletBinding()]
+    param(
+        [int]$RetryCount = 1,
+        [int]$RetryDelaySeconds = 0
+    )
+
+    $driver = $null
+    $cimDriver = $null
+
+    for ($attempt = 1; $attempt -le $RetryCount; $attempt++) {
+        try {
+            $driver = Get-PrinterDriver -Name $PrinterDriverName -ErrorAction SilentlyContinue
+
+            if (-not $driver) {
+                # Some SHARP packages register a slightly different display name.
+                # Fall back to a constrained BP-70C31/PCL6 match rather than
+                # declaring the deployment failed immediately.
+                $driver = Get-PrinterDriver -ErrorAction SilentlyContinue |
+                    Where-Object {
+                        $_.Name -match '(?i)\bBP-70C31\b' -and
+                        $_.Name -match '(?i)\bPCL6\b'
+                    } |
+                    Select-Object -First 1
+            }
+
+            $cimDriver = Get-CimInstance -ClassName Win32_PrinterDriver -ErrorAction SilentlyContinue |
+                Where-Object {
+                    $_.Name -eq $PrinterDriverName -or
+                    $_.Name -like "$PrinterDriverName,*" -or
+                    ($_.Name -match '(?i)\bBP-70C31\b' -and $_.Name -match '(?i)\bPCL6\b')
+                } |
+                Select-Object -First 1
+
+            if ($driver -or $cimDriver) {
+                break
+            }
+        }
+        catch {
+            # Retry below.
+        }
+
+        if ($attempt -lt $RetryCount -and $RetryDelaySeconds -gt 0) {
+            Start-Sleep -Seconds $RetryDelaySeconds
+        }
+    }
+
+    if (-not $driver -and -not $cimDriver) {
+        return [pscustomobject][ordered]@{
+            Installed        = $false
+            Name             = $PrinterDriverName
+            Manufacturer     = $null
+            Version          = $null
+            DriverVersionRaw = $null
+            InfPath          = $null
+            DriverPath       = $null
+            ConfigFile       = $null
+            DataFile         = $null
+            MajorVersion     = $null
+        }
+    }
+
+    $cimDriverPath = Get-SafePropertyValue -InputObject $cimDriver -PropertyNames @('DriverPath')
+    $cimVersionRaw = Get-SafePropertyValue -InputObject $cimDriver -PropertyNames @('DriverVersion','Version')
+    $driverFileVersion = $null
+
+    if ($cimDriverPath -and (Test-Path -LiteralPath ([string]$cimDriverPath) -PathType Leaf)) {
+        try {
+            $driverFileVersion = [Diagnostics.FileVersionInfo]::GetVersionInfo([string]$cimDriverPath).FileVersion
+        }
+        catch { }
+    }
+
+    $driverName = Get-SafePropertyValue -InputObject $driver -PropertyNames @('Name')
+    $cimName = Get-SafePropertyValue -InputObject $cimDriver -PropertyNames @('Name')
+    $manufacturer = Get-SafePropertyValue -InputObject $driver -PropertyNames @('Manufacturer','ProviderName')
+    $infPath = Get-SafePropertyValue -InputObject $driver -PropertyNames @('InfPath','InfName')
+    $majorVersion = Get-SafePropertyValue -InputObject $driver -PropertyNames @('MajorVersion')
+    $configFile = Get-SafePropertyValue -InputObject $cimDriver -PropertyNames @('ConfigFile')
+    $dataFile = Get-SafePropertyValue -InputObject $cimDriver -PropertyNames @('DataFile')
+
+    $normalizedVersion = $null
+    if ($driverFileVersion) {
+        $normalizedVersion = [string]$driverFileVersion
+    }
+    elseif ($null -ne $cimVersionRaw) {
+        # Win32_PrinterDriver commonly exposes Version rather than DriverVersion.
+        # If it is a large packed integer, decode it; otherwise retain the string.
+        try {
+            $numericVersion = [uint64]$cimVersionRaw
+            if ($numericVersion -gt 65535) {
+                $normalizedVersion = Convert-PrinterDriverVersion -DriverVersion $numericVersion
+            }
+            else {
+                $normalizedVersion = [string]$cimVersionRaw
+            }
+        }
+        catch {
+            $normalizedVersion = [string]$cimVersionRaw
+        }
+    }
+
+    [pscustomobject][ordered]@{
+        Installed        = $true
+        Name             = if ($driverName) { [string]$driverName } elseif ($cimName) { [string]$cimName } else { $PrinterDriverName }
+        Manufacturer     = if ($manufacturer) { [string]$manufacturer } else { $null }
+        Version          = $normalizedVersion
+        DriverVersionRaw = if ($null -ne $cimVersionRaw) { [string]$cimVersionRaw } else { $null }
+        InfPath          = if ($infPath) { [string]$infPath } else { $null }
+        DriverPath       = if ($cimDriverPath) { [string]$cimDriverPath } else { $null }
+        ConfigFile       = if ($configFile) { [string]$configFile } else { $null }
+        DataFile         = if ($dataFile) { [string]$dataFile } else { $null }
+        MajorVersion     = $majorVersion
+    }
+}
+
+
+function Get-MsiPackageInfo {
+    param([Parameter(Mandatory)][string]$Path)
+
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { return $null }
+    try {
+        $installer = New-Object -ComObject WindowsInstaller.Installer
+        $database = $installer.GetType().InvokeMember('OpenDatabase', 'InvokeMethod', $null, $installer, @($Path, 0))
+        $properties = [ordered]@{}
+        foreach ($propertyName in @('ProductName','ProductVersion','ProductCode','Manufacturer')) {
+            $query = "SELECT `Value` FROM `Property` WHERE `Property`='$propertyName'"
+            $view = $database.GetType().InvokeMember('OpenView', 'InvokeMethod', $null, $database, @($query))
+            $view.GetType().InvokeMember('Execute', 'InvokeMethod', $null, $view, $null) | Out-Null
+            $record = $view.GetType().InvokeMember('Fetch', 'InvokeMethod', $null, $view, $null)
+            $properties[$propertyName] = if ($record) { [string]$record.StringData(1) } else { $null }
+            $view.GetType().InvokeMember('Close', 'InvokeMethod', $null, $view, $null) | Out-Null
+        }
+        return [pscustomobject]$properties
+    }
+    catch {
+        Write-Log "Could not read PaperCut MSI metadata: $($_.Exception.Message)" 'WARN'
+        return $null
+    }
+}
+
+function Write-DeploymentStateSummary {
+    param(
+        [Parameter(Mandatory)][string]$Label,
+        $Driver,
+        $PaperCut,
+        $Printer
+    )
+
+    Write-Log ("Driver {0}: Installed={1}; Name={2}; Version={3}; Manufacturer={4}; INF={5}." -f `
+        $Label, $Driver.Installed, $Driver.Name, $Driver.Version, $Driver.Manufacturer, $Driver.InfPath)
+    Write-Log ("PaperCut {0}: Installed={1}; Name={2}; Version={3}; ProductCode={4}; InstallLocation={5}." -f `
+        $Label, $PaperCut.Installed, $PaperCut.DisplayName, $PaperCut.DisplayVersion, $PaperCut.ProductCode, $PaperCut.InstallLocation)
+    Write-Log ("Printer connection {0}: Connected={1}; Scope={2}; Share={3}." -f `
+        $Label, $Printer.Connected, $Printer.Scope, $Printer.Name)
+}
+
+function Get-PaperCutProduct {
+    $roots = @('HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*','HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*')
+    $product = Get-ItemProperty -Path $roots -ErrorAction SilentlyContinue | Where-Object {
+        $p = $_.PSObject.Properties['DisplayName']
+        $null -ne $p -and -not [string]::IsNullOrWhiteSpace([string]$p.Value) -and [string]$p.Value -match 'PaperCut.*Print Deploy|Print Deploy Client'
+    } | Select-Object -First 1
+    if (-not $product) { return [pscustomobject]@{ Installed=$false; DisplayName=$null; DisplayVersion=$null; ProductCode=$null; InstallLocation=$null } }
+    $version = $product.PSObject.Properties['DisplayVersion']
+    [pscustomobject]@{
+        Installed=$true
+        DisplayName=[string]$product.DisplayName
+        DisplayVersion=if ($version) { [string]$version.Value } else { $null }
+        ProductCode=[string]$product.PSChildName
+        InstallLocation=[string]$product.InstallLocation
+    }
+}
+
+function Test-PerMachinePrinterConnection {
+    param([Parameter(Mandatory)][string]$ConnectionPath)
+    $connectionsPath = 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Print\Connections'
+    if (-not (Test-Path -LiteralPath $connectionsPath)) { return $false }
+    $parts = $ConnectionPath.TrimStart('\') -split '\\',2
+    if ($parts.Count -ne 2) { return $false }
+    $expected = ',,' + $parts[0] + ',' + $parts[1]
+    return $null -ne (Get-ChildItem -LiteralPath $connectionsPath -ErrorAction SilentlyContinue | Where-Object { $_.PSChildName -ieq $expected } | Select-Object -First 1)
+}
+
+function Get-PrinterConnectionState {
+    param([Parameter(Mandatory)][string]$ConnectionPath)
+    if (Test-IsSystemAccount) {
+        return [pscustomobject]@{ Scope='PerMachine'; Connected=(Test-PerMachinePrinterConnection -ConnectionPath $ConnectionPath); Name=$ConnectionPath }
+    }
+    $parts = $ConnectionPath.TrimStart('\') -split '\\',2
+    $server = if ($parts.Count -eq 2) { $parts[0] } else { $null }
+    $share = if ($parts.Count -eq 2) { $parts[1] } else { $null }
+    $existing = Get-Printer -ErrorAction SilentlyContinue | Where-Object { $_.Name -eq $ConnectionPath -or ($_.ComputerName -ieq $server -and $_.ShareName -ieq $share) } | Select-Object -First 1
+    [pscustomobject]@{ Scope='CurrentUser'; Connected=($null -ne $existing); Name=$ConnectionPath }
+}
+
+function Ensure-SharedPrinterConnection {
+    param([Parameter(Mandatory)][string]$ConnectionPath)
+    $before = Get-PrinterConnectionState -ConnectionPath $ConnectionPath
+    if ($before.Connected) {
+        Write-Log "Printer connection is already configured: $ConnectionPath" 'SUCCESS'
+        return $before
+    }
+    if (Test-IsSystemAccount) {
+        Invoke-ExternalProcess -FilePath "$env:SystemRoot\System32\rundll32.exe" -ArgumentList @('printui.dll,PrintUIEntry','/ga',"/n`"$ConnectionPath`"") -SuccessExitCodes @(0) -TimeoutSeconds 120 -Operation 'Create per-machine printer connection' | Out-Null
+    }
+    else {
+        try { Add-Printer -ConnectionName $ConnectionPath -ErrorAction Stop }
+        catch {
+            Write-Log "Add-Printer failed; using PrintUIEntry fallback. $($_.Exception.Message)" 'WARN'
+            Invoke-ExternalProcess -FilePath "$env:SystemRoot\System32\rundll32.exe" -ArgumentList @('printui.dll,PrintUIEntry','/in',"/n`"$ConnectionPath`"") -SuccessExitCodes @(0) -TimeoutSeconds 120 -Operation 'Create current-user printer connection' | Out-Null
+        }
+    }
+    Start-Sleep -Seconds $PrinterVerificationDelaySeconds
+    $after = Get-PrinterConnectionState -ConnectionPath $ConnectionPath
+    if (-not $after.Connected) { throw "Printer connection could not be verified: $ConnectionPath" }
+    $script:ChangedComponents.Add('PrinterConnection')
+    Write-Log "Printer connection created successfully: $ConnectionPath" 'SUCCESS'
+    return $after
+}
+
+function Copy-TelemetrySnapshot {
+    [CmdletBinding()]
+    param([AllowNull()]$InputObject)
+
+    if ($null -eq $InputObject) {
+        return $null
+    }
+
+    # JSON round-trip deliberately creates a detached snapshot so later
+    # remediation-state changes cannot alter the original "Before" object.
+    return ($InputObject | ConvertTo-Json -Depth 10 | ConvertFrom-Json)
+}
+
+function Convert-ListToArray {
+    [CmdletBinding()]
+    param([AllowNull()]$InputObject)
+
+    if ($null -eq $InputObject) {
+        return @()
+    }
+
+    $result = @()
+    foreach ($item in $InputObject) {
+        $result += $item
+    }
+
+    return @($result)
+}
+
+
+function New-StringArrayForJson {
+    [CmdletBinding()]
+    param([AllowNull()]$InputObject)
+
+    [string[]]$items = @(
+        $InputObject |
+        ForEach-Object { [string]$_ } |
+        Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+    )
+
+    if ($items.Count -eq 0) {
+        return ,([object[]]@())
+    }
+
+    return ,([object[]]$items)
+}
+
+function New-ObjectArrayForJson {
+    [CmdletBinding()]
+    param([AllowNull()]$InputObject)
+
+    [object[]]$items = @(
+        $InputObject |
+        ForEach-Object { $_ }
+    )
+
+    if ($items.Count -eq 0) {
+        return ,([object[]]@())
+    }
+
+    return ,([object[]]$items)
+}
+
+function Write-Telemetry {
+    param(
+        [Parameter(Mandatory)][string]$Status,
+        [Parameter(Mandatory)][int]$ExitCode,
+        [Parameter(Mandatory)]$DriverBefore,
+        [Parameter(Mandatory)]$DriverAfter,
+        [Parameter(Mandatory)]$PaperCutBefore,
+        [Parameter(Mandatory)]$PaperCutAfter,
+        [Parameter(Mandatory)]$PrinterBefore,
+        [Parameter(Mandatory)]$PrinterAfter,
+        $DriverSourceAvailable,
+        $PaperCutSourceAvailable,
+        $SourceFingerprint,
+        $StoredFingerprint,
+        $PaperCutSourceMsiInfo,
+        [Parameter(Mandatory)]$PendingRebootBefore,
+        [Parameter(Mandatory)]$PendingRebootAfter
+    )
+    $end = Get-Date
+
+    $driverWasMissing = -not [bool]$DriverBefore.Installed
+    $driverIsInstalled = [bool]$DriverAfter.Installed
+    $paperCutWasMissing = -not [bool]$PaperCutBefore.Installed
+    $paperCutIsInstalled = [bool]$PaperCutAfter.Installed
+
+    # Derive these reporting fields from the preserved snapshots instead of
+    # trusting mutable run flags.
+    $driverInstallRequired = $driverWasMissing
+    $driverInstalledThisRun = ($driverWasMissing -and $driverIsInstalled -and $script:DriverRemediationAttempted)
+    $paperCutInstallRequired = $paperCutWasMissing
+    $paperCutInstalledThisRun = ($paperCutWasMissing -and $paperCutIsInstalled -and $script:PaperCutRemediationAttempted)
+
+    $event = [ordered]@{
+        event = [ordered]@{ kind='event'; category=@('configuration','package'); type=@('info'); action='maintenance.execution'; outcome=if ($ExitCode -eq 0 -or $ExitCode -eq 3010) {'success'} else {'failure'} }
+        maintenance = [ordered]@{
+            execution = [ordered]@{
+                ComputerName=$env:COMPUTERNAME
+                Domain=$env:USERDOMAIN
+                ScriptName=$ScriptName
+                ScriptVersion=$ScriptVersion
+                RunID=$script:RunId
+                Status=$Status
+                ExitCode=$ExitCode
+                StartTime=$script:StartTime.ToUniversalTime().ToString('o')
+                EndTime=$end.ToUniversalTime().ToString('o')
+                DurationSeconds=[math]::Round(($end-$script:StartTime).TotalSeconds,2)
+                WarningCount=$script:WarningCount
+                ErrorCount=$script:ErrorCount
+                FailureMessage=$script:FailureMessage
+                TextLogPath=$PublishedLogPath
+                RunAsSystem=(Test-IsSystemAccount)
+                UserName=[Security.Principal.WindowsIdentity]::GetCurrent().Name
+            }
+            printerDeployment = [ordered]@{
+                OverallCompliant=($DriverAfter.Installed -and $PaperCutAfter.Installed -and $PrinterAfter.Connected)
+                Changes=[ordered]@{
+                Driver=[bool]($script:ChangedComponents -contains 'PrinterDriver')
+                PaperCut=[bool]($script:ChangedComponents -contains 'PaperCut')
+                PrinterConnection=[bool]($script:ChangedComponents -contains 'PrinterConnection')
+            }
+                Driver=[ordered]@{
+                    Name=$PrinterDriverName
+                    InstallRequired=[bool]$driverInstallRequired
+                    InstalledThisRun=[bool]$driverInstalledThisRun
+                    Before=$DriverBefore
+                    After=$DriverAfter
+                    Remediation=[ordered]@{
+                        Required=[bool]$driverInstallRequired
+                        Attempted=[bool]$script:DriverRemediationAttempted
+                        Succeeded=[bool]$script:DriverRemediationSucceeded
+                        ExitCode=$script:DriverRemediationExitCode
+                        FailureMessage=$script:DriverRemediationFailureMessage
+                    }
+                    SourceAvailable=$DriverSourceAvailable
+                    SourcePath=$DriverSourcePath
+                    SourceFingerprintSHA256=$SourceFingerprint
+                    StoredFingerprintSHA256=$StoredFingerprint
+                    StatePath=$StatePath
+                }
+                PaperCut=[ordered]@{
+                    InstallRequired=[bool]$paperCutInstallRequired
+                    InstalledThisRun=[bool]$paperCutInstalledThisRun
+                    Before=$PaperCutBefore
+                    After=$PaperCutAfter
+                    Remediation=[ordered]@{
+                        Required=[bool]$paperCutInstallRequired
+                        Attempted=[bool]$script:PaperCutRemediationAttempted
+                        Succeeded=[bool]$script:PaperCutRemediationSucceeded
+                        ExitCode=$script:PaperCutRemediationExitCode
+                        FailureMessage=$script:PaperCutRemediationFailureMessage
+                    }
+                    SourceAvailable=$PaperCutSourceAvailable
+                    MsiPath=$PaperCutMsiPath
+                    SourceMsi=$PaperCutSourceMsiInfo
+                }
+                PrinterConnection=[ordered]@{ SharePath=$PrinterSharePath; Before=$PrinterBefore; After=$PrinterAfter }
+                Processes=if ($script:ProcessResults.Count -gt 0) {
+                    [object[]]@($script:ProcessResults.ToArray())
+                }
+                else {
+                    [object[]]@()
+                }
+                Reboot=[ordered]@{
+                    Required=[bool]$script:RebootRequired
+                    PendingBefore=[bool]$PendingRebootBefore.Pending
+                    ReasonNamesBefore=(New-StringArrayForJson -InputObject $PendingRebootBefore.Reasons)
+                    PendingAfter=[bool]$PendingRebootAfter.Pending
+                    ReasonNamesAfter=(New-StringArrayForJson -InputObject $PendingRebootAfter.Reasons)
+                }
+                Windows=(Get-WindowsInfo)
+            }
+        }
+        '@timestamp'=$end.ToUniversalTime().ToString('o')
+    }
+    New-Item -Path $LogDirectory -ItemType Directory -Force | Out-Null
+    try {
+        $pd = $event.maintenance.printerDeployment
+        Write-Log ("Elastic printer-deployment summary: OverallCompliant={0}; DriverChanged={1}; PaperCutChanged={2}; PrinterChanged={3}; RebootRequired={4}; RebootReasonsBefore={5}; RebootReasonsAfter={6}" -f `
+            $pd.OverallCompliant,
+            $pd.Changes.Driver,
+            $pd.Changes.PaperCut,
+            $pd.Changes.PrinterConnection,
+            $pd.Reboot.Required,
+            (@($pd.Reboot.ReasonNamesBefore) -join ', '),
+            (@($pd.Reboot.ReasonNamesAfter) -join ', ')) 'INFO'
+    }
+    catch { }
+
+    $compact = $event | ConvertTo-Json -Depth 12 -Compress
+    Write-MaintenanceTelemetryLine -Path $TelemetryPath -JsonLine $compact
+    $event | ConvertTo-Json -Depth 12 | Set-Content -LiteralPath $LatestTelemetryPath -Encoding UTF8 -Force
+}
+
+# =========================
+# Main
+# =========================
+New-Item -Path $LogDirectory -ItemType Directory -Force | Out-Null
+Write-Banner
+Write-Log "Starting $ScriptName version $ScriptVersion."
+Write-Log "Text log: $LogPath"
+
+$driverBefore = [pscustomobject]@{ Installed=$false; Name=$PrinterDriverName; Manufacturer=$null; Version=$null; DriverVersionRaw=$null; InfPath=$null; DriverPath=$null; ConfigFile=$null; DataFile=$null; MajorVersion=$null }
+$driverAfter = $driverBefore
+$paperCutBefore = [pscustomobject]@{ Installed=$false; DisplayName=$null; DisplayVersion=$null; ProductCode=$null; InstallLocation=$null }
+$paperCutAfter = $paperCutBefore
+$printerBefore = [pscustomobject]@{ Scope='Unknown'; Connected=$false; Name=$PrinterSharePath }
+$printerAfter = $printerBefore
+$sourceFingerprint = $null
+$storedFingerprint = $null
+$driverSourceAvailable = $false
+$paperCutSourceAvailable = $false
+$paperCutSourceMsiInfo = $null
+$pendingBefore = Get-PendingRebootState
+$pendingAfter = $pendingBefore
+$finalStatus = 'Failed'
+$finalExitCode = 1
+
+try {
+    if (-not (Test-IsAdministrator)) { throw 'This script must be run as an administrator.' }
+    if ([string]::IsNullOrWhiteSpace($PrinterDriverName) -or $PrinterDriverName -like 'CHANGE ME*') { throw 'PrinterDriverName is not configured.' }
+    Import-Module PrintManagement -ErrorAction Stop
+
+    $driverBefore = Copy-TelemetrySnapshot -InputObject (Get-InstalledPrinterDriverState)
+    $paperCutBefore = Copy-TelemetrySnapshot -InputObject (Get-PaperCutProduct)
+    $printerBefore = Copy-TelemetrySnapshot -InputObject (Get-PrinterConnectionState -ConnectionPath $PrinterSharePath)
+    $driverSourceAvailable = Test-Path -LiteralPath $DriverSourcePath -PathType Container
+    $paperCutSourceAvailable = Test-Path -LiteralPath $PaperCutMsiPath -PathType Leaf
+    if ($paperCutSourceAvailable) {
+        $paperCutSourceMsiInfo = Get-MsiPackageInfo -Path $PaperCutMsiPath
+        if ($paperCutSourceMsiInfo) {
+            Write-Log ("PaperCut source MSI: Name={0}; Version={1}; ProductCode={2}; Manufacturer={3}." -f `
+                $paperCutSourceMsiInfo.ProductName, $paperCutSourceMsiInfo.ProductVersion, `
+                $paperCutSourceMsiInfo.ProductCode, $paperCutSourceMsiInfo.Manufacturer)
+        }
+    }
+    Write-DeploymentStateSummary -Label 'before' -Driver $driverBefore -PaperCut $paperCutBefore -Printer $printerBefore
+
+    Write-Log ("Install requirements from pre-check: SharpDriverRequired={0}; PaperCutRequired={1}." -f `
+        (-not $driverBefore.Installed),
+        (-not $paperCutBefore.Installed)) 'INFO'
+    $state = Get-DeploymentState
+    if ($state) {
+        $prop = $state.PSObject.Properties['SourceFingerprintSHA256']
+        if ($prop) { $storedFingerprint = [string]$prop.Value }
+    }
+
+    $script:DriverInstallRequired = (-not $driverBefore.Installed)
+    $script:PaperCutInstallRequired = (-not $paperCutBefore.Installed)
+
+    $driverUpdateRequired = -not $driverBefore.Installed
+    if ($driverSourceAvailable) {
+        $sourceFingerprint = Get-DriverPackageFingerprint -Path $DriverSourcePath
+        if ([string]::IsNullOrWhiteSpace($storedFingerprint) -or $storedFingerprint -ne $sourceFingerprint) { $driverUpdateRequired = $true }
+    }
+    elseif ($driverBefore.Installed) {
+        Write-Log "Driver source is unavailable; retaining the already installed driver: $DriverSourcePath" 'WARN'
+    }
+    else { throw "SHARP driver is missing and the source folder is unavailable: $DriverSourcePath" }
+
+    if ($driverUpdateRequired) {
+        $script:DriverRemediationAttempted = $true
+        if (-not $driverSourceAvailable) {
+            $script:DriverRemediationFailureMessage = 'Driver deployment is required but the source package is unavailable.'
+            throw $script:DriverRemediationFailureMessage
+        }
+        if (Test-Path -LiteralPath $LocalDriverStage) { Remove-Item -LiteralPath $LocalDriverStage -Recurse -Force -ErrorAction Stop }
+        New-Item -Path $LocalDriverStage -ItemType Directory -Force | Out-Null
+        Write-Log "Copying driver package to local staging: $LocalDriverStage" 'ACTION'
+        Copy-Item -Path (Join-Path $DriverSourcePath '*') -Destination $LocalDriverStage -Recurse -Force -ErrorAction Stop
+        $infFiles = @(Get-PrinterInfFiles -Path $LocalDriverStage)
+        foreach ($inf in $infFiles) {
+            $code = Invoke-ExternalProcess -FilePath "$env:SystemRoot\System32\pnputil.exe" -ArgumentList @('/add-driver',"`"$($inf.FullName)`"") -SuccessExitCodes @(0,3010) -TimeoutSeconds $DriverInstallTimeoutSeconds -Operation ("Stage driver {0}" -f $inf.Name)
+            $script:DriverRemediationExitCode = $code
+            if ($code -eq 3010) { $script:RebootRequired = $true }
+        }
+        Add-PrinterDriver -Name $PrinterDriverName -ErrorAction Stop
+
+        Write-Log "Waiting for the Windows print subsystem to register the SHARP driver before verification."
+        $driverAfter = Copy-TelemetrySnapshot -InputObject (Get-InstalledPrinterDriverState -RetryCount 6 -RetryDelaySeconds 2)
+
+        if (-not $driverAfter.Installed) {
+            $script:DriverRemediationFailureMessage = "Driver could not be verified after staging and Add-PrinterDriver."
+            $availableSharpDrivers = @(
+                Get-PrinterDriver -ErrorAction SilentlyContinue |
+                Where-Object { $_.Name -match '(?i)Sharp|BP-70C31' } |
+                ForEach-Object { $_.Name }
+            )
+
+            $availableText = if ($availableSharpDrivers.Count -gt 0) {
+                $availableSharpDrivers -join '; '
+            }
+            else {
+                'No SHARP/BP-70C31 printer drivers were returned by Get-PrinterDriver.'
+            }
+
+            throw "Driver was staged and Add-PrinterDriver completed, but the installed driver could not be verified after retries. Expected='$PrinterDriverName'. VisibleSHARPDrivers='$availableText'"
+        }
+
+        $script:DriverRemediationSucceeded = $true
+        if ($null -eq $script:DriverRemediationExitCode) { $script:DriverRemediationExitCode = 0 }
+        Save-DeploymentState -Fingerprint $sourceFingerprint
+        $script:ChangedComponents.Add('PrinterDriver')
+        if ($script:DriverInstallRequired) {
+            $script:DriverInstalledThisRun = $true
+        }
+
+        Write-Log ("Printer driver deployed successfully: RequestedName={0}; VerifiedName={1}; Version={2}; INF={3}" -f `
+            $PrinterDriverName,
+            $driverAfter.Name,
+            $driverAfter.Version,
+            $driverAfter.InfPath) 'SUCCESS'
+    }
+    else {
+        $driverAfter = $driverBefore
+        Write-Log "Printer driver is already compliant: $PrinterDriverName" 'SUCCESS'
+    }
+
+    if (-not $paperCutBefore.Installed) {
+        $script:PaperCutRemediationAttempted = $true
+        if (-not $paperCutSourceAvailable) {
+            $script:PaperCutRemediationFailureMessage = "PaperCut is not installed and the MSI is unavailable: $PaperCutMsiPath"
+            throw $script:PaperCutRemediationFailureMessage
+        }
+        $msiLogPath = Join-Path $LogDirectory 'PaperCut-Print-Deploy-MSI.log'
+        $code = Invoke-ExternalProcess -FilePath "$env:SystemRoot\System32\msiexec.exe" -ArgumentList @('/i',"`"$PaperCutMsiPath`"",'/qn','/norestart','REBOOT=ReallySuppress','/L*v',"`"$msiLogPath`"") -SuccessExitCodes @(0,3010) -TimeoutSeconds $PaperCutInstallTimeoutSeconds -Operation 'Install PaperCut Print Deploy'
+        $script:PaperCutRemediationExitCode = $code
+        if ($code -eq 3010) { $script:RebootRequired = $true }
+        Start-Sleep -Seconds 3
+        $paperCutAfter = Copy-TelemetrySnapshot -InputObject (Get-PaperCutProduct)
+        if (-not $paperCutAfter.Installed) {
+            $script:PaperCutRemediationFailureMessage = 'PaperCut MSI returned success, but the product could not be verified in the uninstall registry.'
+            throw $script:PaperCutRemediationFailureMessage
+        }
+        $script:PaperCutRemediationSucceeded = $true
+        $script:ChangedComponents.Add('PaperCut')
+        if ($script:PaperCutInstallRequired -and $paperCutAfter.Installed) {
+            $script:PaperCutInstalledThisRun = $true
+        }
+        Write-Log "PaperCut installed successfully: $($paperCutAfter.DisplayName) $($paperCutAfter.DisplayVersion)" 'SUCCESS'
+    }
+    else {
+        $paperCutAfter = $paperCutBefore
+        Write-Log "PaperCut is already installed: $($paperCutBefore.DisplayName) $($paperCutBefore.DisplayVersion)" 'SUCCESS'
+        if (-not $paperCutSourceAvailable) { Write-Log "PaperCut MSI source is currently unavailable, but the client is already installed: $PaperCutMsiPath" 'WARN' }
+    }
+
+    $printerAfter = Copy-TelemetrySnapshot -InputObject (Ensure-SharedPrinterConnection -ConnectionPath $PrinterSharePath)
+    if (-not $driverAfter.Installed -or -not $paperCutAfter.Installed -or -not $printerAfter.Connected) { throw 'Final compliance verification failed.' }
+    Write-DeploymentStateSummary -Label 'after' -Driver $driverAfter -PaperCut $paperCutAfter -Printer $printerAfter
+
+    Write-Log ("Change summary: DriverChanged={0}; PaperCutChanged={1}; PrinterConnectionChanged={2}." -f `
+        ($script:ChangedComponents -contains 'PrinterDriver'),
+        ($script:ChangedComponents -contains 'PaperCut'),
+        ($script:ChangedComponents -contains 'PrinterConnection')) 'INFO'
+
+    Write-Log ("Remediation summary: Sharp Required={0}, Attempted={1}, Succeeded={2}, InstalledThisRun={3}; PaperCut Required={4}, Attempted={5}, Succeeded={6}, InstalledThisRun={7}." -f `
+        (-not [bool]$driverBefore.Installed),
+        $script:DriverRemediationAttempted,
+        $script:DriverRemediationSucceeded,
+        ((-not [bool]$driverBefore.Installed) -and [bool]$driverAfter.Installed -and $script:DriverRemediationAttempted),
+        (-not [bool]$paperCutBefore.Installed),
+        $script:PaperCutRemediationAttempted,
+        $script:PaperCutRemediationSucceeded,
+        ((-not [bool]$paperCutBefore.Installed) -and [bool]$paperCutAfter.Installed -and $script:PaperCutRemediationAttempted)) 'INFO'
+
+    $pendingAfter = Get-PendingRebootState
+    if ($pendingAfter.Pending) { $script:RebootRequired = $true }
+    if ($script:RebootRequired) { $finalStatus='SuccessRebootRequired'; $finalExitCode=3010 }
+    elseif ($script:WarningCount -gt 0) { $finalStatus='SuccessWithWarnings'; $finalExitCode=0 }
+    elseif ($script:ChangedComponents.Count -eq 0) { $finalStatus='AlreadyCompliant'; $finalExitCode=0 }
+    else { $finalStatus='Success'; $finalExitCode=0 }
+    Write-Log "Final status: $finalStatus" 'SUCCESS'
+}
+catch {
+    $script:FailureMessage = $_.Exception.Message
+
+    if ($script:DriverRemediationAttempted -and -not $script:DriverRemediationSucceeded -and [string]::IsNullOrWhiteSpace($script:DriverRemediationFailureMessage)) {
+        $script:DriverRemediationFailureMessage = $script:FailureMessage
+    }
+    if ($script:PaperCutRemediationAttempted -and -not $script:PaperCutRemediationSucceeded -and [string]::IsNullOrWhiteSpace($script:PaperCutRemediationFailureMessage)) {
+        $script:PaperCutRemediationFailureMessage = $script:FailureMessage
+    }
+
+    Write-Log $script:FailureMessage 'ERROR'
+    $finalStatus='Failed'
+    $finalExitCode=1
+    try { $driverAfter=Copy-TelemetrySnapshot -InputObject (Get-InstalledPrinterDriverState) } catch { }
+    try { $paperCutAfter=Copy-TelemetrySnapshot -InputObject (Get-PaperCutProduct) } catch { }
+    try { $printerAfter=Copy-TelemetrySnapshot -InputObject (Get-PrinterConnectionState -ConnectionPath $PrinterSharePath) } catch { }
+    try { $pendingAfter=Get-PendingRebootState } catch { }
+}
+finally {
+    try {
+        Write-Telemetry -Status $finalStatus -ExitCode $finalExitCode -DriverBefore $driverBefore -DriverAfter $driverAfter -PaperCutBefore $paperCutBefore -PaperCutAfter $paperCutAfter -PrinterBefore $printerBefore -PrinterAfter $printerAfter -DriverSourceAvailable $driverSourceAvailable -PaperCutSourceAvailable $paperCutSourceAvailable -SourceFingerprint $sourceFingerprint -StoredFingerprint $storedFingerprint -PaperCutSourceMsiInfo $paperCutSourceMsiInfo -PendingRebootBefore $pendingBefore -PendingRebootAfter $pendingAfter
+        Write-Log "Telemetry written to $LatestTelemetryPath"
+    }
+    catch {
+        Write-Log "Telemetry write failed: $($_.Exception.Message)" 'ERROR'
+        if ($finalExitCode -eq 0 -or $finalExitCode -eq 3010) {
+            $finalStatus = 'TelemetryFailure'
+            $finalExitCode = 4
+        }
+    }
+
+    # Final text-log append before the immutable completed file enters C:\Logs.
+    Write-Log ("Completed {0}. Status={1}; ExitCode={2}; Warnings={3}; Errors={4}" -f `
+        $ScriptName,
+        $finalStatus,
+        $finalExitCode,
+        $script:WarningCount,
+        $script:ErrorCount) $(if ($finalExitCode -eq 0 -or $finalExitCode -eq 3010) { 'SUCCESS' } else { 'ERROR' })
+
+    if ($null -ne $LogSession) {
+        $publishResult = Publish-MaintenanceLog -LogSession $LogSession
+
+        if ($publishResult.Published) {
+            Write-Host ("Published completed script 11 text log for Elastic: {0}" -f $PublishedLogPath) -ForegroundColor Green
+        }
+        else {
+            Write-Warning ("Script 11 completed text log remains in staging because publication failed: {0}" -f $publishResult.Path)
+        }
+    }
+}
+
+exit $finalExitCode
 '@
     }
     AutologonAndEdge = [ordered]@{
         FileName = '13_Configure_Autologon_And_Edge.ps1'
-        Sha256   = '864D2A64C5F3DFF84258FA8EE9151978B727104E179DD57458A77ECA57F3D764'
-        GzipBase64 = @'
-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
+        # Plain-text source is intentionally embedded for maintainability.
+        Source = @'
+# =====================================================================
+# ScriptName: 13_Configure_Autologon_And_Edge.ps1
+# ScriptVersion: 2.2.0
+# LastUpdated: 2026-08-27
+# Changes: v2.2.0 removes ForceAutoLogon so Log off and Switch user remain available for administrator sign-in,
+#          while preserving normal CC-Student automatic sign-in at computer startup.
+#          v2.1.3 normalizes Windows 11 product naming, makes telemetry collections explicitly JSON-array safe,
+#          and adds a concise Elastic configuration summary while preserving password redaction.
+#          v2.1.2 uses Maintenance.Framework v2.4 staged text logging.
+# Purpose: Configure lab autologon and launch Microsoft Edge InPrivate
+#          for approved computer-name patterns, with verification and
+#          structured maintenance telemetry. The autologon password is Base64-obfuscated in the script and decoded only at runtime.
+# =====================================================================
+
+[CmdletBinding()]
+param(
+    [string[]]$ComputerNamePatterns = @(
+        'SSB-122-*',
+        'SSB-114*' ,
+	'SSB-171*'
+    ),
+
+    [string]$DefaultUserName = 'CC-Student',
+
+    [ValidateNotNullOrEmpty()]
+    [string]$DefaultPasswordBase64 = 'Q0MkdHVkM250IQ==',
+
+    [string]$DefaultDomainName = 'Compton.edu',
+
+    [ValidateNotNullOrEmpty()]
+    [string]$EdgeUrl = 'https://www.compton.edu',
+
+    [string]$LogDirectory = 'C:\Logs',
+
+    [switch]$AllowHttpEdgeUrl
+)
+
+Set-StrictMode -Version 2.0
+$ErrorActionPreference = 'Stop'
+
+$ScriptName = '13_Configure_Autologon_And_Edge.ps1'
+$ScriptVersion = '2.2.0'
+$RunId = [guid]::NewGuid().Guid
+$StartTime = Get-Date
+$ComputerName = $env:COMPUTERNAME
+$DomainName = $env:USERDOMAIN
+$RunningAccount = [Security.Principal.WindowsIdentity]::GetCurrent().Name
+$LogPath = $null
+$PublishedLogPath = $null
+$LogSession = $null
+$TelemetryPath = Join-Path $LogDirectory 'Maintenance-Telemetry.ndjson'
+$LatestTelemetryPath = Join-Path $LogDirectory '13_Configure_Autologon_And_Edge.latest.json'
+$WinlogonPath = 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon'
+$RunKeyPath = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Run'
+$EdgeRunValueName = 'LaunchComptonEdge'
+$AllUsersStartupPath = Join-Path $env:ProgramData 'Microsoft\Windows\Start Menu\Programs\Startup'
+$LegacyChromeShortcutPath = Join-Path $AllUsersStartupPath 'Google Chrome.lnk'
+
+$script:WarningCount = 0
+$script:ErrorCount = 0
+$script:ExitCode = 0
+$script:FinalStatus = 'Success'
+$script:OverallResult = 'Unknown'
+$script:FailureMessage = $null
+$script:Targeted = $false
+$script:MatchedPattern = $null
+$script:ChangesMade = 0
+$script:VerificationFailures = New-Object System.Collections.Generic.List[string]
+$script:RegistryChanges = New-Object System.Collections.Generic.List[object]
+$script:EdgePath = $null
+$script:EdgeCommand = $null
+$script:LegacyShortcutRemoved = $false
+$script:LegacyShortcutPresentBefore = $false
+$script:LegacyShortcutPresentAfter = $false
+$script:BeforeState = $null
+$script:AfterState = $null
+$script:DecodedPassword = $null
+
+# Load the shared framework from the same directory as this script.
+$MaintenanceFrameworkPath = 'C:\Scripts\Maintenance.Framework.psm1'
+Import-Module -Name $MaintenanceFrameworkPath -Force -ErrorAction Stop
+$MaintenanceConfig = Initialize-MaintenanceEnvironment -ScriptRoot 'C:\Scripts' -LogRoot $LogDirectory
+
+$requiredFrameworkVersion = [version]'2.4.0'
+$currentFrameworkVersion = [version](Get-MaintenanceFrameworkVersion)
+
+if ($currentFrameworkVersion -lt $requiredFrameworkVersion) {
+    throw "Script 13 requires Maintenance.Framework.psm1 version $requiredFrameworkVersion or newer. Installed version: $currentFrameworkVersion"
+}
+
+Archive-MaintenanceLogs `
+    -ScriptName $ScriptName `
+    -LogRoot $LogDirectory `
+    -AdditionalPatterns @(
+        '13_Configure_Autologon_And_Edge.log',
+        '*-13_Configure_Autologon_And_Edge-*.log'
+    ) | Out-Null
+
+$LogSession = New-MaintenanceStagedLog `
+    -ScriptName $ScriptName `
+    -LogRoot $LogDirectory `
+    -StagingRoot $MaintenanceConfig.LogStagingRoot `
+    -ComputerName $ComputerName `
+    -Timestamp $StartTime
+
+$LogPath = [string]$LogSession.WorkingPath
+$PublishedLogPath = [string]$LogSession.PublishedPath
+
+function Initialize-LogDirectory {
+    if (-not (Test-Path -LiteralPath $LogDirectory)) {
+        New-Item -Path $LogDirectory -ItemType Directory -Force | Out-Null
+    }
+}
+
+function Write-Log {
+    param(
+        [Parameter(Mandatory)][string]$Message,
+        [ValidateSet('INFO','OK','WARN','ERROR')][string]$Level = 'INFO'
+    )
+
+    if ($Level -eq 'WARN') { $script:WarningCount++ }
+    if ($Level -eq 'ERROR') { $script:ErrorCount++ }
+
+    $normalizedLevel = switch ($Level) {
+        'OK'   { 'SUCCESS' }
+        'WARN' { 'WARNING' }
+        default { $Level }
+    }
+    $logComputerName = if ($ComputerName) { $ComputerName } else { 'UNKNOWN' }
+    $line = '{0} [{1}] [{2}] {3}' -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $logComputerName, $normalizedLevel, $Message
+
+    switch ($Level) {
+        'OK'    { Write-Host $line -ForegroundColor Green }
+        'WARN'  { Write-Host $line -ForegroundColor Yellow }
+        'ERROR' { Write-Host $line -ForegroundColor Red }
+        default { Write-Host $line }
+    }
+
+    try {
+        $activeLogDirectory = Split-Path -Parent $LogPath
+        if (-not (Test-Path -LiteralPath $activeLogDirectory -PathType Container)) {
+            New-Item -Path $activeLogDirectory -ItemType Directory -Force | Out-Null
+        }
+        Add-Content -LiteralPath $LogPath -Value $line -Encoding UTF8
+    }
+    catch {
+        Write-Warning "Unable to write to the log file: $($_.Exception.Message)"
+    }
+}
+
+function Test-IsAdministrator {
+    $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+    $principal = New-Object Security.Principal.WindowsPrincipal($identity)
+    return $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+}
+
+function Get-WindowsInformation {
+    try {
+        $os = Get-CimInstance -ClassName Win32_OperatingSystem -ErrorAction Stop
+        $currentVersion = Get-ItemProperty -LiteralPath 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion' -ErrorAction Stop
+
+        $productName = [string]$currentVersion.ProductName
+        $buildText = [string]$os.BuildNumber
+        $buildNumber = 0
+        [void][int]::TryParse($buildText, [ref]$buildNumber)
+
+        if ($buildNumber -ge 22000 -and $productName -match '^Windows 10') {
+            $productName = $productName -replace '^Windows 10', 'Windows 11'
+        }
+
+        [pscustomobject]@{
+            ProductName    = $productName
+            EditionId      = [string]$currentVersion.EditionID
+            DisplayVersion = [string]$currentVersion.DisplayVersion
+            Version        = [string]$os.Version
+            BuildNumber    = $buildText
+            UBR            = [int]$currentVersion.UBR
+            FullBuild      = '{0}.{1}' -f $buildText, $currentVersion.UBR
+        }
+    }
+    catch {
+        Write-Log "Unable to collect Windows version information: $($_.Exception.Message)" 'WARN'
+        [pscustomobject]@{
+            ProductName = $null; EditionId = $null; DisplayVersion = $null
+            Version = $null; BuildNumber = $null; UBR = $null; FullBuild = $null
+        }
+    }
+}
+
+function Get-MatchedComputerPattern {
+    param(
+        [Parameter(Mandatory)][string]$Name,
+        [Parameter(Mandatory)][string[]]$Patterns
+    )
+
+    foreach ($pattern in $Patterns) {
+        if (-not [string]::IsNullOrWhiteSpace($pattern) -and $Name -like $pattern) {
+            return $pattern
+        }
+    }
+    return $null
+}
+
+function Get-RegistryStringValue {
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)][string]$Name
+    )
+
+    try {
+        $value = (Get-ItemProperty -LiteralPath $Path -Name $Name -ErrorAction Stop).$Name
+        return [string]$value
+    }
+    catch {
+        return $null
+    }
+}
+
+function Set-VerifiedRegistryString {
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)][string]$Name,
+        [Parameter(Mandatory)][AllowEmptyString()][string]$Value,
+        [switch]$Sensitive
+    )
+
+    if (-not (Test-Path -LiteralPath $Path)) {
+        New-Item -Path $Path -Force | Out-Null
+    }
+
+    $before = Get-RegistryStringValue -Path $Path -Name $Name
+    $changed = ([string]$before -cne [string]$Value)
+
+    if ($changed) {
+        New-ItemProperty -LiteralPath $Path -Name $Name -Value $Value -PropertyType String -Force | Out-Null
+        $script:ChangesMade++
+        if ($Sensitive) {
+            Write-Log "Updated protected registry value: $Path\$Name" 'OK'
+        }
+        else {
+            Write-Log "Updated registry value: $Path\$Name" 'OK'
+        }
+    }
+    else {
+        Write-Log "Registry value is already correct: $Path\$Name"
+    }
+
+    $after = Get-RegistryStringValue -Path $Path -Name $Name
+    $verified = ([string]$after -ceq [string]$Value)
+
+    if (-not $verified) {
+        $script:VerificationFailures.Add("Registry verification failed: $Path\$Name")
+        throw "Registry value verification failed: $Path\$Name"
+    }
+
+    $script:RegistryChanges.Add([pscustomobject]@{
+        Path          = $Path
+        Name          = $Name
+        Changed       = $changed
+        Verified      = $verified
+        Sensitive     = [bool]$Sensitive
+        BeforePresent = ($null -ne $before)
+        AfterPresent  = ($null -ne $after)
+        BeforeValue   = $(if ($Sensitive) { $null } else { $before })
+        AfterValue    = $(if ($Sensitive) { $null } else { $after })
+    })
+}
+
+function Remove-VerifiedRegistryValue {
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)][string]$Name
+    )
+
+    $before = Get-RegistryStringValue -Path $Path -Name $Name
+    $changed = ($null -ne $before)
+
+    if ($changed) {
+        Remove-ItemProperty -LiteralPath $Path -Name $Name -Force -ErrorAction Stop
+        $script:ChangesMade++
+        Write-Log "Removed registry value: $Path\$Name" 'OK'
+    }
+    else {
+        Write-Log "Registry value is already absent: $Path\$Name"
+    }
+
+    $after = Get-RegistryStringValue -Path $Path -Name $Name
+    $verified = ($null -eq $after)
+
+    if (-not $verified) {
+        $script:VerificationFailures.Add("Registry removal verification failed: $Path\$Name")
+        throw "Registry value removal verification failed: $Path\$Name"
+    }
+
+    $script:RegistryChanges.Add([pscustomobject]@{
+        Path          = $Path
+        Name          = $Name
+        Changed       = $changed
+        Verified      = $verified
+        Sensitive     = $false
+        BeforePresent = ($null -ne $before)
+        AfterPresent  = ($null -ne $after)
+        BeforeValue   = $before
+        AfterValue    = $after
+    })
+}
+
+function Get-DecodedAutologonPassword {
+    try {
+        $bytes = [Convert]::FromBase64String($DefaultPasswordBase64)
+        $password = [Text.Encoding]::UTF8.GetString($bytes)
+
+        if ([string]::IsNullOrWhiteSpace($password)) {
+            throw 'The decoded autologon password is blank.'
+        }
+
+        return $password
+    }
+    catch {
+        throw "Unable to decode the configured autologon password: $($_.Exception.Message)"
+    }
+    finally {
+        $bytes = $null
+    }
+}
+
+function Test-ConfigurationInput {
+    if (-not $ComputerNamePatterns -or @($ComputerNamePatterns | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }).Count -eq 0) {
+        throw 'At least one nonblank computer-name pattern is required.'
+    }
+    if ([string]::IsNullOrWhiteSpace($DefaultUserName)) {
+        throw 'DefaultUserName cannot be blank.'
+    }
+    if ([string]::IsNullOrWhiteSpace($DefaultPasswordBase64)) {
+        throw 'DefaultPasswordBase64 cannot be blank when autologon is enabled.'
+    }
+
+    try {
+        $decodedBytes = [Convert]::FromBase64String($DefaultPasswordBase64)
+        if ($decodedBytes.Length -eq 0) {
+            throw 'The decoded password is empty.'
+        }
+    }
+    catch {
+        throw 'DefaultPasswordBase64 is not valid Base64 or decodes to an empty value.'
+    }
+    finally {
+        $decodedBytes = $null
+    }
+    if ([string]::IsNullOrWhiteSpace($DefaultDomainName)) {
+        throw 'DefaultDomainName cannot be blank.'
+    }
+
+    $uri = $null
+    if (-not [uri]::TryCreate($EdgeUrl, [UriKind]::Absolute, [ref]$uri)) {
+        throw "EdgeUrl is not a valid absolute URL: $EdgeUrl"
+    }
+    if ($uri.Scheme -notin @('https','http')) {
+        throw "EdgeUrl must use HTTP or HTTPS: $EdgeUrl"
+    }
+    if ($uri.Scheme -eq 'http' -and -not $AllowHttpEdgeUrl) {
+        throw 'EdgeUrl uses HTTP. Use HTTPS or explicitly supply -AllowHttpEdgeUrl.'
+    }
+}
+
+function Get-AutologonState {
+    $autoAdmin = Get-RegistryStringValue -Path $WinlogonPath -Name 'AutoAdminLogon'
+    $user = Get-RegistryStringValue -Path $WinlogonPath -Name 'DefaultUserName'
+    $domain = Get-RegistryStringValue -Path $WinlogonPath -Name 'DefaultDomainName'
+    $force = Get-RegistryStringValue -Path $WinlogonPath -Name 'ForceAutoLogon'
+    $password = Get-RegistryStringValue -Path $WinlogonPath -Name 'DefaultPassword'
+
+    [pscustomobject]@{
+        AutoAdminLogonEnabled = ($autoAdmin -eq '1')
+        DefaultUserName       = $user
+        DefaultDomainName     = $domain
+        ForceAutoLogonPresent = ($null -ne $force)
+        ForceAutoLogonEnabled = ($force -eq '1')
+        PasswordPresent       = (-not [string]::IsNullOrEmpty($password))
+        PasswordMatches       = ($null -ne $script:DecodedPassword -and [string]$password -ceq [string]$script:DecodedPassword)
+        ConfigurationMatches  = (
+            $autoAdmin -eq '1' -and
+            $user -ceq $DefaultUserName -and
+            $domain -ceq $DefaultDomainName -and
+            $null -eq $force -and
+            [string]$password -ceq [string]$script:DecodedPassword
+        )
+    }
+}
+
+function Set-AutologonConfiguration {
+    Write-Log "Ensuring Windows autologon is configured for '$DefaultDomainName\$DefaultUserName'."
+
+    Set-VerifiedRegistryString -Path $WinlogonPath -Name 'AutoAdminLogon' -Value '1'
+    Set-VerifiedRegistryString -Path $WinlogonPath -Name 'DefaultUserName' -Value $DefaultUserName
+    Set-VerifiedRegistryString -Path $WinlogonPath -Name 'DefaultPassword' -Value $script:DecodedPassword -Sensitive
+    Set-VerifiedRegistryString -Path $WinlogonPath -Name 'DefaultDomainName' -Value $DefaultDomainName
+    # ForceAutoLogon=1 immediately signs the default user back in after Log off.
+    # Keep standard startup autologon, but remove this override so an administrator can sign in.
+    Remove-VerifiedRegistryValue -Path $WinlogonPath -Name 'ForceAutoLogon'
+
+    $state = Get-AutologonState
+    if (-not $state.ConfigurationMatches) {
+        throw 'Autologon registry values did not pass final verification.'
+    }
+    Write-Log "Autologon configuration verified for '$DefaultDomainName\$DefaultUserName'." 'OK'
+}
+
+function Remove-LegacyChromeStartupShortcut {
+    $script:LegacyShortcutPresentBefore = Test-Path -LiteralPath $LegacyChromeShortcutPath -PathType Leaf
+    Write-Log 'Checking for the legacy All Users Google Chrome startup shortcut.'
+
+    if ($script:LegacyShortcutPresentBefore) {
+        Remove-Item -LiteralPath $LegacyChromeShortcutPath -Force -ErrorAction Stop
+        $script:ChangesMade++
+        $script:LegacyShortcutRemoved = $true
+        Write-Log "Removed legacy Chrome startup shortcut: $LegacyChromeShortcutPath" 'OK'
+    }
+    else {
+        Write-Log 'Legacy Google Chrome startup shortcut is not present.'
+    }
+
+    $script:LegacyShortcutPresentAfter = Test-Path -LiteralPath $LegacyChromeShortcutPath -PathType Leaf
+    if ($script:LegacyShortcutPresentAfter) {
+        $script:VerificationFailures.Add('Legacy Chrome startup shortcut remains present.')
+        throw "The legacy Chrome startup shortcut could not be removed: $LegacyChromeShortcutPath"
+    }
+}
+
+function Get-EdgePath {
+    $candidatePaths = @()
+    if (-not [string]::IsNullOrWhiteSpace(${env:ProgramFiles(x86)})) {
+        $candidatePaths += (Join-Path ${env:ProgramFiles(x86)} 'Microsoft\Edge\Application\msedge.exe')
+    }
+    if (-not [string]::IsNullOrWhiteSpace($env:ProgramFiles)) {
+        $candidatePaths += (Join-Path $env:ProgramFiles 'Microsoft\Edge\Application\msedge.exe')
+    }
+
+    return $candidatePaths |
+        Select-Object -Unique |
+        Where-Object { Test-Path -LiteralPath $_ -PathType Leaf } |
+        Select-Object -First 1
+}
+
+function Get-EdgeRunState {
+    $configuredCommand = Get-RegistryStringValue -Path $RunKeyPath -Name $EdgeRunValueName
+    $edgePath = Get-EdgePath
+    $edgeVersion = $null
+    if ($edgePath) {
+        try { $edgeVersion = [Diagnostics.FileVersionInfo]::GetVersionInfo($edgePath).ProductVersion } catch { }
+    }
+    [pscustomobject]@{
+        EdgeInstalled      = [bool]$edgePath
+        EdgePath           = $edgePath
+        EdgeVersion        = $edgeVersion
+        RunValuePresent    = (-not [string]::IsNullOrWhiteSpace($configuredCommand))
+        RunCommand         = $configuredCommand
+        CommandMatches     = ($null -ne $script:EdgeCommand -and $configuredCommand -ceq $script:EdgeCommand)
+        UrlPresent         = (-not [string]::IsNullOrWhiteSpace($configuredCommand) -and $configuredCommand.Contains($EdgeUrl))
+        InPrivateEnabled   = (-not [string]::IsNullOrWhiteSpace($configuredCommand) -and $configuredCommand -match '(?i)--inprivate(?:\s|$)')
+        NewWindowEnabled   = (-not [string]::IsNullOrWhiteSpace($configuredCommand) -and $configuredCommand -match '(?i)--new-window(?:\s|$)')
+        MaximizedEnabled   = (-not [string]::IsNullOrWhiteSpace($configuredCommand) -and $configuredCommand -match '(?i)--start-maximized(?:\s|$)')
+    }
+}
+
+function Write-ConfigurationStateSummary {
+    param(
+        [Parameter(Mandatory)][string]$Label,
+        [Parameter(Mandatory)]$State
+    )
+
+    Write-Log ("Autologon {0}: Enabled={1}; User={2}; Domain={3}; ForceAutoLogonPresent={4}; ForceAutoLogonEnabled={5}; PasswordPresent={6}; PasswordMatches={7}; ConfigurationMatches={8}." -f `
+        $Label, $State.Autologon.AutoAdminLogonEnabled, $State.Autologon.DefaultUserName, `
+        $State.Autologon.DefaultDomainName, $State.Autologon.ForceAutoLogonPresent, $State.Autologon.ForceAutoLogonEnabled, `
+        $State.Autologon.PasswordPresent, $State.Autologon.PasswordMatches, $State.Autologon.ConfigurationMatches)
+
+    Write-Log ("Edge startup {0}: Installed={1}; Version={2}; RunValuePresent={3}; CommandMatches={4}; UrlPresent={5}; InPrivate={6}; NewWindow={7}; Maximized={8}." -f `
+        $Label, $State.Edge.EdgeInstalled, $State.Edge.EdgeVersion, $State.Edge.RunValuePresent, `
+        $State.Edge.CommandMatches, $State.Edge.UrlPresent, $State.Edge.InPrivateEnabled, `
+        $State.Edge.NewWindowEnabled, $State.Edge.MaximizedEnabled)
+}
+
+function Set-EdgeAutoLaunch {
+    $script:EdgePath = Get-EdgePath
+    if (-not $script:EdgePath) {
+        throw 'Microsoft Edge was not found in either Program Files location.'
+    }
+
+    $escapedUrl = $EdgeUrl.Replace('"','')
+    $script:EdgeCommand = '"{0}" --inprivate --new-window --start-maximized "{1}"' -f $script:EdgePath, $escapedUrl
+    Set-VerifiedRegistryString -Path $RunKeyPath -Name $EdgeRunValueName -Value $script:EdgeCommand
+
+    $edgeState = Get-EdgeRunState
+    if (-not $edgeState.CommandMatches -or -not $edgeState.EdgeInstalled) {
+        $script:VerificationFailures.Add('Edge auto-launch configuration verification failed.')
+        throw 'Edge auto-launch configuration did not pass final verification.'
+    }
+
+    Write-Log "Configured and verified Edge auto-launch for every user: $EdgeUrl" 'OK'
+}
+
+
+function New-StringArrayForJson {
+    [CmdletBinding()]
+    param([AllowNull()]$InputObject)
+
+    [string[]]$items = @(
+        $InputObject |
+        ForEach-Object { [string]$_ } |
+        Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+    )
+
+    if ($items.Count -eq 0) {
+        return ,([object[]]@())
+    }
+
+    return ,([object[]]$items)
+}
+
+function New-ObjectArrayForJson {
+    [CmdletBinding()]
+    param([AllowNull()]$InputObject)
+
+    [object[]]$items = @(
+        $InputObject |
+        ForEach-Object { $_ }
+    )
+
+    if ($items.Count -eq 0) {
+        return ,([object[]]@())
+    }
+
+    return ,([object[]]$items)
+}
+
+function Write-Telemetry {
+    param([Parameter(Mandatory)][object]$WindowsInfo)
+
+    try {
+        Initialize-LogDirectory
+        $endTime = Get-Date
+        $duration = [math]::Round(($endTime - $StartTime).TotalSeconds, 3)
+
+        $event = [ordered]@{
+            '@timestamp'             = $endTime.ToUniversalTime().ToString('o')
+            EventType                = 'maintenance.execution'
+            ComputerName             = $ComputerName
+            Domain                   = $DomainName
+            ScriptName               = $ScriptName
+            ScriptVersion            = $ScriptVersion
+            RunId                    = $RunId
+            StartTime                = $StartTime.ToUniversalTime().ToString('o')
+            EndTime                  = $endTime.ToUniversalTime().ToString('o')
+            DurationSeconds          = $duration
+            Status                   = $script:FinalStatus
+            OverallResult            = $script:OverallResult
+            ExitCode                 = $script:ExitCode
+            ErrorCount               = $script:ErrorCount
+            WarningCount             = $script:WarningCount
+            FailureMessage           = $script:FailureMessage
+            TextLogPath              = $PublishedLogPath
+            RunningAccount           = $RunningAccount
+            RunningAsSystem          = ($RunningAccount -eq 'NT AUTHORITY\SYSTEM')
+            IsAdministrator          = (Test-IsAdministrator)
+            Targeted                 = $script:Targeted
+            MatchedPattern           = $script:MatchedPattern
+            ConfiguredPatterns       = New-StringArrayForJson -InputObject $ComputerNamePatterns
+            ChangesMade              = $script:ChangesMade
+            VerificationFailureCount = $script:VerificationFailures.Count
+            VerificationFailures     = New-StringArrayForJson -InputObject $script:VerificationFailures
+            Windows                  = $WindowsInfo
+            Configuration            = [ordered]@{
+                DefaultUserName   = $DefaultUserName
+                DefaultDomainName = $DefaultDomainName
+                PasswordProvided  = (-not [string]::IsNullOrWhiteSpace($DefaultPasswordBase64))
+                PasswordStorage   = 'Base64ObfuscatedInScript'
+                PasswordValueLogged = $false
+                ForceAutoLogonDesired = $false
+                EdgeUrl           = $EdgeUrl
+                EdgeRunValueName  = $EdgeRunValueName
+            }
+            Before                   = $script:BeforeState
+            After                    = $script:AfterState
+            RegistryChanges          = New-ObjectArrayForJson -InputObject $script:RegistryChanges
+            LegacyChromeShortcut     = [ordered]@{
+                Path          = $LegacyChromeShortcutPath
+                PresentBefore = $script:LegacyShortcutPresentBefore
+                Removed       = $script:LegacyShortcutRemoved
+                PresentAfter  = $script:LegacyShortcutPresentAfter
+            }
+            Edge                     = [ordered]@{
+                ExecutablePath = $script:EdgePath
+                RunCommand     = $script:EdgeCommand
+            }
+        }
+
+        try {
+            $autologonVerified = $false
+            $edgeVerified = $false
+            if ($event.After) {
+                if ($event.After.Autologon) { $autologonVerified = [bool]$event.After.Autologon.ConfigurationMatches }
+                if ($event.After.Edge) { $edgeVerified = [bool]$event.After.Edge.CommandMatches }
+            }
+
+            Write-Log ("Elastic configuration summary: Targeted={0}; MatchedPattern={1}; ChangesMade={2}; VerificationFailures={3}; AutologonVerified={4}; EdgeVerified={5}; LegacyChromeRemoved={6}; Result={7}" -f `
+                $event.Targeted,
+                $event.MatchedPattern,
+                $event.ChangesMade,
+                $event.VerificationFailureCount,
+                $autologonVerified,
+                $edgeVerified,
+                $event.LegacyChromeShortcut.Removed,
+                $event.OverallResult) 'INFO'
+        }
+        catch { }
+
+        $compactJson = $event | ConvertTo-Json -Depth 10 -Compress
+        Write-MaintenanceTelemetryLine -Path $TelemetryPath -JsonLine $compactJson
+
+        $prettyJson = $event | ConvertTo-Json -Depth 10
+        $tempPath = "$LatestTelemetryPath.tmp.$RunId"
+        Set-Content -LiteralPath $tempPath -Value $prettyJson -Encoding UTF8
+        Move-Item -LiteralPath $tempPath -Destination $LatestTelemetryPath -Force
+    }
+    catch {
+        Write-Warning "Unable to write structured telemetry: $($_.Exception.Message)"
+    }
+}
+
+$windowsInfo = Get-WindowsInformation
+
+try {
+    Initialize-LogDirectory
+    Write-Log "===== Autologon and Edge configuration v$ScriptVersion started ====="
+    Write-Log "Text log: $LogPath"
+    Write-Log "Computer name: $ComputerName"
+    Write-Log "Configured computer-name patterns: $($ComputerNamePatterns -join ', ')"
+
+    if (-not (Test-IsAdministrator)) {
+        throw 'Please run this script as Administrator or through a SYSTEM scheduled task.'
+    }
+
+    Test-ConfigurationInput
+
+    $script:MatchedPattern = Get-MatchedComputerPattern -Name $ComputerName -Patterns $ComputerNamePatterns
+    $script:Targeted = (-not [string]::IsNullOrWhiteSpace($script:MatchedPattern))
+
+    if (-not $script:Targeted) {
+        $script:BeforeState = [pscustomobject]@{
+            Autologon = Get-AutologonState
+            Edge      = Get-EdgeRunState
+        }
+        $script:AfterState = $script:BeforeState
+        Write-ConfigurationStateSummary -Label 'unchanged (not targeted)' -State $script:BeforeState
+        $script:OverallResult = 'NotTargeted'
+        $script:FinalStatus = 'Success'
+        Write-Log "Computer '$ComputerName' does not match the configured pattern list. No changes were made."
+        Write-Log '===== Script completed: computer not targeted =====' 'OK'
+    }
+    else {
+        Write-Log "Computer '$ComputerName' matches pattern '$($script:MatchedPattern)'." 'OK'
+
+        $script:DecodedPassword = Get-DecodedAutologonPassword
+
+        $script:BeforeState = [pscustomobject]@{
+            Autologon = Get-AutologonState
+            Edge      = Get-EdgeRunState
+        }
+        Write-ConfigurationStateSummary -Label 'before' -State $script:BeforeState
+
+        Set-AutologonConfiguration
+        Remove-LegacyChromeStartupShortcut
+        Set-EdgeAutoLaunch
+
+        $script:AfterState = [pscustomobject]@{
+            Autologon = Get-AutologonState
+            Edge      = Get-EdgeRunState
+        }
+        Write-ConfigurationStateSummary -Label 'after' -State $script:AfterState
+        Write-Log ("Legacy Chrome startup shortcut: PresentBefore={0}; Removed={1}; PresentAfter={2}." -f `
+            $script:LegacyShortcutPresentBefore, $script:LegacyShortcutRemoved, $script:LegacyShortcutPresentAfter)
+
+        if (-not $script:AfterState.Autologon.ConfigurationMatches) {
+            $script:VerificationFailures.Add('Final autologon configuration does not match the requested values.')
+        }
+        if (-not $script:AfterState.Edge.CommandMatches) {
+            $script:VerificationFailures.Add('Final Edge Run value does not match the requested command.')
+        }
+        if ($script:LegacyShortcutPresentAfter) {
+            $script:VerificationFailures.Add('Legacy Chrome startup shortcut remains present.')
+        }
+
+        if ($script:VerificationFailures.Count -gt 0) {
+            throw "One or more final verification checks failed: $($script:VerificationFailures -join '; ')"
+        }
+
+        if ($script:ChangesMade -eq 0) {
+            $script:OverallResult = 'AlreadyCompliant'
+        }
+        else {
+            $script:OverallResult = 'ConfiguredAndVerified'
+        }
+        $script:FinalStatus = 'Success'
+        Write-Log 'Autologon, legacy Chrome cleanup, and Edge startup settings were verified successfully.' 'OK'
+        Write-Log '===== Script completed successfully =====' 'OK'
+    }
+}
+catch {
+    $script:ExitCode = 1
+    $script:FinalStatus = 'Failed'
+    $script:OverallResult = 'Failed'
+    $script:FailureMessage = $_.Exception.Message
+    Write-Log "Configuration failed: $($_.Exception.Message)" 'ERROR'
+
+    try {
+        $script:AfterState = [pscustomobject]@{
+            Autologon = Get-AutologonState
+            Edge      = Get-EdgeRunState
+        }
+    }
+    catch {
+        Write-Log "Unable to collect final configuration state: $($_.Exception.Message)" 'WARN'
+    }
+
+    Write-Log '===== Script completed with errors =====' 'ERROR'
+}
+finally {
+    # Clear the decoded credential before final telemetry/log publication.
+    $script:DecodedPassword = $null
+    [GC]::Collect()
+
+    try {
+        Write-Telemetry -WindowsInfo $windowsInfo
+    }
+    catch {
+        Write-Log "Telemetry write failed: $($_.Exception.Message)" 'ERROR'
+        if ($script:ExitCode -eq 0) {
+            $script:FinalStatus = 'TelemetryFailure'
+            $script:OverallResult = 'TelemetryFailure'
+            $script:ExitCode = 4
+        }
+    }
+
+    # Final text-log append before the immutable completed file enters C:\Logs.
+    Write-Log ("Finalizing {0}. Status={1}; Result={2}; ExitCode={3}; Warnings={4}; Errors={5}" -f `
+        $ScriptName,
+        $script:FinalStatus,
+        $script:OverallResult,
+        $script:ExitCode,
+        $script:WarningCount,
+        $script:ErrorCount) $(if ($script:ExitCode -eq 0) { 'OK' } else { 'ERROR' })
+
+    if ($null -ne $LogSession) {
+        $publishResult = Publish-MaintenanceLog -LogSession $LogSession
+
+        if ($publishResult.Published) {
+            Write-Host ("Published completed script 13 text log for Elastic: {0}" -f $PublishedLogPath) -ForegroundColor Green
+        }
+        else {
+            Write-Warning ("Script 13 completed text log remains in staging because publication failed: {0}" -f $publishResult.Path)
+        }
+    }
+}
+
+exit $script:ExitCode
 '@
     }
     ElasticAgent = [ordered]@{
         FileName = '15_Install_Elastic_Agent.ps1'
-        Sha256   = '8CF1BCCE9194F55516F690A811D75D039CC0078063BEF2CDAB581F449CBEBD90'
-        GzipBase64 = @'
-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
+        # Plain-text source is intentionally embedded for maintainability.
+        Source = @'
+#requires -Version 5.1
+#requires -RunAsAdministrator
+# ScriptVersion: 2.1.5
+
+<#
+.SYNOPSIS
+    Installs and enrolls Elastic Agent only on approved lab computers using
+    the configured Fleet Server and enrollment token.
+
+.DESCRIPTION
+    - Uses a configurable computer-name prefix allowlist.
+    - Defaults to the IB1-103 lab prefix.
+    - Installs Elastic Agent from the internal ZIP package, with automatic official Elastic Internet fallback.
+    - Uses the current Fleet Server URL and enrollment token from Install.ps1.
+    - Performs a fully unattended Fleet installation with no Y/N prompt.
+    - Leaves the Elastic Agent service installed and running under Fleet management.
+    - Is safe to run repeatedly; already-installed systems are health-checked and skipped when present.
+
+.NOTES
+    Script:  15_Install_Elastic_Agent.ps1
+    Version: 2.1.5
+    LastUpdated: 2026-08-19
+    Changes: v2.1.5 adds structured, mapping-safe Elastic Agent deployment telemetry,
+             explicit result/failure-stage reporting, package-source/hash/enrollment state,
+             existing/final agent health snapshots, and enrollment-token redaction.
+             v2.1.4 uses Maintenance.Framework v2.4 staged text logging.
+    Requires: Windows PowerShell 5.1, administrative/SYSTEM context
+#>
+
+[CmdletBinding()]
+param(
+    [switch]$ForceReinstall,
+
+    [string[]]$AllowedComputerPrefixes = @(
+        'IB1-103'
+    )
+)
+
+Set-StrictMode -Version Latest
+$ErrorActionPreference = 'Stop'
+$ScriptVersion = '2.1.5'
+
+# ============================================================================
+# CONFIGURATION
+# ============================================================================
+
+# Keep this version aligned with the ZIP placed on the deployment share.
+[string]$ElasticAgentVersion = '9.5.0'
+
+# Fleet enrollment settings copied from the current Install.ps1.
+# NOTE: The enrollment token is sensitive. Restrict read access to this script/share.
+[string]$FleetServerUrl   = 'https://10.2.12.4:8220'
+[string]$EnrollmentToken  = 'X2lseThaOEJ2UFRmNGxFS0k1aEg6dUI2VVFOVGRnWHhmeHI5S05uWDd2dw=='
+
+# Fleet Server is currently using the Quick Start self-signed TLS certificate.
+# Keep this $true until Fleet Server is moved to a certificate trusted by the lab PCs.
+[bool]$UseInsecureFleetTls = $true
+
+# Preferred and fallback ZIP locations.
+[string]$PreferredInstallerPath = "\\filesvr\Labscripts\ElasticAgent\elastic-agent-$ElasticAgentVersion-windows-x86_64.zip"
+[string]$FallbackInstallerPath  = "\\10.2.3.30\Labscripts\ElasticAgent\elastic-agent-$ElasticAgentVersion-windows-x86_64.zip"
+
+# Official Elastic download fallback. Used automatically when both internal shares are unavailable.
+[string]$DownloadUri = "https://artifacts.elastic.co/downloads/beats/elastic-agent/elastic-agent-$ElasticAgentVersion-windows-x86_64.zip"
+
+# Optional SHA-512 value from Elastic's matching .sha512 file.
+# Leave blank to skip package-hash enforcement.
+[string]$ExpectedSHA512 = ''
+
+[string]$ElasticServiceName = 'Elastic Agent'
+[string]$InstalledAgentPath = 'C:\Program Files\Elastic\Agent\elastic-agent.exe'
+[string]$WorkingRoot        = 'C:\ProgramData\Compton\ElasticAgentInstall'
+[string]$LogDirectory       = 'C:\Logs'
+[string]$LogPath            = $null
+[string]$PublishedLogPath   = $null
+$LogSession                 = $null
+[int]$MaximumLogSizeMB      = 10
+[int]$LogRetentionDays      = 60
+
+[string]$TelemetryPath       = Join-Path $LogDirectory 'Maintenance-Telemetry.ndjson'
+[string]$LatestTelemetryPath = Join-Path $LogDirectory '15_Install_Elastic_Agent.latest.json'
+
+$script:StartTime    = Get-Date
+$script:WarningCount = 0
+$script:ErrorCount   = 0
+$script:CurrentStage = 'Initialization'
+$script:FailureStage = $null
+$script:FailureMessage = $null
+$script:MatchedPrefix = $null
+$script:ExistingHealth = $null
+$script:FinalHealth = $null
+$script:PackageSource = $null
+$script:PackageHashEnforced = -not [string]::IsNullOrWhiteSpace($ExpectedSHA512)
+$script:PackageHashVerified = $false
+$script:InstallationAttempted = $false
+$script:EnrollmentAttempted = $false
+$script:InstallerExitCode = $null
+$script:VersionResponse = $null
+$script:ExistingHealthRestartAttempted = $false
+$script:ExistingHealthRestored = $false
+$script:ReinstallAttempted = $false
+$script:OverallResult = 'Unknown'
+
+$MaintenanceFrameworkPath = 'C:\Scripts\Maintenance.Framework.psm1'
+Import-Module -Name $MaintenanceFrameworkPath -Force -ErrorAction Stop
+$MaintenanceConfig = Initialize-MaintenanceEnvironment -ScriptRoot 'C:\Scripts' -LogRoot $LogDirectory
+
+$requiredFrameworkVersion = [version]'2.4.0'
+$currentFrameworkVersion = [version](Get-MaintenanceFrameworkVersion)
+
+if ($currentFrameworkVersion -lt $requiredFrameworkVersion) {
+    throw "Script 15 requires Maintenance.Framework.psm1 version $requiredFrameworkVersion or newer. Installed version: $currentFrameworkVersion"
+}
+
+Archive-MaintenanceLogs `
+    -ScriptName '15_Install_Elastic_Agent.ps1' `
+    -LogRoot $LogDirectory `
+    -AdditionalPatterns @(
+        '15_Install_Elastic_Agent.log',
+        '*-15_Install_Elastic_Agent-*.log'
+    ) | Out-Null
+
+$LogSession = New-MaintenanceStagedLog `
+    -ScriptName '15_Install_Elastic_Agent.ps1' `
+    -LogRoot $LogDirectory `
+    -StagingRoot $MaintenanceConfig.LogStagingRoot `
+    -ComputerName $env:COMPUTERNAME `
+    -Timestamp (Get-Date)
+
+$LogPath = [string]$LogSession.WorkingPath
+$PublishedLogPath = [string]$LogSession.PublishedPath
+
+# ============================================================================
+# FUNCTIONS
+# ============================================================================
+
+function Initialize-Directory {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][string]$Path)
+
+    if (-not (Test-Path -LiteralPath $Path -PathType Container)) {
+        New-Item -Path $Path -ItemType Directory -Force | Out-Null
+    }
+}
+
+function Invoke-LogMaintenance {
+    [CmdletBinding()]
+    param()
+
+    Initialize-Directory -Path $LogDirectory
+    # Current and legacy script 15 logs were archived before the staged log was created.
+    # Retention of C:\Logs\Old Logs is managed centrally by Maintenance.Framework.
+}
+
+function Write-Log {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$Message,
+        [ValidateSet('INFO', 'WARNING', 'ERROR', 'SUCCESS')][string]$Level = 'INFO'
+    )
+
+    if ($Level -eq 'WARNING') { $script:WarningCount++ }
+    elseif ($Level -eq 'ERROR') { $script:ErrorCount++ }
+
+    $line = '{0} [{1}] [{2}] {3}' -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $env:COMPUTERNAME, $Level, $Message
+    $activeLogDirectory = Split-Path -Parent $LogPath
+    Initialize-Directory -Path $activeLogDirectory
+    Add-Content -LiteralPath $LogPath -Value $line -Encoding UTF8
+    Write-Host $line
+}
+
+
+function New-StringArrayForJson {
+    [CmdletBinding()]
+    param([AllowNull()]$InputObject)
+
+    [string[]]$items = @(
+        $InputObject |
+        ForEach-Object { [string]$_ } |
+        Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+    )
+
+    if ($items.Count -eq 0) {
+        return ,([object[]]@())
+    }
+
+    return ,([object[]]$items)
+}
+
+function Convert-AgentHealthForTelemetry {
+    [CmdletBinding()]
+    param([AllowNull()]$Health)
+
+    if ($null -eq $Health) {
+        return $null
+    }
+
+    [ordered]@{
+        Installed      = [bool]$Health.Installed
+        ServiceRunning = [bool]$Health.ServiceRunning
+        ServiceStatus  = $Health.ServiceStatus
+        StatusHealthy  = [bool]$Health.StatusHealthy
+        Healthy        = [bool]$Health.Healthy
+        StatusExitCode = $Health.StatusExitCode
+        StatusOutput   = New-StringArrayForJson -InputObject $Health.StatusOutput
+        Message        = $Health.Message
+    }
+}
+
+function Write-JsonAtomically {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)][string]$Json
+    )
+
+    $temporary = '{0}.{1}.tmp' -f $Path, ([guid]::NewGuid().Guid)
+    [IO.File]::WriteAllText($temporary, $Json, (New-Object Text.UTF8Encoding($false)))
+    Move-Item -LiteralPath $temporary -Destination $Path -Force
+}
+
+function Write-ElasticAgentTelemetry {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][int]$ExitCode)
+
+    $eventTime = Get-Date
+    $domain = $env:USERDOMAIN
+    try {
+        $computerSystem = Get-CimInstance Win32_ComputerSystem -ErrorAction Stop
+        if ($computerSystem.Domain) { $domain = [string]$computerSystem.Domain }
+    }
+    catch { }
+
+    $status = if ($ExitCode -ne 0) {
+        'Failed'
+    }
+    elseif ($script:OverallResult -eq 'ExistingUnhealthyNeedsInvestigation' -or
+            $script:OverallResult -eq 'InstalledButUnhealthy') {
+        'SuccessWithWarnings'
+    }
+    else {
+        'Success'
+    }
+
+    $event = [ordered]@{
+        '@timestamp'   = $eventTime.ToUniversalTime().ToString('o')
+        EventType      = 'maintenance.elastic_agent'
+        SchemaVersion  = '1.0'
+        ComputerName   = $env:COMPUTERNAME
+        Domain         = $domain
+        ScriptName     = '15_Install_Elastic_Agent.ps1'
+        ScriptVersion  = $ScriptVersion
+        Status         = $status
+        OverallResult  = $script:OverallResult
+        ExitCode       = $ExitCode
+        StartTime      = $script:StartTime.ToUniversalTime().ToString('o')
+        EndTime        = $eventTime.ToUniversalTime().ToString('o')
+        DurationSeconds = [math]::Round(($eventTime - $script:StartTime).TotalSeconds, 3)
+        WarningCount   = $script:WarningCount
+        ErrorCount     = $script:ErrorCount
+        FailureStage   = $script:FailureStage
+        FailureMessage = $script:FailureMessage
+        TextLogPath    = $PublishedLogPath
+
+        Targeting = [ordered]@{
+            Approved        = ($null -ne $script:MatchedPrefix)
+            MatchedPrefix   = $script:MatchedPrefix
+            AllowedPrefixes = New-StringArrayForJson -InputObject $AllowedComputerPrefixes
+        }
+
+        ExistingAgent = Convert-AgentHealthForTelemetry -Health $script:ExistingHealth
+
+        Installation = [ordered]@{
+            ForceReinstall          = [bool]$ForceReinstall
+            Attempted               = [bool]$script:InstallationAttempted
+            ReinstallAttempted      = [bool]$script:ReinstallAttempted
+            PackageSource           = $script:PackageSource
+            PackageVersion          = $ElasticAgentVersion
+            PreferredInstallerPath  = $PreferredInstallerPath
+            FallbackInstallerPath   = $FallbackInstallerPath
+            DownloadUri             = $DownloadUri
+            PackageHashEnforced     = [bool]$script:PackageHashEnforced
+            PackageHashVerified     = [bool]$script:PackageHashVerified
+            FleetServerUrl          = $FleetServerUrl
+            UseInsecureFleetTls     = [bool]$UseInsecureFleetTls
+            EnrollmentAttempted     = [bool]$script:EnrollmentAttempted
+            EnrollmentTokenProvided = -not [string]::IsNullOrWhiteSpace($EnrollmentToken)
+            EnrollmentTokenLogged   = $false
+            InstallerExitCode       = $script:InstallerExitCode
+        }
+
+        Actions = [ordered]@{
+            ExistingAgentDetected          = ($null -ne $script:ExistingHealth -and [bool]$script:ExistingHealth.Installed)
+            ExistingHealthRestartAttempted = [bool]$script:ExistingHealthRestartAttempted
+            ExistingHealthRestored         = [bool]$script:ExistingHealthRestored
+            ReinstallAttempted              = [bool]$script:ReinstallAttempted
+            EnrollmentAttempted             = [bool]$script:EnrollmentAttempted
+        }
+
+        FinalAgent = Convert-AgentHealthForTelemetry -Health $script:FinalHealth
+        VersionResponse = $script:VersionResponse
+    }
+
+    Write-Log -Message ("Elastic Agent telemetry summary: Status={0}; Result={1}; Targeted={2}; ExistingHealthy={3}; InstallAttempted={4}; PackageSource={5}; FinalHealthy={6}; ExitCode={7}" -f `
+        $event.Status,
+        $event.OverallResult,
+        $event.Targeting.Approved,
+        $(if ($event.ExistingAgent) { $event.ExistingAgent.Healthy } else { $null }),
+        $event.Installation.Attempted,
+        $event.Installation.PackageSource,
+        $(if ($event.FinalAgent) { $event.FinalAgent.Healthy } else { $null }),
+        $event.ExitCode)
+
+    $compact = $event | ConvertTo-Json -Depth 12 -Compress
+    $pretty  = $event | ConvertTo-Json -Depth 12
+
+    Write-MaintenanceTelemetryLine -Path $TelemetryPath -JsonLine $compact
+    Write-JsonAtomically -Path $LatestTelemetryPath -Json $pretty
+}
+
+function Test-ApprovedComputer {
+    [CmdletBinding()]
+    param()
+
+    foreach ($prefix in $AllowedComputerPrefixes) {
+        if (-not [string]::IsNullOrWhiteSpace($prefix) -and
+            $env:COMPUTERNAME.StartsWith($prefix, [System.StringComparison]::OrdinalIgnoreCase)) {
+            $script:MatchedPrefix = [string]$prefix
+            return $true
+        }
+    }
+
+    return $false
+}
+
+function Test-IsAdministrator {
+    [CmdletBinding()]
+    param()
+
+    $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+    $principal = New-Object Security.Principal.WindowsPrincipal($identity)
+    return $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+}
+
+function Get-InstalledElasticAgent {
+    [CmdletBinding()]
+    param()
+
+    $service = Get-Service -Name $ElasticServiceName -ErrorAction SilentlyContinue
+    $exeExists = Test-Path -LiteralPath $InstalledAgentPath -PathType Leaf
+
+    [pscustomobject]@{
+        ServiceExists = ($null -ne $service)
+        Service       = $service
+        ExecutableExists = $exeExists
+        IsInstalled   = (($null -ne $service) -and $exeExists)
+    }
+}
+
+
+function Get-ElasticAgentHealth {
+    [CmdletBinding()]
+    param()
+
+    $installed = Get-InstalledElasticAgent
+
+    if (-not $installed.IsInstalled) {
+        return [pscustomobject]@{
+            Installed      = $false
+            ServiceRunning = $false
+            StatusHealthy  = $false
+            Healthy        = $false
+            ServiceStatus  = $null
+            StatusExitCode = $null
+            StatusOutput   = New-StringArrayForJson -InputObject @()
+            Message        = 'Elastic Agent is not fully installed.'
+        }
+    }
+
+    $service = Get-Service -Name $ElasticServiceName -ErrorAction SilentlyContinue
+
+    if ($service -and $service.Status -ne 'Running') {
+        Write-Log -Level WARNING -Message "Elastic Agent service is installed but currently $($service.Status). Attempting to start it."
+
+        try {
+            Set-Service -Name $ElasticServiceName -StartupType Automatic -ErrorAction SilentlyContinue
+            Start-Service -Name $ElasticServiceName -ErrorAction Stop
+            $service.WaitForStatus('Running', [timespan]::FromSeconds(20))
+        }
+        catch {
+            Write-Log -Level WARNING -Message "Unable to start Elastic Agent service: $($_.Exception.Message)"
+        }
+
+        $service = Get-Service -Name $ElasticServiceName -ErrorAction SilentlyContinue
+    }
+
+    $serviceRunning = ($service -and $service.Status -eq 'Running')
+    $statusOutput = @()
+    $statusExitCode = $null
+    $statusHealthy = $false
+
+    if (Test-Path -LiteralPath $InstalledAgentPath -PathType Leaf) {
+        try {
+            $statusOutput = @(& $InstalledAgentPath status 2>&1 | ForEach-Object { [string]$_ })
+            $statusExitCode = $LASTEXITCODE
+            $joined = ($statusOutput -join "`n")
+
+            $statusHealthy = (
+                $statusExitCode -eq 0 -and
+                $joined -match '(?im)\bHEALTHY\b' -and
+                $joined -notmatch '(?im)\bFAILED\b|\bDEGRADED\b|\bUNHEALTHY\b'
+            )
+        }
+        catch {
+            $statusOutput = @($_.Exception.Message)
+            $statusExitCode = -1
+        }
+    }
+
+    $healthy = ($serviceRunning -and $statusHealthy)
+
+    [pscustomobject]@{
+        Installed      = $true
+        ServiceRunning = $serviceRunning
+        StatusHealthy  = $statusHealthy
+        Healthy        = $healthy
+        ServiceStatus  = if ($service) { [string]$service.Status } else { 'Missing' }
+        StatusExitCode = $statusExitCode
+        StatusOutput   = New-StringArrayForJson -InputObject $statusOutput
+        Message        = if ($healthy) {
+            'Elastic Agent is installed and reporting HEALTHY.'
+        }
+        elseif (-not $serviceRunning) {
+            'Elastic Agent is installed, but its Windows service is not running.'
+        }
+        else {
+            'Elastic Agent service is running, but elastic-agent status is not reporting HEALTHY.'
+        }
+    }
+}
+
+function Wait-ElasticAgentHealth {
+    [CmdletBinding()]
+    param(
+        [ValidateRange(1,20)][int]$Attempts = 8,
+        [ValidateRange(1,60)][int]$DelaySeconds = 5
+    )
+
+    $lastHealth = $null
+
+    for ($attempt = 1; $attempt -le $Attempts; $attempt++) {
+        $lastHealth = Get-ElasticAgentHealth
+
+        if ($lastHealth.Healthy) {
+            return $lastHealth
+        }
+
+        if ($attempt -lt $Attempts) {
+            Write-Log -Message ("Elastic Agent health check {0}/{1} is not yet HEALTHY. ServiceStatus={2}; StatusExitCode={3}. Retrying in {4} seconds." -f `
+                $attempt, $Attempts, $lastHealth.ServiceStatus, $lastHealth.StatusExitCode, $DelaySeconds)
+            Start-Sleep -Seconds $DelaySeconds
+        }
+    }
+
+    return $lastHealth
+}
+
+function Test-ExistingElasticAgentAndExit {
+    [CmdletBinding()]
+    param()
+
+    $health = Get-ElasticAgentHealth
+
+    if (-not $health.Installed) {
+        return $false
+    }
+
+    Write-Log -Message "Existing Elastic Agent detected. ServiceStatus=$($health.ServiceStatus); StatusExitCode=$($health.StatusExitCode)."
+
+    foreach ($line in @($health.StatusOutput | Select-Object -First 15)) {
+        if (-not [string]::IsNullOrWhiteSpace($line)) {
+            Write-Log -Message "Elastic status: $line"
+        }
+    }
+
+    if ($health.Healthy) {
+        Write-Log -Level SUCCESS -Message 'Elastic Agent is already installed and working properly. No installation action is required.'
+        return $true
+    }
+
+    Write-Log -Level WARNING -Message $health.Message
+    $script:ExistingHealthRestartAttempted = $true
+
+    try {
+        Restart-Service -Name $ElasticServiceName -Force -ErrorAction Stop
+        (Get-Service -Name $ElasticServiceName -ErrorAction Stop).WaitForStatus('Running', [timespan]::FromSeconds(20))
+    }
+    catch {
+        Write-Log -Level WARNING -Message "Elastic Agent service restart attempt failed: $($_.Exception.Message)"
+    }
+
+    $retry = Wait-ElasticAgentHealth -Attempts 6 -DelaySeconds 5
+
+    if ($retry.Healthy) {
+        $script:ExistingHealthRestored = $true
+        Write-Log -Level SUCCESS -Message 'Elastic Agent was already installed. Health was restored after restarting the service; agent is now working properly.'
+        return $true
+    }
+
+    Write-Log -Level WARNING -Message 'Elastic Agent is installed but did not verify as healthy after a service restart. Installation will not be duplicated; manual/Fleet investigation is recommended.'
+    return $true
+}
+
+function Resolve-InstallerPackage {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][string]$DestinationPath)
+
+    $source = $null
+
+    if (Test-Path -LiteralPath $PreferredInstallerPath -PathType Leaf -ErrorAction SilentlyContinue) {
+        $source = $PreferredInstallerPath
+        Write-Log -Level SUCCESS -Message "Elastic Agent package found at preferred share: $PreferredInstallerPath"
+    }
+    elseif (Test-Path -LiteralPath $FallbackInstallerPath -PathType Leaf -ErrorAction SilentlyContinue) {
+        $source = $FallbackInstallerPath
+        Write-Log -Level WARNING -Message "Preferred Elastic Agent share was unavailable. Using fallback share: $FallbackInstallerPath"
+    }
+
+    if ($null -ne $source) {
+        Write-Log -Message "Copying Elastic Agent package from $source"
+        Copy-Item -LiteralPath $source -Destination $DestinationPath -Force -ErrorAction Stop
+
+        if (-not (Test-Path -LiteralPath $DestinationPath -PathType Leaf)) {
+            throw "Elastic Agent package copy completed without error, but the local ZIP was not created: $DestinationPath"
+        }
+
+        return 'Share'
+    }
+
+    Write-Log -Level WARNING -Message 'Elastic Agent package was not accessible from either internal share. Falling back to the official Elastic artifact site.'
+    Write-Log -Message "Downloading Elastic Agent $ElasticAgentVersion from $DownloadUri"
+
+    try {
+        [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+
+        Invoke-WebRequest `
+            -Uri $DownloadUri `
+            -OutFile $DestinationPath `
+            -UseBasicParsing `
+            -ErrorAction Stop
+
+        if (-not (Test-Path -LiteralPath $DestinationPath -PathType Leaf)) {
+            throw "Elastic Agent Internet download completed without error, but the ZIP was not created: $DestinationPath"
+        }
+
+        $downloadedLength = (Get-Item -LiteralPath $DestinationPath -ErrorAction Stop).Length
+        if ($downloadedLength -lt 1MB) {
+            throw "Elastic Agent Internet download appears incomplete. Downloaded size: $downloadedLength bytes."
+        }
+
+        Write-Log -Level SUCCESS -Message "Elastic Agent package downloaded successfully from the official Elastic artifact site. Size=$downloadedLength bytes."
+        return 'Internet'
+    }
+    catch {
+        throw "Elastic Agent package was unavailable from both internal shares and the official Internet download also failed: $($_.Exception.Message)"
+    }
+}
+
+function Test-PackageHash {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][string]$Path)
+
+    if ([string]::IsNullOrWhiteSpace($ExpectedSHA512)) {
+        Write-Log -Level WARNING -Message 'ExpectedSHA512 is blank; package hash enforcement was skipped.'
+        return $false
+    }
+
+    $actual = (Get-FileHash -LiteralPath $Path -Algorithm SHA512).Hash
+    if (-not $actual.Equals($ExpectedSHA512.Trim(), [System.StringComparison]::OrdinalIgnoreCase)) {
+        throw "Elastic Agent package SHA-512 mismatch. Expected $ExpectedSHA512 but found $actual."
+    }
+
+    Write-Log -Message 'Elastic Agent package SHA-512 validation passed.'
+    return $true
+}
+
+# ============================================================================
+# MAIN
+# ============================================================================
+
+$exitCode = 1
+
+try {
+    $script:CurrentStage = 'Initialization'
+    Invoke-LogMaintenance
+    Write-Log -Message "Elastic Agent installation check started. ScriptVersion=$ScriptVersion."
+
+    $script:CurrentStage = 'PrivilegeCheck'
+    if (-not (Test-IsAdministrator)) {
+        throw 'This script must run as Administrator or SYSTEM.'
+    }
+
+    $script:CurrentStage = 'Targeting'
+    if (-not (Test-ApprovedComputer)) {
+        Write-Log -Message "Computer is not in an approved lab prefix. Allowed prefixes: $($AllowedComputerPrefixes -join ', '). No changes were made."
+        $script:OverallResult = 'NotTargeted'
+        $script:FinalHealth = Get-ElasticAgentHealth
+        $exitCode = 0
+        return
+    }
+
+    Write-Log -Message "Computer matched the approved Elastic Agent pilot prefix list."
+
+    $script:CurrentStage = 'ExistingAgentCheck'
+    $installed = Get-InstalledElasticAgent
+    $script:ExistingHealth = Get-ElasticAgentHealth
+
+    if ($installed.IsInstalled -and -not $ForceReinstall) {
+        $existingWasHealthy = [bool]$script:ExistingHealth.Healthy
+
+        if (Test-ExistingElasticAgentAndExit) {
+            $script:FinalHealth = Get-ElasticAgentHealth
+
+            if ($existingWasHealthy) {
+                $script:OverallResult = 'AlreadyHealthy'
+            }
+            elseif ($script:FinalHealth.Healthy -and $script:ExistingHealthRestored) {
+                $script:OverallResult = 'ExistingHealthRestored'
+            }
+            else {
+                $script:OverallResult = 'ExistingUnhealthyNeedsInvestigation'
+            }
+
+            $exitCode = 0
+            return
+        }
+    }
+
+    if (($installed.ServiceExists -or $installed.ExecutableExists) -and $ForceReinstall) {
+        $script:CurrentStage = 'UninstallExistingAgent'
+        $script:ReinstallAttempted = $true
+        Write-Log -Level WARNING -Message 'ForceReinstall was requested. Removing the existing Elastic Agent installation.'
+
+        if (Test-Path -LiteralPath $InstalledAgentPath -PathType Leaf) {
+            $uninstallProcess = Start-Process -FilePath $InstalledAgentPath `
+                -ArgumentList @('uninstall', '--force', '--skip-fleet-audit') `
+                -Wait -PassThru -WindowStyle Hidden
+
+            if ($uninstallProcess.ExitCode -ne 0) {
+                throw "Existing Elastic Agent uninstall returned exit code $($uninstallProcess.ExitCode)."
+            }
+        }
+    }
+
+    if (Test-Path -LiteralPath $WorkingRoot) {
+        Remove-Item -LiteralPath $WorkingRoot -Recurse -Force
+    }
+    Initialize-Directory -Path $WorkingRoot
+
+    $zipPath = Join-Path $WorkingRoot "elastic-agent-$ElasticAgentVersion-windows-x86_64.zip"
+    $extractRoot = Join-Path $WorkingRoot 'Extracted'
+
+    $script:CurrentStage = 'ResolveInstallerPackage'
+    $script:PackageSource = Resolve-InstallerPackage -DestinationPath $zipPath
+    Unblock-File -LiteralPath $zipPath -ErrorAction SilentlyContinue
+
+    $script:CurrentStage = 'ValidatePackageHash'
+    $script:PackageHashVerified = [bool](Test-PackageHash -Path $zipPath)
+
+    $script:CurrentStage = 'ExtractPackage'
+    Initialize-Directory -Path $extractRoot
+    Expand-Archive -LiteralPath $zipPath -DestinationPath $extractRoot -Force
+
+    $agentExecutable = Get-ChildItem -LiteralPath $extractRoot -Filter 'elastic-agent.exe' -File -Recurse |
+        Select-Object -First 1
+
+    if ($null -eq $agentExecutable) {
+        throw 'elastic-agent.exe was not found in the extracted package.'
+    }
+
+    $agentDirectory = $agentExecutable.Directory.FullName
+    Get-ChildItem -LiteralPath $agentDirectory -File -Recurse | Unblock-File -ErrorAction SilentlyContinue
+
+    $script:CurrentStage = 'InstallAndEnroll'
+    $script:InstallationAttempted = $true
+    $script:EnrollmentAttempted = $true
+    Write-Log -Message "Installing Elastic Agent $ElasticAgentVersion and enrolling with Fleet Server $FleetServerUrl."
+
+    # --non-interactive suppresses installation questions/prompts.
+    # --force suppresses configuration-overwrite confirmation. This script only
+    # reaches this point on a fresh install or after -ForceReinstall removed the
+    # previous installation, avoiding duplicate-agent behavior.
+    $installArguments = @(
+        'install',
+        "--url=$FleetServerUrl",
+        "--enrollment-token=$EnrollmentToken",
+        '--non-interactive',
+        '--force'
+    )
+
+    # Quick Start Fleet Server uses a self-signed certificate. Remote agents must
+    # use --insecure until Fleet Server is configured with a certificate trusted
+    # by the Windows endpoints.
+    if ($UseInsecureFleetTls) {
+        $installArguments += '--insecure'
+        Write-Log -Level WARNING -Message 'Fleet Server TLS certificate verification is disabled for enrollment because UseInsecureFleetTls is enabled.'
+    }
+
+    # Capture the Elastic Agent install/enrollment output so a failed deployment
+    # records the underlying Elastic error instead of only returning exit code 1.
+    $installerStdOut = Join-Path $WorkingRoot 'elastic-agent-install.stdout.log'
+    $installerStdErr = Join-Path $WorkingRoot 'elastic-agent-install.stderr.log'
+
+    $installProcess = Start-Process -FilePath $agentExecutable.FullName `
+        -ArgumentList $installArguments `
+        -WorkingDirectory $agentDirectory `
+        -Wait -PassThru -WindowStyle Hidden `
+        -RedirectStandardOutput $installerStdOut `
+        -RedirectStandardError $installerStdErr
+
+    $script:InstallerExitCode = $installProcess.ExitCode
+    $capturedInstallerOutput = @()
+    if (Test-Path -LiteralPath $installerStdOut -PathType Leaf) {
+        $capturedInstallerOutput += Get-Content -LiteralPath $installerStdOut -ErrorAction SilentlyContinue
+    }
+    if (Test-Path -LiteralPath $installerStdErr -PathType Leaf) {
+        $capturedInstallerOutput += Get-Content -LiteralPath $installerStdErr -ErrorAction SilentlyContinue
+    }
+
+    $script:CurrentStage = 'VerifyInstalledAgent'
+    $verification = Wait-ElasticAgentHealth -Attempts 8 -DelaySeconds 5
+    $script:FinalHealth = $verification
+
+    if ($installProcess.ExitCode -ne 0 -and -not $verification.Healthy) {
+        $capturedInstallerOutput | Select-Object -Last 30 | ForEach-Object {
+            if (-not [string]::IsNullOrWhiteSpace($_)) {
+                Write-Log -Level ERROR -Message "Elastic Agent: $_"
+            }
+        }
+        throw "Elastic Agent installer returned exit code $($installProcess.ExitCode), and the installed agent did not become HEALTHY during verification."
+    }
+
+    $capturedInstallerOutput | Select-Object -Last 10 | ForEach-Object {
+        if (-not [string]::IsNullOrWhiteSpace($_)) {
+            Write-Log -Message "Elastic Agent: $_"
+        }
+    }
+
+    if ($installProcess.ExitCode -ne 0 -and $verification.Healthy) {
+        Write-Log -Level WARNING -Message ("Elastic Agent installer returned exit code {0}, but the installed service subsequently reported HEALTHY. The installer result was treated as a transient daemon-startup race." -f $installProcess.ExitCode)
+    }
+
+    if (-not $verification.Installed) {
+        throw 'Elastic Agent installation verification failed.'
+    }
+
+    if (-not $verification.Healthy) {
+        Write-Log -Level WARNING -Message "Elastic Agent installation completed, but health verification did not report HEALTHY. ServiceStatus=$($verification.ServiceStatus); StatusExitCode=$($verification.StatusExitCode)."
+        foreach ($line in @($verification.StatusOutput | Select-Object -First 15)) {
+            if (-not [string]::IsNullOrWhiteSpace($line)) {
+                Write-Log -Message "Elastic status: $line"
+            }
+        }
+    }
+    else {
+        Write-Log -Level SUCCESS -Message 'Elastic Agent installation verified: service is running and elastic-agent status reports HEALTHY.'
+    }
+
+    try {
+        Set-Service -Name $ElasticServiceName -StartupType Automatic -ErrorAction Stop
+        Start-Service -Name $ElasticServiceName -ErrorAction SilentlyContinue
+        $serviceState = (Get-Service -Name $ElasticServiceName -ErrorAction Stop).Status
+        Write-Log -Message "Elastic Agent service state after installation: $serviceState"
+    }
+    catch {
+        Write-Log -Level WARNING -Message "Elastic Agent installed, but service verification encountered an issue: $($_.Exception.Message)"
+    }
+
+    $installedVersion = (& $InstalledAgentPath version 2>$null | Out-String).Trim()
+    $script:VersionResponse = $installedVersion
+    Write-Log -Level SUCCESS -Message "Elastic Agent installed successfully. Version response: $installedVersion"
+    Write-Log -Level SUCCESS -Message 'Fleet enrollment was requested successfully and the Elastic Agent service is left enabled for Fleet management.'
+
+    $script:FinalHealth = Get-ElasticAgentHealth
+    if ($script:FinalHealth.Healthy) {
+        $script:OverallResult = if ($script:ReinstallAttempted) { 'ReinstalledAndHealthy' } else { 'InstalledAndHealthy' }
+    }
+    else {
+        $script:OverallResult = 'InstalledButUnhealthy'
+    }
+
+    $exitCode = 0
+}
+catch {
+    $script:FailureStage = $script:CurrentStage
+    $script:FailureMessage = $_.Exception.Message
+    $script:OverallResult = 'Failed'
+    try {
+        $script:FinalHealth = Get-ElasticAgentHealth
+    }
+    catch { }
+
+    try {
+        Write-Log -Level ERROR -Message $_.Exception.Message
+    }
+    catch {
+        Write-Error $_.Exception.Message
+    }
+    $exitCode = 1
+}
+finally {
+    if (Test-Path -LiteralPath $WorkingRoot -PathType Container) {
+        Remove-Item -LiteralPath $WorkingRoot -Recurse -Force -ErrorAction SilentlyContinue
+    }
+
+    # Emit one structured deployment event for Elastic. The enrollment token itself
+    # is never written; telemetry records only whether one was provided.
+    try {
+        if ($null -eq $script:FinalHealth) {
+            $script:FinalHealth = Get-ElasticAgentHealth
+        }
+        Write-ElasticAgentTelemetry -ExitCode $exitCode
+    }
+    catch {
+        try {
+            Write-Log -Level ERROR -Message ("Elastic Agent telemetry finalization failed: {0}" -f $_.Exception.Message)
+        }
+        catch { }
+        if ($exitCode -eq 0) { $exitCode = 4 }
+    }
+
+    # Final append before the completed immutable text log enters C:\Logs.
+    try {
+        Write-Log -Message ("Finalizing 15_Install_Elastic_Agent.ps1. ExitCode={0}" -f $exitCode) `
+            -Level $(if ($exitCode -eq 0) { 'SUCCESS' } else { 'ERROR' })
+    }
+    catch {
+        Write-Warning ("Unable to write final script 15 staged log entry: {0}" -f $_.Exception.Message)
+    }
+
+    if ($null -ne $LogSession) {
+        $publishResult = Publish-MaintenanceLog -LogSession $LogSession
+
+        if ($publishResult.Published) {
+            Write-Host ("Published completed script 15 text log for Elastic: {0}" -f $PublishedLogPath) -ForegroundColor Green
+        }
+        else {
+            Write-Warning ("Script 15 completed text log remains in staging because publication failed: {0}" -f $publishResult.Path)
+        }
+    }
+}
+
+exit $exitCode
 '@
     }
     BrowserHomepage = [ordered]@{
         FileName = '17_Set_Browser_Homepage.ps1'
-        Sha256   = '108521BA08427BEEA952DFA2624F84DFC32E72A622D0D417458B7E74EF269E23'
-        GzipBase64 = @'
-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
+        # Plain-text source is intentionally embedded for maintainability.
+        Source = @'
+# ScriptName: 17_Set_Browser_Homepage.ps1
+# ScriptVersion: 1.1.0
+# LastUpdated: 2026-08-27
+# Changes: v1.1.0 adds machine-wide Chrome onboarding/default-browser suppression
+#          for shared lab computers while retaining browser sign-in disablement.
+#          v1.0.1 updates the internal script identity, log names, and telemetry
+#          dataset after renaming the file from script 19 to script 17.
+# Purpose: Configure Firefox, Google Chrome, and Microsoft Edge to use the
+#          Compton College website as the machine-wide homepage and startup
+#          page. Disable Chrome browser/profile sign-in and sync, suppress Chrome
+#          promotional/first-run sign-in content and default-browser prompts, while
+#          preserving normal sign-in to websites.
+
+[CmdletBinding(SupportsShouldProcess = $true, ConfirmImpact = 'Low')]
+param(
+    [ValidatePattern('^https://')]
+    [string]$HomepageUrl = 'https://www.compton.edu',
+
+    [string]$LogFolder = 'C:\Logs'
+)
+
+Set-StrictMode -Version Latest
+$ErrorActionPreference = 'Stop'
+
+$script:ScriptName = '17_Set_Browser_Homepage.ps1'
+$script:ScriptVersion = '1.1.0'
+$script:ComputerName = $env:COMPUTERNAME
+$script:StartTime = Get-Date
+$script:RunId = [guid]::NewGuid().Guid
+$script:ChangedCount = 0
+$script:VerifiedCount = 0
+$script:Status = 'failed'
+$script:ExitCode = 1
+$script:LogPath = Join-Path $LogFolder '17_Set_Browser_Homepage.log'
+$script:LatestTelemetryPath = Join-Path $LogFolder '17_Set_Browser_Homepage.latest.json'
+$script:TelemetryPath = Join-Path $LogFolder 'Maintenance-Telemetry.ndjson'
+
+function Write-Log {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$Message,
+        [ValidateSet('INFO','SUCCESS','WARNING','ERROR')][string]$Level = 'INFO'
+    )
+
+    if (-not (Test-Path -LiteralPath $LogFolder -PathType Container)) {
+        New-Item -Path $LogFolder -ItemType Directory -Force | Out-Null
+    }
+
+    $timestamp = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
+    $line = '{0} [{1}] [{2}] {3}' -f $timestamp, $script:ComputerName, $Level, $Message
+    Write-Host $line -ForegroundColor $(switch ($Level) {
+        'SUCCESS' { 'Green' }
+        'WARNING' { 'Yellow' }
+        'ERROR'   { 'Red' }
+        default   { 'Cyan' }
+    })
+    Add-Content -LiteralPath $script:LogPath -Value $line -Encoding UTF8
+}
+
+function Assert-Administrator {
+    $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+    $principal = New-Object Security.Principal.WindowsPrincipal($identity)
+    if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+        throw 'This script must run elevated or as Local System.'
+    }
+
+    if ([Environment]::Is64BitOperatingSystem -and -not [Environment]::Is64BitProcess) {
+        throw 'Run this script with 64-bit PowerShell so browser policies are written to the correct registry view.'
+    }
+}
+
+function Set-PolicyValue {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$Browser,
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)][string]$Name,
+        [Parameter(Mandatory)]$Value,
+        [Parameter(Mandatory)][ValidateSet('String','DWord')][string]$Type
+    )
+
+    if (-not (Test-Path -LiteralPath $Path)) {
+        New-Item -Path $Path -Force | Out-Null
+    }
+
+    $currentValue = $null
+    $valueExists = $false
+    try {
+        $currentValue = Get-ItemPropertyValue -LiteralPath $Path -Name $Name -ErrorAction Stop
+        $valueExists = $true
+    }
+    catch [System.Management.Automation.PSArgumentException] {}
+    catch [System.Management.Automation.ItemNotFoundException] {}
+
+    $expectedValue = if ($Type -eq 'DWord') { [int]$Value } else { [string]$Value }
+    $alreadyCorrect = $valueExists -and ([string]$currentValue -eq [string]$expectedValue)
+
+    if (-not $alreadyCorrect) {
+        New-ItemProperty -LiteralPath $Path -Name $Name -Value $expectedValue -PropertyType $Type -Force | Out-Null
+        $script:ChangedCount++
+        Write-Log ("{0}: Set {1} = {2}." -f $Browser, $Name, $expectedValue) 'INFO'
+    }
+    else {
+        Write-Log ("{0}: {1} is already correctly configured." -f $Browser, $Name) 'INFO'
+    }
+
+    $verifiedValue = Get-ItemPropertyValue -LiteralPath $Path -Name $Name -ErrorAction Stop
+    if ([string]$verifiedValue -ne [string]$expectedValue) {
+        throw ("{0}: Verification failed for {1}. Expected '{2}', found '{3}'." -f $Browser, $Name, $expectedValue, $verifiedValue)
+    }
+
+    $script:VerifiedCount++
+}
+
+function Remove-UnwantedPolicyValues {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$Browser,
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)][string[]]$AllowedNames
+    )
+
+    if (-not (Test-Path -LiteralPath $Path)) { return }
+
+    $properties = @(
+        (Get-ItemProperty -LiteralPath $Path -ErrorAction Stop).PSObject.Properties |
+        Where-Object { $_.Name -notmatch '^PS(Path|ParentPath|ChildName|Drive|Provider)$' }
+    )
+
+    foreach ($property in $properties) {
+        if ($property.Name -notin $AllowedNames) {
+            Remove-ItemProperty -LiteralPath $Path -Name $property.Name -Force -ErrorAction Stop
+            $script:ChangedCount++
+            Write-Log ("{0}: Removed unwanted startup URL policy entry '{1}'." -f $Browser, $property.Name) 'INFO'
+        }
+    }
+}
+
+function Add-SharedTextLine {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)][string]$Line,
+        [int]$MaximumAttempts = 10
+    )
+
+    for ($attempt = 1; $attempt -le $MaximumAttempts; $attempt++) {
+        $stream = $null
+        $writer = $null
+        try {
+            $stream = [System.IO.File]::Open(
+                $Path,
+                [System.IO.FileMode]::Append,
+                [System.IO.FileAccess]::Write,
+                [System.IO.FileShare]::ReadWrite
+            )
+            $writer = [System.IO.StreamWriter]::new($stream, [System.Text.UTF8Encoding]::new($false))
+            $writer.WriteLine($Line)
+            $writer.Flush()
+            return
+        }
+        catch [System.IO.IOException] {
+            if ($attempt -ge $MaximumAttempts) { throw }
+            Start-Sleep -Milliseconds (250 * $attempt)
+        }
+        finally {
+            if ($null -ne $writer) { $writer.Dispose() }
+            elseif ($null -ne $stream) { $stream.Dispose() }
+        }
+    }
+}
+
+function Write-Telemetry {
+    $endTime = Get-Date
+    $event = [pscustomobject][ordered]@{
+        EventType       = 'maintenance.execution'
+        EventDataset    = 'compton.maintenance.script17'
+        ComputerName    = $script:ComputerName
+        ScriptName      = $script:ScriptName
+        ScriptVersion   = $script:ScriptVersion
+        RunId           = $script:RunId
+        Status          = $script:Status
+        ExitCode        = $script:ExitCode
+        StartTime       = $script:StartTime.ToString('o')
+        EndTime         = $endTime.ToString('o')
+        DurationSeconds = [math]::Round(($endTime - $script:StartTime).TotalSeconds, 2)
+        Timestamp       = $endTime.ToUniversalTime().ToString('o')
+        HomepageUrl     = $HomepageUrl
+        ChangedCount    = $script:ChangedCount
+        VerifiedCount   = $script:VerifiedCount
+        ChromeSignin                 = 'disabled'
+        ChromeSync                   = 'disabled'
+        ChromeSigninInterception     = 'disabled'
+        ChromePromotionalTabs        = 'disabled'
+        ChromeDefaultBrowserPrompt   = 'disabled'
+        ChromePolicyScope            = 'HKLM-AllUsers'
+        LogPath                      = $script:LogPath
+    }
+
+    $json = $event | ConvertTo-Json -Depth 5 -Compress
+    Add-SharedTextLine -Path $script:TelemetryPath -Line $json
+    $event | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $script:LatestTelemetryPath -Encoding UTF8 -Force
+}
+
+try {
+    Assert-Administrator
+    Write-Log ("Starting browser homepage configuration. Version={0}; Homepage={1}; RunId={2}" -f $script:ScriptVersion, $HomepageUrl, $script:RunId) 'INFO'
+
+    if (-not $PSCmdlet.ShouldProcess($script:ComputerName, "Set Firefox, Chrome, and Edge homepage policies to $HomepageUrl")) {
+        $script:Status = 'what_if'
+        $script:ExitCode = 0
+        return
+    }
+
+    # Google Chrome machine policies.
+    $chromePath = 'HKLM:\SOFTWARE\Policies\Google\Chrome'
+    $chromeStartupPath = Join-Path $chromePath 'RestoreOnStartupURLs'
+    Set-PolicyValue -Browser 'Chrome' -Path $chromePath -Name 'HomepageLocation' -Value $HomepageUrl -Type String
+    Set-PolicyValue -Browser 'Chrome' -Path $chromePath -Name 'HomepageIsNewTabPage' -Value 0 -Type DWord
+    Set-PolicyValue -Browser 'Chrome' -Path $chromePath -Name 'ShowHomeButton' -Value 1 -Type DWord
+    Set-PolicyValue -Browser 'Chrome' -Path $chromePath -Name 'RestoreOnStartup' -Value 4 -Type DWord
+    Set-PolicyValue -Browser 'Chrome' -Path $chromeStartupPath -Name '1' -Value $HomepageUrl -Type String
+    Remove-UnwantedPolicyValues -Browser 'Chrome' -Path $chromeStartupPath -AllowedNames @('1')
+
+    # Disable Chrome browser/profile sign-in and sync prompts. This does not
+    # block users from signing in to websites in Chrome.
+    Set-PolicyValue -Browser 'Chrome' -Path $chromePath -Name 'BrowserSignin' -Value 0 -Type DWord
+    Set-PolicyValue -Browser 'Chrome' -Path $chromePath -Name 'SyncDisabled' -Value 1 -Type DWord
+    Set-PolicyValue -Browser 'Chrome' -Path $chromePath -Name 'SigninInterceptionEnabled' -Value 0 -Type DWord
+
+    # Suppress Chrome's full-tab onboarding/promotional content (including the
+    # sign-in / "stay signed out" first-run experience) and stop Chrome from
+    # asking users to make it the Windows default browser.
+    Set-PolicyValue -Browser 'Chrome' -Path $chromePath -Name 'PromotionalTabsEnabled' -Value 0 -Type DWord
+    Set-PolicyValue -Browser 'Chrome' -Path $chromePath -Name 'DefaultBrowserSettingEnabled' -Value 0 -Type DWord
+
+    # Microsoft Edge machine policies.
+    $edgePath = 'HKLM:\SOFTWARE\Policies\Microsoft\Edge'
+    $edgeStartupPath = Join-Path $edgePath 'RestoreOnStartupURLs'
+    Set-PolicyValue -Browser 'Edge' -Path $edgePath -Name 'HomepageLocation' -Value $HomepageUrl -Type String
+    Set-PolicyValue -Browser 'Edge' -Path $edgePath -Name 'HomepageIsNewTabPage' -Value 0 -Type DWord
+    Set-PolicyValue -Browser 'Edge' -Path $edgePath -Name 'ShowHomeButton' -Value 1 -Type DWord
+    Set-PolicyValue -Browser 'Edge' -Path $edgePath -Name 'RestoreOnStartup' -Value 4 -Type DWord
+    Set-PolicyValue -Browser 'Edge' -Path $edgeStartupPath -Name '1' -Value $HomepageUrl -Type String
+    Remove-UnwantedPolicyValues -Browser 'Edge' -Path $edgeStartupPath -AllowedNames @('1')
+
+    # Mozilla Firefox machine policies.
+    $firefoxHomepagePath = 'HKLM:\SOFTWARE\Policies\Mozilla\Firefox\Homepage'
+    Set-PolicyValue -Browser 'Firefox' -Path $firefoxHomepagePath -Name 'URL' -Value $HomepageUrl -Type String
+    Set-PolicyValue -Browser 'Firefox' -Path $firefoxHomepagePath -Name 'Locked' -Value 1 -Type DWord
+    Set-PolicyValue -Browser 'Firefox' -Path $firefoxHomepagePath -Name 'StartPage' -Value 'homepage' -Type String
+
+    $script:Status = 'success'
+    $script:ExitCode = 0
+    Write-Log ("Browser policies completed successfully. Changed={0}; Verified={1}. Close and reopen each browser to apply the policies." -f $script:ChangedCount, $script:VerifiedCount) 'SUCCESS'
+}
+catch {
+    $script:Status = 'failed'
+    $script:ExitCode = 1
+    try { Write-Log ("Browser policy configuration failed: {0}" -f $_.Exception.Message) 'ERROR' }
+    catch { Write-Error $_.Exception.Message }
+}
+finally {
+    try { Write-Telemetry }
+    catch { try { Write-Log ("Telemetry write failed: {0}" -f $_.Exception.Message) 'WARNING' } catch {} }
+}
+
+exit $script:ExitCode
 '@
     }
     Honorlock = [ordered]@{
         FileName = '18_Install_Honorlock_Chrome_Extension.ps1'
-        Sha256   = '8736D0D2EFC7F04670F3271315730411E5BE97A78221C1D8956715E407B8A665'
-        GzipBase64 = @'
-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
+        # Plain-text source is intentionally embedded for maintainability.
+        Source = @'
+# ScriptName: 18_Install_Honorlock_Chrome_Extension.ps1
+# ScriptVersion: 1.2.0
+# LastUpdated: 2026-08-27
+# Changes: v1.2.0 adds Building/Lab/DeviceIdentifier and target-scope telemetry
+#          for scalable Honorlock deployment dashboards as additional labs are added.
+#          v1.1.2 updates the internal script identity, log names, and telemetry
+#          dataset after renaming the file from script 20 to script 18.
+#          v1.1.1 corrects the computer-name pattern array that caused a
+#          PowerShell parser error.
+# Purpose: Force-install the Honorlock Chrome extension machine-wide through
+#          Google Chrome enterprise policy without overwriting other forced
+#          extension entries. Deployment can be limited to configured computer
+#          name prefixes or wildcard patterns.
+
+[CmdletBinding(SupportsShouldProcess = $true, ConfirmImpact = 'Low')]
+param(
+    [string]$LogFolder = 'C:\Logs',
+
+    # Leave empty to target every computer. Examples:
+    # @('IB1-103-*')
+    # @('IB1-103-*','SSB-122-*','SSB-114*')
+    [string[]]$ComputerNamePatterns = @(
+        'SSC-216*',
+        'AHB-146*'
+    )
+)
+
+Set-StrictMode -Version Latest
+$ErrorActionPreference = 'Stop'
+
+$script:ScriptName = '18_Install_Honorlock_Chrome_Extension.ps1'
+$script:ScriptVersion = '1.2.0'
+$script:ComputerName = $env:COMPUTERNAME
+$script:StartTime = Get-Date
+$script:RunId = [guid]::NewGuid().Guid
+$script:Status = 'failed'
+$script:ExitCode = 1
+$script:PolicyChanged = $false
+$script:PolicyVerified = $false
+$script:PolicyValueName = $null
+$script:Targeted = $false
+$script:MatchedComputerPattern = $null
+$script:OverallResult = 'NotStarted'
+$script:Building = $null
+$script:Lab = $null
+$script:DeviceIdentifier = $null
+
+$script:HonorlockExtensionId = 'hnbmpkmhjackfpkpcbapafmpepgmmddc'
+$script:ChromeUpdateUrl = 'https://clients2.google.com/service/update2/crx'
+$script:ForceInstallValue = '{0};{1}' -f $script:HonorlockExtensionId, $script:ChromeUpdateUrl
+$script:ForceListPath = 'HKLM:\SOFTWARE\Policies\Google\Chrome\ExtensionInstallForcelist'
+
+$script:LogPath = Join-Path $LogFolder '18_Install_Honorlock_Chrome_Extension.log'
+$script:LatestTelemetryPath = Join-Path $LogFolder '18_Install_Honorlock_Chrome_Extension.latest.json'
+$script:TelemetryPath = Join-Path $LogFolder 'Maintenance-Telemetry.ndjson'
+
+function Write-Log {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$Message,
+        [ValidateSet('INFO','SUCCESS','WARNING','ERROR')][string]$Level = 'INFO'
+    )
+
+    if (-not (Test-Path -LiteralPath $LogFolder -PathType Container)) {
+        New-Item -Path $LogFolder -ItemType Directory -Force | Out-Null
+    }
+
+    $timestamp = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
+    $line = '{0} [{1}] [{2}] {3}' -f $timestamp, $script:ComputerName, $Level, $Message
+    $color = switch ($Level) {
+        'SUCCESS' { 'Green' }
+        'WARNING' { 'Yellow' }
+        'ERROR'   { 'Red' }
+        default   { 'Cyan' }
+    }
+
+    Write-Host $line -ForegroundColor $color
+    Add-Content -LiteralPath $script:LogPath -Value $line -Encoding UTF8
+}
+
+function Assert-Administrator {
+    $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+    $principal = New-Object Security.Principal.WindowsPrincipal($identity)
+    if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+        throw 'This script must run elevated or as Local System.'
+    }
+
+    if ([Environment]::Is64BitOperatingSystem -and -not [Environment]::Is64BitProcess) {
+        throw 'Run this script with 64-bit PowerShell so the Chrome policy is written to the correct registry view.'
+    }
+}
+
+function Get-ComputerLocation {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][string]$ComputerName)
+
+    # Common Compton naming pattern:
+    #   IB1-103-13   -> Building=IB1, Lab=IB1-103, DeviceIdentifier=13
+    #   SSC-216-015  -> Building=SSC, Lab=SSC-216, DeviceIdentifier=015
+    # Preserve a useful fallback for names that do not follow that pattern.
+    if ($ComputerName -match '^(?<Building>[^-]+)-(?<Room>[^-]+)-(?<Device>.+)$') {
+        return [pscustomobject][ordered]@{
+            Building         = [string]$Matches.Building
+            Lab              = '{0}-{1}' -f $Matches.Building, $Matches.Room
+            DeviceIdentifier = [string]$Matches.Device
+        }
+    }
+
+    return [pscustomobject][ordered]@{
+        Building         = $null
+        Lab              = $null
+        DeviceIdentifier = $ComputerName
+    }
+}
+
+function Get-MatchedComputerPattern {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$Name,
+        [AllowEmptyCollection()][string[]]$Patterns
+    )
+
+    $configuredPatterns = @(
+        $Patterns | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+    )
+
+    # An empty list intentionally targets all computers.
+    if ($configuredPatterns.Count -eq 0) {
+        return '*'
+    }
+
+    foreach ($pattern in $configuredPatterns) {
+        if ($Name -like $pattern) {
+            return [string]$pattern
+        }
+    }
+
+    return $null
+}
+
+function Get-ForceListProperties {
+    if (-not (Test-Path -LiteralPath $script:ForceListPath)) {
+        return @()
+    }
+
+    return @(
+        (Get-ItemProperty -LiteralPath $script:ForceListPath -ErrorAction Stop).PSObject.Properties |
+        Where-Object { $_.Name -notmatch '^PS(Path|ParentPath|ChildName|Drive|Provider)$' }
+    )
+}
+
+function Set-HonorlockForceInstallPolicy {
+    if (-not (Test-Path -LiteralPath $script:ForceListPath)) {
+        New-Item -Path $script:ForceListPath -Force | Out-Null
+        Write-Log ("Created Chrome force-install policy path: {0}" -f $script:ForceListPath) 'INFO'
+    }
+
+    $properties = @(Get-ForceListProperties)
+    $extensionPattern = '^{0}(;|$)' -f [regex]::Escape($script:HonorlockExtensionId)
+    $existingProperty = @(
+        $properties | Where-Object { [string]$_.Value -match $extensionPattern }
+    ) | Select-Object -First 1
+
+    if ($null -ne $existingProperty) {
+        $script:PolicyValueName = [string]$existingProperty.Name
+        if ([string]$existingProperty.Value -ne $script:ForceInstallValue) {
+            New-ItemProperty -LiteralPath $script:ForceListPath -Name $script:PolicyValueName `
+                -Value $script:ForceInstallValue -PropertyType String -Force | Out-Null
+            $script:PolicyChanged = $true
+            Write-Log ("Updated existing Honorlock force-install entry '{0}'." -f $script:PolicyValueName) 'INFO'
+        }
+        else {
+            Write-Log ("Honorlock is already present in Chrome's force-install policy as entry '{0}'." -f $script:PolicyValueName) 'INFO'
+        }
+    }
+    else {
+        $usedNumbers = @(
+            $properties |
+            Where-Object { $_.Name -match '^\d+$' } |
+            ForEach-Object { [int]$_.Name }
+        )
+
+        $nextNumber = 1
+        while ($usedNumbers -contains $nextNumber) {
+            $nextNumber++
+        }
+
+        $script:PolicyValueName = [string]$nextNumber
+        New-ItemProperty -LiteralPath $script:ForceListPath -Name $script:PolicyValueName `
+            -Value $script:ForceInstallValue -PropertyType String -Force | Out-Null
+        $script:PolicyChanged = $true
+        Write-Log ("Added Honorlock to Chrome's force-install policy as entry '{0}'." -f $script:PolicyValueName) 'INFO'
+    }
+
+    $verifiedProperties = @(Get-ForceListProperties)
+    $verified = @(
+        $verifiedProperties | Where-Object { [string]$_.Value -eq $script:ForceInstallValue }
+    )
+
+    if ($verified.Count -lt 1) {
+        throw 'Honorlock force-install policy verification failed after the registry update.'
+    }
+
+    $script:PolicyVerified = $true
+    Write-Log ("Verified Honorlock force-install policy. ExtensionId={0}; Entry={1}" -f $script:HonorlockExtensionId, $script:PolicyValueName) 'SUCCESS'
+}
+
+function Add-SharedTextLine {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)][string]$Line,
+        [int]$MaximumAttempts = 10
+    )
+
+    for ($attempt = 1; $attempt -le $MaximumAttempts; $attempt++) {
+        $stream = $null
+        $writer = $null
+        try {
+            $stream = [System.IO.File]::Open(
+                $Path,
+                [System.IO.FileMode]::Append,
+                [System.IO.FileAccess]::Write,
+                [System.IO.FileShare]::ReadWrite
+            )
+            $writer = [System.IO.StreamWriter]::new($stream, [System.Text.UTF8Encoding]::new($false))
+            $writer.WriteLine($Line)
+            $writer.Flush()
+            return
+        }
+        catch [System.IO.IOException] {
+            if ($attempt -ge $MaximumAttempts) { throw }
+            Start-Sleep -Milliseconds (250 * $attempt)
+        }
+        finally {
+            if ($null -ne $writer) { $writer.Dispose() }
+            elseif ($null -ne $stream) { $stream.Dispose() }
+        }
+    }
+}
+
+function Write-Telemetry {
+    $endTime = Get-Date
+    $installState = switch ($script:OverallResult) {
+        'PolicyConfigured' { 'Policy configured; Chrome installs/updates the extension at policy refresh or browser startup.' }
+        'NotTargeted'      { 'Skipped because the computer name did not match the configured pattern list.' }
+        'WhatIf'           { 'WhatIf evaluation only; no policy changes were made.' }
+        'Failed'           { 'Policy deployment failed. Review the text log.' }
+        default            { 'No completed deployment result was recorded.' }
+    }
+
+    $event = [pscustomobject][ordered]@{
+        EventType       = 'maintenance.execution'
+        EventDataset    = 'compton.maintenance.script18'
+        ComputerName    = $script:ComputerName
+        Building        = $script:Building
+        Lab             = $script:Lab
+        DeviceIdentifier = $script:DeviceIdentifier
+        ScriptName      = $script:ScriptName
+        ScriptVersion   = $script:ScriptVersion
+        RunId           = $script:RunId
+        Status          = $script:Status
+        ExitCode        = $script:ExitCode
+        StartTime       = $script:StartTime.ToString('o')
+        EndTime         = $endTime.ToString('o')
+        DurationSeconds = [math]::Round(($endTime - $script:StartTime).TotalSeconds, 2)
+        Timestamp       = $endTime.ToUniversalTime().ToString('o')
+        Browser         = 'Google Chrome'
+        ExtensionName   = 'Honorlock'
+        ExtensionId     = $script:HonorlockExtensionId
+        PolicyChanged   = $script:PolicyChanged
+        PolicyVerified  = $script:PolicyVerified
+        PolicyValueName = $script:PolicyValueName
+        ComputerNamePatterns = @($ComputerNamePatterns)
+        TargetPatternCount   = @($ComputerNamePatterns | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }).Count
+        TargetScope          = if (@($ComputerNamePatterns | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }).Count -eq 0) { 'AllComputers' } else { 'ConfiguredPatterns' }
+        Targeted        = $script:Targeted
+        MatchedPattern  = $script:MatchedComputerPattern
+        OverallResult   = $script:OverallResult
+        InstallState    = $installState
+        LogPath         = $script:LogPath
+    }
+
+    $json = $event | ConvertTo-Json -Depth 5 -Compress
+    Add-SharedTextLine -Path $script:TelemetryPath -Line $json
+    $event | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $script:LatestTelemetryPath -Encoding UTF8 -Force
+}
+
+try {
+    Write-Log ("Starting Honorlock Chrome extension policy deployment. Version={0}; RunId={1}" -f $script:ScriptVersion, $script:RunId) 'INFO'
+
+    $location = Get-ComputerLocation -ComputerName $script:ComputerName
+    $script:Building = $location.Building
+    $script:Lab = $location.Lab
+    $script:DeviceIdentifier = $location.DeviceIdentifier
+
+    $script:MatchedComputerPattern = Get-MatchedComputerPattern `
+        -Name $script:ComputerName `
+        -Patterns $ComputerNamePatterns
+
+    if ([string]::IsNullOrWhiteSpace($script:MatchedComputerPattern)) {
+        $script:Targeted = $false
+        $script:OverallResult = 'NotTargeted'
+        $script:Status = 'success'
+        $script:ExitCode = 0
+        $configuredText = if (@($ComputerNamePatterns).Count -gt 0) {
+            @($ComputerNamePatterns) -join ', '
+        }
+        else {
+            '(none)'
+        }
+        Write-Log ("Computer '{0}' does not match the configured pattern list [{1}]. No changes were made." -f $script:ComputerName, $configuredText) 'INFO'
+        return
+    }
+
+    $script:Targeted = $true
+    Write-Log ("Computer is targeted. Matched pattern: {0}" -f $script:MatchedComputerPattern) 'SUCCESS'
+    Assert-Administrator
+
+    if (-not $PSCmdlet.ShouldProcess($script:ComputerName, 'Force-install the Honorlock extension in Google Chrome for all users')) {
+        $script:Status = 'what_if'
+        $script:ExitCode = 0
+        $script:OverallResult = 'WhatIf'
+        return
+    }
+
+    Set-HonorlockForceInstallPolicy
+
+    $script:Status = 'success'
+    $script:ExitCode = 0
+    $script:OverallResult = 'PolicyConfigured'
+    Write-Log 'Honorlock policy deployment completed. Chrome will install or update the extension when policy refreshes or Chrome next starts.' 'SUCCESS'
+}
+catch {
+    $script:Status = 'failed'
+    $script:ExitCode = 1
+    $script:OverallResult = 'Failed'
+    try { Write-Log ("Honorlock policy deployment failed: {0}" -f $_.Exception.Message) 'ERROR' }
+    catch { Write-Error $_.Exception.Message }
+}
+finally {
+    try { Write-Telemetry }
+    catch { try { Write-Log ("Telemetry write failed: {0}" -f $_.Exception.Message) 'WARNING' } catch {} }
+}
+
+exit $script:ExitCode
 '@
     }
     StellariumLocation = [ordered]@{
-        # This is an internal temporary filename. No external script 19 is read.
         FileName = 'Embedded_Stellarium_Location_Services.ps1'
-        Sha256   = '8121EED29FB928D21A1BAFD8C97190FD581ED5580560310455E7B61248314927'
-        GzipBase64 = @'
-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
+        # Plain-text source is intentionally embedded for maintainability.
+        Source = @'
+#requires -Version 5.1
+#requires -RunAsAdministrator
+<#
+.SYNOPSIS
+    Enables Windows 11 Location Services for Stellarium on approved computers.
+
+.DESCRIPTION
+    Runs only when the computer name matches an approved prefix pattern. Clears
+    the local policies that disable location and sensors, enables device and
+    desktop-application location access, configures the Geolocation Service for
+    trigger start, and verifies the resulting registry configuration.
+
+    This script is designed to run as SYSTEM from the Compton College weekly
+    maintenance task framework. Machine-level app-location policy is used so
+    the setting applies to interactive users rather than the SYSTEM profile.
+
+.NOTES
+    ScriptName:    19_Stellarium_Location_Services.ps1
+    ScriptVersion: 1.0.0
+    LastUpdated:   2026-09-02
+    Targets:       SSC-216* and MS-203*
+    Designed for:  Windows PowerShell 5.1 / Windows 11
+#>
+
+[CmdletBinding()]
+param(
+    [string[]]$TargetComputerPatterns = @('SSC-216*', 'MS-203*'),
+    [string]$LogDirectory = 'C:\Logs'
+)
+
+Set-StrictMode -Version 2.0
+$ErrorActionPreference = 'Stop'
+
+$ScriptName = '19_Stellarium_Location_Services.ps1'
+$ScriptVersion = '1.0.0'
+$RunId = [guid]::NewGuid().Guid
+$StartTime = Get-Date
+$ComputerName = [string]$env:COMPUTERNAME
+$LogPath = Join-Path $LogDirectory '19_Stellarium_Location_Services.log'
+$LatestPath = Join-Path $LogDirectory '19_Stellarium_Location_Services.latest.json'
+$TelemetryPath = Join-Path $LogDirectory 'Maintenance-Telemetry.ndjson'
+$Changes = New-Object System.Collections.Generic.List[string]
+$WarningCount = 0
+$ErrorCount = 0
+$Status = 'Success'
+$ExitCode = 0
+$FailureMessage = $null
+$MatchedPattern = $null
+
+function Ensure-Directory {
+    param([Parameter(Mandatory)][string]$Path)
+
+    if (-not (Test-Path -LiteralPath $Path -PathType Container)) {
+        New-Item -Path $Path -Force | Out-Null
+    }
+}
+
+function Write-Log {
+    param(
+        [Parameter(Mandatory)][string]$Message,
+        [ValidateSet('INFO', 'ACTION', 'OK', 'WARN', 'ERROR')]
+        [string]$Level = 'INFO'
+    )
+
+    if ($Level -eq 'WARN') { $script:WarningCount++ }
+    if ($Level -eq 'ERROR') { $script:ErrorCount++ }
+
+    $line = '{0} [{1}] [{2}] {3}' -f `
+        (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $ComputerName, $Level, $Message
+
+    try {
+        Ensure-Directory -Path $LogDirectory
+        Add-Content -LiteralPath $LogPath -Value $line -Encoding UTF8
+    }
+    catch {}
+
+    $color = switch ($Level) {
+        'ACTION' { 'Yellow' }
+        'OK'     { 'Green' }
+        'WARN'   { 'DarkYellow' }
+        'ERROR'  { 'Red' }
+        default  { 'Cyan' }
+    }
+    Write-Host $line -ForegroundColor $color
+}
+
+function Test-IsAdministrator {
+    $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+    $principal = New-Object Security.Principal.WindowsPrincipal($identity)
+    return $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+}
+
+function Set-RequiredRegistryValue {
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)][string]$Name,
+        [Parameter(Mandatory)]$Value,
+        [Parameter(Mandatory)][ValidateSet('DWord', 'String')][string]$PropertyType
+    )
+
+    if (-not (Test-Path -LiteralPath $Path -PathType Container)) {
+        New-Item -Path $Path -ItemType Directory -Force | Out-Null
+        [void]$Changes.Add("Created registry key $Path")
+    }
+
+    $currentValue = $null
+    $valueExists = $false
+    try {
+        $currentValue = Get-ItemPropertyValue -LiteralPath $Path -Name $Name -ErrorAction Stop
+        $valueExists = $true
+    }
+    catch {}
+
+    if (-not $valueExists -or [string]$currentValue -cne [string]$Value) {
+        New-ItemProperty `
+            -Path $Path `
+            -Name $Name `
+            -PropertyType $PropertyType `
+            -Value $Value `
+            -Force | Out-Null
+
+        [void]$Changes.Add("Set $Path\$Name to $Value")
+        Write-Log -Level 'ACTION' -Message "Set registry value $Path\$Name to $Value."
+    }
+    else {
+        Write-Log -Message "Registry value is already correct: $Path\$Name"
+    }
+}
+
+function Test-RegistryValue {
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)][string]$Name,
+        [Parameter(Mandatory)]$ExpectedValue
+    )
+
+    try {
+        $actualValue = Get-ItemPropertyValue -LiteralPath $Path -Name $Name -ErrorAction Stop
+        return ([string]$actualValue -ceq [string]$ExpectedValue)
+    }
+    catch {
+        return $false
+    }
+}
+
+function Write-ExecutionRecord {
+    $endTime = Get-Date
+    $record = [ordered]@{
+        EventType        = 'maintenance.stellarium_location_services'
+        SchemaVersion    = 1
+        ComputerName     = $ComputerName
+        ScriptName       = $ScriptName
+        ScriptVersion    = $ScriptVersion
+        RunId            = $RunId
+        Status           = $Status
+        ExitCode         = $ExitCode
+        StartTime        = $StartTime.ToUniversalTime().ToString('o')
+        EndTime          = $endTime.ToUniversalTime().ToString('o')
+        DurationSeconds  = [math]::Round(($endTime - $StartTime).TotalSeconds, 3)
+        TargetPatterns   = @($TargetComputerPatterns)
+        MatchedPattern   = $MatchedPattern
+        Changes          = @($Changes | ForEach-Object { $_ })
+        WarningCount     = $WarningCount
+        ErrorCount       = $ErrorCount
+        FailureMessage   = $FailureMessage
+        Timestamp        = $endTime.ToUniversalTime().ToString('o')
+    }
+
+    try {
+        Ensure-Directory -Path $LogDirectory
+        $record | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $LatestPath -Encoding UTF8 -Force
+        $record | ConvertTo-Json -Depth 6 -Compress | Add-Content -LiteralPath $TelemetryPath -Encoding UTF8
+    }
+    catch {
+        Write-Log -Level 'WARN' -Message "Unable to write JSON telemetry: $($_.Exception.Message)"
+    }
+}
+
+Write-Log -Message "Starting $ScriptName version $ScriptVersion. RunId=$RunId"
+
+try {
+    if ([string]::IsNullOrWhiteSpace($ComputerName)) {
+        throw 'The computer name could not be determined.'
+    }
+
+    foreach ($pattern in $TargetComputerPatterns) {
+        if (-not [string]::IsNullOrWhiteSpace($pattern) -and $ComputerName -like $pattern) {
+            $MatchedPattern = $pattern
+            break
+        }
+    }
+
+    if ($null -eq $MatchedPattern) {
+        $Status = 'SkippedNotTargeted'
+        Write-Log -Level 'OK' -Message (
+            "Computer is not targeted. Configured patterns: {0}. No changes were made." -f
+            ($TargetComputerPatterns -join ', ')
+        )
+    }
+    else {
+        Write-Log -Message "Computer matched target pattern '$MatchedPattern'."
+
+        if (-not (Test-IsAdministrator)) {
+            throw 'This script must run as Administrator or SYSTEM.'
+        }
+
+        $locationPolicyPath = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\LocationAndSensors'
+        $appPrivacyPolicyPath = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\AppPrivacy'
+        $locationConfigPath = 'HKLM:\SYSTEM\CurrentControlSet\Services\lfsvc\Service\Configuration'
+        $deviceConsentPath = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\CapabilityAccessManager\ConsentStore\location'
+        $desktopConsentPath = Join-Path $deviceConsentPath 'NonPackaged'
+
+        # A value of 0 leaves each "Turn off" policy disabled.
+        Set-RequiredRegistryValue -Path $locationPolicyPath -Name 'DisableLocation' -Value 0 -PropertyType DWord
+        Set-RequiredRegistryValue -Path $locationPolicyPath -Name 'DisableSensors' -Value 0 -PropertyType DWord
+        Set-RequiredRegistryValue -Path $locationPolicyPath -Name 'DisableWindowsLocationProvider' -Value 0 -PropertyType DWord
+
+        # Force-allow location for apps so the setting applies to every user,
+        # including when this maintenance script runs under SYSTEM.
+        Set-RequiredRegistryValue -Path $appPrivacyPolicyPath -Name 'LetAppsAccessLocation' -Value 1 -PropertyType DWord
+
+        # Enable the Windows location master switch and desktop-app consent.
+        Set-RequiredRegistryValue -Path $locationConfigPath -Name 'Status' -Value 1 -PropertyType DWord
+        Set-RequiredRegistryValue -Path $deviceConsentPath -Name 'Value' -Value 'Allow' -PropertyType String
+        Set-RequiredRegistryValue -Path $desktopConsentPath -Name 'Value' -Value 'Allow' -PropertyType String
+
+        $service = Get-Service -Name 'lfsvc' -ErrorAction Stop
+        Set-Service -Name 'lfsvc' -StartupType Manual -ErrorAction Stop
+        if ($service.Status -ne 'Running') {
+            Start-Service -Name 'lfsvc' -ErrorAction Stop
+            [void]$Changes.Add('Started the Geolocation Service (lfsvc)')
+            Write-Log -Level 'ACTION' -Message 'Started the Geolocation Service (lfsvc).'
+        }
+        else {
+            Write-Log -Message 'The Geolocation Service (lfsvc) is already running.'
+        }
+
+        $verificationChecks = @(
+            [pscustomobject]@{ Path=$locationPolicyPath; Name='DisableLocation'; Expected=0 },
+            [pscustomobject]@{ Path=$locationPolicyPath; Name='DisableSensors'; Expected=0 },
+            [pscustomobject]@{ Path=$locationPolicyPath; Name='DisableWindowsLocationProvider'; Expected=0 },
+            [pscustomobject]@{ Path=$appPrivacyPolicyPath; Name='LetAppsAccessLocation'; Expected=1 },
+            [pscustomobject]@{ Path=$locationConfigPath; Name='Status'; Expected=1 },
+            [pscustomobject]@{ Path=$deviceConsentPath; Name='Value'; Expected='Allow' },
+            [pscustomobject]@{ Path=$desktopConsentPath; Name='Value'; Expected='Allow' }
+        )
+
+        $failedChecks = @(
+            foreach ($check in $verificationChecks) {
+                if (-not (Test-RegistryValue -Path $check.Path -Name $check.Name -ExpectedValue $check.Expected)) {
+                    "$($check.Path)\$($check.Name)"
+                }
+            }
+        )
+
+        if ($failedChecks.Count -gt 0) {
+            throw "Location Services verification failed for: $($failedChecks -join ', ')"
+        }
+
+        Write-Log -Level 'OK' -Message "Windows Location Services configuration is enabled and verified. Changes=$($Changes.Count)"
+    }
+}
+catch {
+    $Status = 'Failed'
+    $ExitCode = 2
+    $FailureMessage = $_.Exception.Message
+    Write-Log -Level 'ERROR' -Message "Unable to enable Windows Location Services: $FailureMessage"
+}
+finally {
+    Write-ExecutionRecord
+    Write-Log -Message "Completed. Status=$Status ExitCode=$ExitCode RunId=$RunId"
+}
+
+exit $ExitCode
 '@
     }
 }
@@ -273,9 +4883,16 @@ function Set-HonorlockChromeMachinePolicy {
         New-ItemProperty -LiteralPath $forceListPath -Name ([string]$slot) -Value $forceValue -PropertyType String -Force | Out-Null
     }
 
-    $existingSettingsJson = [string](
-        Get-ItemPropertyValue -LiteralPath $chromePolicyPath -Name 'ExtensionSettings' -ErrorAction SilentlyContinue
-    )
+    $existingChromePolicy = Get-ItemProperty -LiteralPath $chromePolicyPath -ErrorAction SilentlyContinue
+    $existingSettingsValue = if ($null -ne $existingChromePolicy) {
+        $property = $existingChromePolicy.PSObject.Properties['ExtensionSettings']
+        if ($null -ne $property) { $property.Value } else { $null }
+    }
+    else {
+        $null
+    }
+
+    $existingSettingsJson = [string]$existingSettingsValue
     if ([string]::IsNullOrWhiteSpace($existingSettingsJson)) {
         $extensionSettings = [pscustomobject]@{}
     }
@@ -304,10 +4921,21 @@ function Set-HonorlockChromeMachinePolicy {
         (Get-ItemProperty -LiteralPath $forceListPath).PSObject.Properties |
             Where-Object { $_.Name -notmatch '^PS' -and [string]$_.Value -eq $forceValue }
     ).Count -gt 0
-    $verifiedSettings = (
-        (Get-ItemPropertyValue -LiteralPath $chromePolicyPath -Name 'ExtensionSettings' -ErrorAction Stop) |
-            ConvertFrom-Json -ErrorAction Stop
-    ).PSObject.Properties[$extensionId].Value
+    $verifiedChromePolicy = Get-ItemProperty -LiteralPath $chromePolicyPath -ErrorAction Stop
+    $verifiedSettingsJsonProperty = $verifiedChromePolicy.PSObject.Properties['ExtensionSettings']
+    if ($null -eq $verifiedSettingsJsonProperty -or [string]::IsNullOrWhiteSpace([string]$verifiedSettingsJsonProperty.Value)) {
+        throw 'Honorlock Chrome ExtensionSettings policy was not created.'
+    }
+
+    $verifiedSettingsObject = [string]$verifiedSettingsJsonProperty.Value |
+        ConvertFrom-Json -ErrorAction Stop
+    $verifiedExtensionProperty = $verifiedSettingsObject.PSObject.Properties[$extensionId]
+    $verifiedSettings = if ($null -ne $verifiedExtensionProperty) {
+        $verifiedExtensionProperty.Value
+    }
+    else {
+        $null
+    }
 
     if (-not $verifiedForceList -or $null -eq $verifiedSettings -or
         [string]$verifiedSettings.installation_mode -ne 'force_installed' -or
@@ -318,43 +4946,22 @@ function Set-HonorlockChromeMachinePolicy {
     Write-RunnerLog -Message 'Verified Honorlock force-install policy in HKLM for all Windows users and Chrome profiles.' -Level 'SUCCESS'
 }
 
-function Expand-EmbeddedSection {
+function Write-EmbeddedSectionSource {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory)][System.Collections.IDictionary]$Payload,
         [Parameter(Mandatory)][string]$Destination
     )
 
-    $compressedBytes = [Convert]::FromBase64String(([string]$Payload.GzipBase64).Trim())
-    $inputStream = [System.IO.MemoryStream]::new([byte[]]$compressedBytes)
-    $gzipStream = [System.IO.Compression.GZipStream]::new(
-        $inputStream,
-        [System.IO.Compression.CompressionMode]::Decompress
-    )
-    $reader = [System.IO.StreamReader]::new(
-        $gzipStream,
-        [System.Text.UTF8Encoding]::new($false)
-    )
-
-    try {
-        $sourceText = $reader.ReadToEnd()
-    }
-    finally {
-        $reader.Dispose()
-        $gzipStream.Dispose()
-        $inputStream.Dispose()
+    if ($null -eq $Payload.Source) {
+        throw "Embedded plain-text source is missing for $($Payload.FileName)."
     }
 
     [System.IO.File]::WriteAllText(
         $Destination,
-        $sourceText,
+        [string]$Payload.Source,
         [System.Text.UTF8Encoding]::new($true)
     )
-
-    $actualHash = (Get-FileHash -LiteralPath $Destination -Algorithm SHA256).Hash
-    if ($actualHash -ne [string]$Payload.Sha256) {
-        throw "Embedded section integrity verification failed for $($Payload.FileName)."
-    }
 }
 
 function New-SectionBootstrap {
@@ -466,6 +5073,25 @@ function Write-RunnerTelemetryLine {
     throw "Unable to append Office telemetry after 15 attempts: $lastErrorMessage"
 }
 
+function Get-SafeObjectPropertyValue {
+    [CmdletBinding()]
+    param(
+        [AllowNull()]$InputObject,
+        [Parameter(Mandatory)][string]$Name
+    )
+
+    if ($null -eq $InputObject) {
+        return $null
+    }
+
+    $property = $InputObject.PSObject.Properties[$Name]
+    if ($null -eq $property) {
+        return $null
+    }
+
+    return $property.Value
+}
+
 function Get-OfficeInstallationInventory {
     [CmdletBinding()]
     param()
@@ -494,7 +5120,9 @@ function Get-OfficeInstallationInventory {
     )
     [string[]]$displayNames = @(
         $uninstallEntries |
-            ForEach-Object { [string]$_.DisplayName } |
+            ForEach-Object {
+                [string](Get-SafeObjectPropertyValue -InputObject $_ -Name 'DisplayName')
+            } |
             Where-Object {
                 -not [string]::IsNullOrWhiteSpace($_) -and
                 $_ -match '(?i)(Microsoft\s+365|Office\s+365|Microsoft Office|Office LTSC|Office Professional|Office Standard)'
@@ -541,13 +5169,23 @@ function Get-OfficeInstallationInventory {
     )
     [string[]]$olderMsiDisplayNames = @(
         $uninstallEntries | Where-Object {
-            $name = [string]$_.DisplayName
+            $name = [string](Get-SafeObjectPropertyValue -InputObject $_ -Name 'DisplayName')
+            $windowsInstallerValue = Get-SafeObjectPropertyValue -InputObject $_ -Name 'WindowsInstaller'
+            $uninstallStringValue = [string](Get-SafeObjectPropertyValue -InputObject $_ -Name 'UninstallString')
+
             $isOlderSuite =
+                -not [string]::IsNullOrWhiteSpace($name) -and
                 $name -match '(?i)(?:Microsoft Office|Office LTSC|Office Professional|Office Standard).*(?:2007|2010|2013|2016|2019|2021)' -and
                 $name -notmatch '(?i)(?:Project|Visio|Language Pack|Proofing|Update)'
-            $isMsi = ([int]$_.WindowsInstaller -eq 1) -or ([string]$_.UninstallString -match '(?i)msiexec(?:\.exe)?')
+
+            $isMsi =
+                ($null -ne $windowsInstallerValue -and [int]$windowsInstallerValue -eq 1) -or
+                ($uninstallStringValue -match '(?i)msiexec(?:\.exe)?')
+
             $isOlderSuite -and $isMsi
-        } | ForEach-Object { [string]$_.DisplayName } | Sort-Object -Unique
+        } | ForEach-Object {
+            [string](Get-SafeObjectPropertyValue -InputObject $_ -Name 'DisplayName')
+        } | Sort-Object -Unique
     )
     $olderUnknownTypeDetected =
         $olderDisplayNames.Count -gt 0 -and
@@ -1115,6 +5753,66 @@ function Invoke-Office2024MaintenanceSection {
     }
 }
 
+function Resolve-PrinterSectionExitCode {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][int]$ProcessExitCode,
+        [Parameter(Mandatory)][string]$LogDirectory
+    )
+
+    # Script 11 intentionally returns Windows Installer code 3010 when the
+    # printer/PaperCut configuration is compliant but a reboot is pending.
+    # In some Windows PowerShell 5.1 child-process launches that code can be
+    # surfaced to the parent as a generic nonzero value.  The child also
+    # writes an authoritative latest.json result, so use that telemetry to
+    # preserve SuccessRebootRequired instead of incorrectly marking failure.
+    $latestJson = Join-Path $LogDirectory '11_Install_SharpDriver_And_PaperCut.latest.json'
+
+    if (-not (Test-Path -LiteralPath $latestJson -PathType Leaf)) {
+        return $ProcessExitCode
+    }
+
+    try {
+        $result = Get-Content -LiteralPath $latestJson -Raw -ErrorAction Stop |
+            ConvertFrom-Json -ErrorAction Stop
+
+        $status = [string]$result.Status
+        $reportedExitCode = 0
+        $hasReportedExitCode = $false
+
+        if ($null -ne $result.PSObject.Properties['ExitCode']) {
+            $reportedExitCode = [int]$result.ExitCode
+            $hasReportedExitCode = $true
+        }
+
+        $rebootRequired = $false
+        if ($null -ne $result.PSObject.Properties['RebootRequired']) {
+            $rebootRequired = [bool]$result.RebootRequired
+        }
+
+        if (
+            $status -eq 'SuccessRebootRequired' -or
+            ($hasReportedExitCode -and $reportedExitCode -eq 3010) -or
+            ($status -match '^Success' -and $rebootRequired)
+        ) {
+            return 3010
+        }
+
+        if ($status -match '^Success' -and $ProcessExitCode -ne 0) {
+            # The child telemetry says the work succeeded and no reboot is
+            # required. Normalize a transport/launcher-only nonzero code.
+            return 0
+        }
+    }
+    catch {
+        Write-RunnerLog `
+            -Message "Unable to read Script 11 latest telemetry for exit-code normalization: $($_.Exception.Message)" `
+            -Level 'WARNING'
+    }
+
+    return $ProcessExitCode
+}
+
 function Invoke-MaintenanceSection {
     [CmdletBinding()]
     param(
@@ -1146,6 +5844,19 @@ function Invoke-MaintenanceSection {
             -PassThru
 
         $exitCode = [int]$process.ExitCode
+
+        if ($SectionId -eq 'PrinterAndPaperCut') {
+            $normalizedExitCode = Resolve-PrinterSectionExitCode `
+                -ProcessExitCode $exitCode `
+                -LogDirectory $LogDirectory
+
+            if ($normalizedExitCode -ne $exitCode) {
+                Write-RunnerLog `
+                    -Message "Normalized SHARP/PaperCut child exit code from $exitCode to $normalizedExitCode based on Script 11 telemetry." `
+                    -Level 'INFO'
+                $exitCode = $normalizedExitCode
+            }
+        }
     }
     catch {
         $exitCode = 1
@@ -1210,7 +5921,7 @@ try {
 
     foreach ($payloadEntry in $EmbeddedSections.GetEnumerator()) {
         $destination = Join-Path $stagingRoot ([string]$payloadEntry.Value.FileName)
-        Expand-EmbeddedSection -Payload $payloadEntry.Value -Destination $destination
+        Write-EmbeddedSectionSource -Payload $payloadEntry.Value -Destination $destination
     }
 
     $sectionPlan = @(
@@ -1244,8 +5955,9 @@ try {
         [void]$results.Add($sectionResult)
     }
 
-    $failedSections = @($results | Where-Object { -not $_.Success })
-    $rebootRequired = @($results | Where-Object { $_.RebootRequired }).Count -gt 0
+    [object[]]$resultArray = $results.ToArray()
+    [object[]]$failedSections = @($resultArray | Where-Object { -not $_.Success })
+    $rebootRequired = @($resultArray | Where-Object { $_.RebootRequired }).Count -gt 0
 
     if ($failedSections.Count -gt 0) {
         $finalExitCode = 1
@@ -1278,7 +5990,7 @@ finally {
         StartTime       = $RunnerStartTime.ToUniversalTime().ToString('o')
         EndTime         = $runnerEndTime.ToUniversalTime().ToString('o')
         DurationSeconds = [math]::Round(($runnerEndTime - $RunnerStartTime).TotalSeconds, 2)
-        Sections        = @($results)
+        Sections        = $results.ToArray()
         Timestamp       = $runnerEndTime.ToUniversalTime().ToString('o')
     }
 

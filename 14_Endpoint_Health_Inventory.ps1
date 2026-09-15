@@ -22,9 +22,14 @@
 
 .NOTES
     ScriptName:    14_Endpoint_Health_Inventory.ps1
-    ScriptVersion: 1.2.8
-    LastUpdated:   2026-08-19
-    Changes:       v1.2.8 makes Secure Boot detection resilient by using Confirm-SecureBootUEFI first,
+    ScriptVersion: 1.2.9
+    LastUpdated:   2026-09-15
+    Changes:       v1.2.9 improves application crash/hang telemetry by filtering Event IDs 1000/1001/1002
+                   by the correct Windows providers, extracting application/module/exception/path/report details,
+                   grouping repeated failures by application, and reporting the top offending application in the finding.
+                   This prevents unrelated Event ID 1001/1002 providers from being counted as application failures and
+                   makes Kibana findings immediately actionable without opening the raw endpoint.health document.
+                   v1.2.8 makes Secure Boot detection resilient by using Confirm-SecureBootUEFI first,
                    then falling back to the Windows SecureBoot registry state when the cmdlet returns Access Denied.
                    Telemetry now records the detection method and diagnostic error without creating a false warning
                    when the registry can determine the actual Secure Boot state.
@@ -109,7 +114,7 @@ Set-StrictMode -Version 2.0
 $ErrorActionPreference = 'Stop'
 
 $script:ScriptName       = '14_Endpoint_Health_Inventory.ps1'
-$script:ScriptVersion    = '1.2.8'
+$script:ScriptVersion    = '1.2.9'
 $script:RunId            = [guid]::NewGuid().Guid
 $script:StartTime        = Get-Date
 $script:WarningCount     = 0
@@ -1556,27 +1561,193 @@ function Get-WindowsUpdateHealth {
     }
 }
 
+function ConvertTo-ApplicationCrashRecord {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [System.Diagnostics.Eventing.Reader.EventRecord]$Event
+    )
+
+    $message = if ($Event.Message) { ($Event.Message -replace '\s+', ' ').Trim() } else { '' }
+    $eventData = @{}
+
+    try {
+        [xml]$xml = $Event.ToXml()
+        foreach ($data in @($xml.Event.EventData.Data)) {
+            if ($data -and $data.Name) {
+                $eventData[[string]$data.Name] = [string]$data.'#text'
+            }
+        }
+    }
+    catch {
+        # Message parsing below is the fallback when EventData is unavailable.
+    }
+
+    $getData = {
+        param([string[]]$Names)
+        foreach ($name in $Names) {
+            if ($eventData.ContainsKey($name) -and -not [string]::IsNullOrWhiteSpace([string]$eventData[$name])) {
+                return [string]$eventData[$name]
+            }
+        }
+        return $null
+    }
+
+    $applicationName    = & $getData @('AppName','ApplicationName','P1')
+    $applicationVersion = & $getData @('AppVersion','ApplicationVersion','P2')
+    $applicationPath    = & $getData @('AppPath','ApplicationPath')
+    $faultingModule     = & $getData @('ModuleName','FaultingModuleName','P4')
+    $moduleVersion      = & $getData @('ModuleVersion','FaultingModuleVersion','P5')
+    $modulePath         = & $getData @('ModulePath','FaultingModulePath')
+    $exceptionCode      = & $getData @('ExceptionCode','P7')
+    $faultOffset        = & $getData @('FaultingOffset','FaultOffset','P8')
+    $processId          = & $getData @('ProcessId','ProcessID')
+    $reportId           = & $getData @('ReportId','ReportID')
+    $hangType           = & $getData @('HangType')
+
+    if (-not $applicationName -and $message -match '(?i)Faulting application name:\s*([^,]+)') {
+        $applicationName = $matches[1].Trim()
+    }
+    if (-not $applicationName -and $message -match '(?i)^The program\s+(.+?)\s+version\s+') {
+        $applicationName = $matches[1].Trim()
+    }
+    if (-not $applicationVersion -and $message -match '(?i)Faulting application name:\s*[^,]+,\s*version:\s*([^,]+)') {
+        $applicationVersion = $matches[1].Trim()
+    }
+    if (-not $faultingModule -and $message -match '(?i)Faulting module name:\s*([^,]+)') {
+        $faultingModule = $matches[1].Trim()
+    }
+    if (-not $moduleVersion -and $message -match '(?i)Faulting module name:\s*[^,]+,\s*version:\s*([^,]+)') {
+        $moduleVersion = $matches[1].Trim()
+    }
+    if (-not $exceptionCode -and $message -match '(?i)Exception code:\s*([^\s,]+)') {
+        $exceptionCode = $matches[1].Trim()
+    }
+    if (-not $faultOffset -and $message -match '(?i)Fault offset:\s*([^\s,]+)') {
+        $faultOffset = $matches[1].Trim()
+    }
+    if (-not $processId -and $message -match '(?i)Faulting process id:\s*([^\s,]+)') {
+        $processId = $matches[1].Trim()
+    }
+    if (-not $applicationPath -and $message -match '(?i)Faulting application path:\s*(.+?)\s+Faulting module path:') {
+        $applicationPath = $matches[1].Trim()
+    }
+    if (-not $modulePath -and $message -match '(?i)Faulting module path:\s*(.+?)\s+Report Id:') {
+        $modulePath = $matches[1].Trim()
+    }
+    if (-not $reportId -and $message -match '(?i)Report Id:\s*([^\s,]+)') {
+        $reportId = $matches[1].Trim()
+    }
+
+    $incidentType = switch ([int]$Event.Id) {
+        1000 { 'Crash' }
+        1002 { 'Hang' }
+        1001 { 'WindowsErrorReporting' }
+        default { 'ApplicationFailure' }
+    }
+
+    [pscustomobject]@{
+        TimeCreated       = $Event.TimeCreated.ToUniversalTime().ToString('o')
+        Id                = [int]$Event.Id
+        Provider          = [string]$Event.ProviderName
+        Level             = [string]$Event.LevelDisplayName
+        IncidentType      = $incidentType
+        ApplicationName   = $applicationName
+        ApplicationVersion= $applicationVersion
+        ApplicationPath   = $applicationPath
+        FaultingModule    = $faultingModule
+        ModuleVersion     = $moduleVersion
+        ModulePath        = $modulePath
+        ExceptionCode     = $exceptionCode
+        FaultOffset       = $faultOffset
+        ProcessId         = $processId
+        ReportId          = $reportId
+        HangType          = $hangType
+        Message           = $message
+    }
+}
+
 function Get-EventLogHealth {
     $start = (Get-Date).AddHours(-$EventLookbackHours)
 
     $applicationCrashes = @()
     try {
-        $applicationCrashes = @(Get-WinEvent -FilterHashtable @{
+        $candidateEvents = @(Get-WinEvent -FilterHashtable @{
             LogName   = 'Application'
             StartTime = $start
             Id        = 1000,1001,1002
-        } -ErrorAction Stop | Select-Object -First 100 | ForEach-Object {
-            [pscustomobject]@{
-                TimeCreated = $_.TimeCreated.ToUniversalTime().ToString('o')
-                Id          = $_.Id
-                Provider    = $_.ProviderName
-                Level       = $_.LevelDisplayName
-                Message     = ($_.Message -replace '\s+', ' ').Trim()
-            }
-        })
-    } catch {
+        } -ErrorAction Stop)
+
+        # Event IDs 1000/1001/1002 are reused by other providers. Only count the
+        # standard Windows application-failure providers to avoid false positives.
+        $applicationCrashes = @($candidateEvents |
+            Where-Object {
+                ($_.Id -eq 1000 -and $_.ProviderName -eq 'Application Error') -or
+                ($_.Id -eq 1002 -and $_.ProviderName -eq 'Application Hang') -or
+                ($_.Id -eq 1001 -and $_.ProviderName -eq 'Windows Error Reporting')
+            } |
+            Sort-Object TimeCreated -Descending |
+            Select-Object -First 100 |
+            ForEach-Object { ConvertTo-ApplicationCrashRecord -Event $_ })
+    }
+    catch {
         if ($_.Exception.Message -notmatch 'No events were found') {
             Write-Log -Level 'WARN' -Message ("Application crash event query failed: {0}" -f $_.Exception.Message)
+        }
+    }
+
+    $applicationCrashSummary = @()
+    $primaryApplicationCrash = $null
+
+    if ($applicationCrashes.Count -gt 0) {
+        $applicationCrashSummary = @($applicationCrashes |
+            Group-Object {
+                if (-not [string]::IsNullOrWhiteSpace([string]$_.ApplicationName)) {
+                    [string]$_.ApplicationName
+                }
+                else {
+                    "Unknown application ({0}/{1})" -f $_.Provider, $_.Id
+                }
+            } |
+            ForEach-Object {
+                $events = @($_.Group | Sort-Object TimeCreated)
+                $latest = $events[-1]
+
+                $moduleGroups = @($events |
+                    Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_.FaultingModule) } |
+                    Group-Object FaultingModule |
+                    Sort-Object @{ Expression = 'Count'; Descending = $true }, @{ Expression = 'Name'; Descending = $false })
+                $exceptionGroups = @($events |
+                    Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_.ExceptionCode) } |
+                    Group-Object ExceptionCode |
+                    Sort-Object @{ Expression = 'Count'; Descending = $true }, @{ Expression = 'Name'; Descending = $false })
+
+                [pscustomobject]@{
+                    ApplicationName     = [string]$_.Name
+                    EventCount          = $events.Count
+                    CrashCount          = @($events | Where-Object { $_.IncidentType -eq 'Crash' }).Count
+                    HangCount           = @($events | Where-Object { $_.IncidentType -eq 'Hang' }).Count
+                    WerCount            = @($events | Where-Object { $_.IncidentType -eq 'WindowsErrorReporting' }).Count
+                    FirstSeen           = $events[0].TimeCreated
+                    LastSeen            = $latest.TimeCreated
+                    LatestApplicationVersion = $latest.ApplicationVersion
+                    LatestApplicationPath    = $latest.ApplicationPath
+                    TopFaultingModule    = if ($moduleGroups.Count -gt 0) { [string]$moduleGroups[0].Name } else { $null }
+                    TopFaultingModuleCount = if ($moduleGroups.Count -gt 0) { [int]$moduleGroups[0].Count } else { 0 }
+                    LatestModuleVersion  = $latest.ModuleVersion
+                    LatestModulePath     = $latest.ModulePath
+                    TopExceptionCode     = if ($exceptionGroups.Count -gt 0) { [string]$exceptionGroups[0].Name } else { $null }
+                    TopExceptionCount    = if ($exceptionGroups.Count -gt 0) { [int]$exceptionGroups[0].Count } else { 0 }
+                    LatestExceptionCode  = $latest.ExceptionCode
+                    LatestEventId        = $latest.Id
+                    LatestProvider       = $latest.Provider
+                    LatestReportId       = $latest.ReportId
+                }
+            } |
+            Sort-Object @{ Expression = 'EventCount'; Descending = $true }, @{ Expression = 'LastSeen'; Descending = $true })
+
+        if ($applicationCrashSummary.Count -gt 0) {
+            $primaryApplicationCrash = $applicationCrashSummary[0]
         }
     }
 
@@ -1596,7 +1767,8 @@ function Get-EventLogHealth {
                     Message     = ($_.Message -replace '\s+', ' ').Trim()
                 }
             })
-        } catch {
+        }
+        catch {
             if ($_.Exception.Message -notmatch 'No events were found') {
                 Write-Log -Level 'WARN' -Message ("Critical event query failed for {0}: {1}" -f $log, $_.Exception.Message)
             }
@@ -1609,21 +1781,44 @@ function Get-EventLogHealth {
         -Value $criticalEvents.Count
 
     if ($applicationCrashes.Count -gt 0) {
+        $detailText = ''
+        if ($primaryApplicationCrash) {
+            $detailParts = New-Object System.Collections.Generic.List[string]
+            $detailParts.Add(("Top application: {0} ({1} event(s))" -f
+                $primaryApplicationCrash.ApplicationName, $primaryApplicationCrash.EventCount))
+
+            if ($primaryApplicationCrash.TopFaultingModule) {
+                $detailParts.Add(("module: {0}" -f $primaryApplicationCrash.TopFaultingModule))
+            }
+            if ($primaryApplicationCrash.TopExceptionCode) {
+                $detailParts.Add(("exception: {0}" -f $primaryApplicationCrash.TopExceptionCode))
+            }
+            if ($primaryApplicationCrash.LastSeen) {
+                $detailParts.Add(("last: {0}" -f $primaryApplicationCrash.LastSeen))
+            }
+
+            $detailText = ' ' + (($detailParts.ToArray()) -join '; ') + '.'
+        }
+
         Add-Finding -Severity 'Warning' -Category 'EventLogs' -Check 'ApplicationCrashes' `
-            -Message ("{0} application crash/hang event(s) in the last {1} hours." -f
-                $applicationCrashes.Count, $EventLookbackHours) `
+            -Message (("{0} application crash/hang/WER event(s) in the last {1} hours.{2}" -f
+                $applicationCrashes.Count, $EventLookbackHours, $detailText).Trim()) `
             -Value $applicationCrashes.Count
-    } else {
+    }
+    else {
         Add-Finding -Severity 'Healthy' -Category 'EventLogs' -Check 'ApplicationCrashes' `
-            -Message ("No application crash/hang events in the last {0} hours." -f $EventLookbackHours)
+            -Message ("No application crash/hang/WER events in the last {0} hours." -f $EventLookbackHours)
     }
 
     [pscustomobject]@{
-        LookbackHours          = $EventLookbackHours
-        ApplicationCrashCount  = $applicationCrashes.Count
-        ApplicationCrashes     = New-ObjectArrayForJson -InputObject $applicationCrashes
-        CriticalEventCount     = $criticalEvents.Count
-        CriticalEvents         = New-ObjectArrayForJson -InputObject $criticalEvents
+        LookbackHours                = $EventLookbackHours
+        ApplicationCrashCount        = $applicationCrashes.Count
+        ApplicationCrashes           = New-ObjectArrayForJson -InputObject $applicationCrashes
+        ApplicationCrashSummary      = New-ObjectArrayForJson -InputObject $applicationCrashSummary
+        PrimaryApplicationCrash      = $primaryApplicationCrash
+        ApplicationCrashProviderRule = '1000=Application Error; 1002=Application Hang; 1001=Windows Error Reporting'
+        CriticalEventCount           = $criticalEvents.Count
+        CriticalEvents               = New-ObjectArrayForJson -InputObject $criticalEvents
     }
 }
 

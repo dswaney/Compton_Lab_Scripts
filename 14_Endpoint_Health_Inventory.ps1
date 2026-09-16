@@ -15,6 +15,18 @@
     The script is fault-tolerant: individual collectors can fail without
     preventing the remaining endpoint snapshot from being written.
 
+    Optional approved BIOS/driver comparisons use C:\Scripts\EndpointHealth.Baseline.json.
+    Without that file the script still reports BIOS age and old-driver inventory.
+    Example baseline structure:
+      {
+        "BIOS": [
+          { "ModelRegex": "HP EliteDesk 800 G6", "ApprovedVersions": [ "S01 Ver. 02.19.00 / HPQOEM" ] }
+        ],
+        "Drivers": [
+          { "DeviceNameRegex": "Intel.*Ethernet", "DeviceIdRegex": "VEN_8086", "MinimumVersion": "12.19.2.60" }
+        ]
+      }
+
 .OUTPUTS
     C:\Logs\Maintenance-Telemetry.ndjson
     C:\Logs\14_Endpoint_Health_Inventory.latest.json
@@ -22,9 +34,22 @@
 
 .NOTES
     ScriptName:    14_Endpoint_Health_Inventory.ps1
-    ScriptVersion: 1.2.9
-    LastUpdated:   2026-09-15
-    Changes:       v1.2.9 improves application crash/hang telemetry by filtering Event IDs 1000/1001/1002
+    ScriptVersion: 1.4.1
+    LastUpdated:   2026-09-16
+    Changes:       v1.4.1 makes the last-Windows-update check resilient when Get-HotFix has no usable
+                   InstalledOn value by falling back to successful Windows Update Agent history and then
+                   the Windows Update LastSuccessTime registry value. It also records the selected source
+                   and update title for Elastic troubleshooting.
+                   v1.4.0 adds battery condition and wear, Windows/Office activation, time synchronization,
+                   maintenance scheduled-task health, driver age and optional approved-baseline comparison,
+                   gateway/DNS/network-adapter diagnostics, disk reliability/SMART detail, bugcheck and
+                   unexpected-shutdown evidence, and BIOS age plus optional approved-baseline comparison.
+                   v1.3.0 publishes one detailed finding for each actionable Device Manager problem,
+                   including the device name/class/instance ID, manufacturer, service, Config Manager
+                   problem code and description, PNP status, hardware and compatible IDs, and signed-driver
+                   provider/version/date/INF/signer details. Findings retain a searchable scalar value and add
+                   DetailsJson for complete drill-down data without changing existing Value* mappings.
+                   v1.2.9 improves application crash/hang telemetry by filtering Event IDs 1000/1001/1002
                    by the correct Windows providers, extracting application/module/exception/path/report details,
                    grouping repeated failures by application, and reporting the top offending application in the finding.
                    This prevents unrelated Event ID 1001/1002 providers from being counted as application failures and
@@ -82,6 +107,25 @@ param(
     [ValidateRange(1, 10000)]
     [int]$CriticalEventWarningCount = 5,
 
+    [ValidateRange(1, 100)]
+    [int]$BatteryWearWarningPercent = 30,
+
+    [ValidateRange(30, 7300)]
+    [int]$DriverAgeWarningDays = 1825,
+
+    [ValidateRange(30, 7300)]
+    [int]$BiosAgeWarningDays = 1825,
+
+    [ValidateRange(1, 720)]
+    [int]$TimeSyncWarningHours = 48,
+
+    [ValidateRange(1, 365)]
+    [int]$ScheduledTaskStaleDays = 14,
+
+    [string]$DnsTestName = 'compton.edu',
+
+    [string]$HealthBaselinePath = 'C:\Scripts\EndpointHealth.Baseline.json',
+
     [string[]]$CriticalServices = @(
         'WinDefend',
         'mpssvc',
@@ -114,7 +158,7 @@ Set-StrictMode -Version 2.0
 $ErrorActionPreference = 'Stop'
 
 $script:ScriptName       = '14_Endpoint_Health_Inventory.ps1'
-$script:ScriptVersion    = '1.2.9'
+$script:ScriptVersion    = '1.4.1'
 $script:RunId            = [guid]::NewGuid().Guid
 $script:StartTime        = Get-Date
 $script:WarningCount     = 0
@@ -325,10 +369,21 @@ function Add-Finding {
         [Parameter(Mandatory)][string]$Category,
         [Parameter(Mandatory)][string]$Check,
         [Parameter(Mandatory)][string]$Message,
-        $Value = $null
+        $Value = $null,
+        [AllowNull()]$Details = $null
     )
 
     $typedValue = Convert-FindingValueForTelemetry -Value $Value
+
+    $detailsJson = $null
+    if ($null -ne $Details) {
+        try {
+            $detailsJson = $Details | ConvertTo-Json -Depth 8 -Compress
+        }
+        catch {
+            $detailsJson = [string]$Details
+        }
+    }
 
     $script:Findings.Add([pscustomobject]@{
         Severity     = $Severity
@@ -341,6 +396,8 @@ function Add-Finding {
         ValueText    = $typedValue.ValueText
         ValueTexts   = $typedValue.ValueTexts
         ValueJson    = $typedValue.ValueJson
+        Details      = $Details
+        DetailsJson  = $detailsJson
     })
 }
 
@@ -1031,6 +1088,19 @@ function Get-DiskHealth {
         }
     }
 
+    foreach ($physicalDisk in $physical) {
+        $reliabilityProblems = @()
+        if ($null -ne $physicalDisk.Wear -and [double]$physicalDisk.Wear -ge 90) { $reliabilityProblems += ('wear={0}%' -f $physicalDisk.Wear) }
+        if ($null -ne $physicalDisk.TemperatureC -and [double]$physicalDisk.TemperatureC -ge 60) { $reliabilityProblems += ('temperature={0}C' -f $physicalDisk.TemperatureC) }
+        if ($null -ne $physicalDisk.ReadErrorsTotal -and [double]$physicalDisk.ReadErrorsTotal -gt 0) { $reliabilityProblems += ('readErrors={0}' -f $physicalDisk.ReadErrorsTotal) }
+        if ($null -ne $physicalDisk.WriteErrorsTotal -and [double]$physicalDisk.WriteErrorsTotal -gt 0) { $reliabilityProblems += ('writeErrors={0}' -f $physicalDisk.WriteErrorsTotal) }
+        if ($reliabilityProblems.Count -gt 0) {
+            Add-Finding -Severity 'Warning' -Category 'Storage' -Check 'DiskReliability' `
+                -Message ("Disk {0} reliability warning: {1}." -f $physicalDisk.FriendlyName,($reliabilityProblems -join '; ')) `
+                -Value $physicalDisk.FriendlyName -Details $physicalDisk
+        }
+    }
+
     $camWal = Get-CapabilityAccessManagerHealth
 
     [pscustomobject]@{
@@ -1118,9 +1188,75 @@ function Get-CapabilityAccessManagerHealth {
     [pscustomobject]$result
 }
 
+function Get-DeviceProblemDescription {
+    [CmdletBinding()]
+    param([AllowNull()]$ProblemCode)
+
+    if ($null -eq $ProblemCode) { return 'Problem code unavailable' }
+
+    switch ([int]$ProblemCode) {
+        0  { 'Device is working properly' }
+        1  { 'Device is not configured correctly' }
+        3  { 'Driver may be corrupted or the system may be low on resources' }
+        9  { 'Device identification or firmware reported invalid information' }
+        10 { 'Device cannot start' }
+        12 { 'Device cannot find enough free resources' }
+        14 { 'Computer restart is required' }
+        16 { 'Windows cannot identify all resources used by this device' }
+        18 { 'Drivers must be reinstalled' }
+        19 { 'Registry configuration information is incomplete or damaged' }
+        21 { 'Windows is removing this device' }
+        22 { 'Device is disabled' }
+        24 { 'Device is not present, not working properly, or lacks installed drivers' }
+        28 { 'Drivers are not installed' }
+        29 { 'Device firmware did not provide required resources' }
+        31 { 'Device is not working properly because Windows cannot load required drivers' }
+        32 { 'Driver service start type is disabled' }
+        33 { 'Windows cannot determine required resources' }
+        34 { 'Windows cannot determine device settings' }
+        35 { 'Computer firmware lacks enough information to configure the device' }
+        36 { 'Device is requesting a PCI interrupt but is configured for an ISA interrupt' }
+        37 { 'Windows cannot initialize the device driver' }
+        38 { 'Windows cannot load the driver because a previous instance remains in memory' }
+        39 { 'Windows cannot load the driver because it is missing or corrupted' }
+        40 { 'Windows cannot access the device because registry service information is missing or incorrect' }
+        41 { 'Windows loaded the driver but cannot find the hardware device' }
+        42 { 'Duplicate device is already running' }
+        43 { 'Windows stopped the device because it reported problems' }
+        44 { 'An application or service shut down the device' }
+        45 { 'Device is not currently connected' }
+        46 { 'Windows cannot access the device because the operating system is shutting down' }
+        47 { 'Device is prepared for safe removal' }
+        48 { 'Device software was blocked because it is known to have problems' }
+        49 { 'Windows cannot start new hardware because the system hive is too large' }
+        50 { 'Windows cannot apply all device properties' }
+        51 { 'Device is waiting on another device or set of devices' }
+        52 { 'Windows cannot verify the digital signature for the required drivers' }
+        53 { 'Device is reserved for use by the Windows kernel debugger' }
+        54 { 'Device failed and is undergoing a reset' }
+        default { 'Unknown Device Manager problem code' }
+    }
+}
+
 function Get-DeviceManagerHealth {
     $devices = @()
     $informationalDegraded = @()
+
+    # CIM supplies manufacturer, service, hardware IDs, and configuration status.
+    # Win32_PnPSignedDriver supplies the installed driver package metadata.
+    $cimDevices = @(Get-CimInstance Win32_PnPEntity -ErrorAction SilentlyContinue)
+    $signedDrivers = @(Get-CimInstance Win32_PnPSignedDriver -ErrorAction SilentlyContinue)
+    $cimByInstanceId = @{}
+    $driverByDeviceId = @{}
+
+    foreach ($cimDevice in $cimDevices) {
+        $key = [string]$cimDevice.PNPDeviceID
+        if (-not [string]::IsNullOrWhiteSpace($key)) { $cimByInstanceId[$key] = $cimDevice }
+    }
+    foreach ($signedDriver in $signedDrivers) {
+        $key = [string]$signedDriver.DeviceID
+        if (-not [string]::IsNullOrWhiteSpace($key)) { $driverByDeviceId[$key] = $signedDriver }
+    }
 
     if (Get-Command Get-PnpDevice -ErrorAction SilentlyContinue) {
         $presentDevices = @(Get-PnpDevice -PresentOnly -ErrorAction SilentlyContinue)
@@ -1129,12 +1265,35 @@ function Get-DeviceManagerHealth {
             $problemCode = $null
             try { $problemCode = [int]$device.Problem } catch { $problemCode = $null }
 
-            $entry = [pscustomobject]@{
-                Class        = $device.Class
-                FriendlyName = $device.FriendlyName
-                InstanceId   = $device.InstanceId
-                Status       = [string]$device.Status
-                ProblemCode  = $problemCode
+            $instanceId = [string]$device.InstanceId
+            $cimDevice = if ($cimByInstanceId.ContainsKey($instanceId)) { $cimByInstanceId[$instanceId] } else { $null }
+            $signedDriver = if ($driverByDeviceId.ContainsKey($instanceId)) { $driverByDeviceId[$instanceId] } else { $null }
+            $driverDate = if ($signedDriver -and $signedDriver.DriverDate) {
+                $parsedDriverDate = Convert-CimDate $signedDriver.DriverDate
+                if ($parsedDriverDate) { $parsedDriverDate.ToUniversalTime().ToString('o') } else { $null }
+            } else { $null }
+
+            $entry = [pscustomobject][ordered]@{
+                FriendlyName        = if ($device.FriendlyName) { [string]$device.FriendlyName } elseif ($cimDevice) { [string]$cimDevice.Name } else { $instanceId }
+                Class               = [string]$device.Class
+                InstanceId          = $instanceId
+                Status              = [string]$device.Status
+                Present             = $true
+                ProblemCode         = $problemCode
+                ProblemDescription  = Get-DeviceProblemDescription -ProblemCode $problemCode
+                Manufacturer        = if ($cimDevice) { [string]$cimDevice.Manufacturer } elseif ($signedDriver) { [string]$signedDriver.Manufacturer } else { $null }
+                Service             = if ($cimDevice) { [string]$cimDevice.Service } else { $null }
+                ErrorDescription    = if ($cimDevice) { [string]$cimDevice.ErrorDescription } else { $null }
+                ConfigManagerUserConfig = if ($cimDevice) { [bool]$cimDevice.ConfigManagerUserConfig } else { $null }
+                HardwareIds         = New-StringArrayForJson -InputObject $(if ($cimDevice) { $cimDevice.HardwareID } else { @() })
+                CompatibleIds       = New-StringArrayForJson -InputObject $(if ($cimDevice) { $cimDevice.CompatibleID } else { @() })
+                DriverProvider      = if ($signedDriver) { [string]$signedDriver.DriverProviderName } else { $null }
+                DriverVersion       = if ($signedDriver) { [string]$signedDriver.DriverVersion } else { $null }
+                DriverDateUtc       = $driverDate
+                InfName             = if ($signedDriver) { [string]$signedDriver.InfName } else { $null }
+                DriverName          = if ($signedDriver) { [string]$signedDriver.DriverName } else { $null }
+                IsSigned            = if ($signedDriver) { [bool]$signedDriver.IsSigned } else { $null }
+                Signer              = if ($signedDriver) { [string]$signedDriver.Signer } else { $null }
             }
 
             if ($null -ne $problemCode -and $problemCode -ne 0) {
@@ -1146,31 +1305,62 @@ function Get-DeviceManagerHealth {
         }
     }
     else {
-        $presentDevices = @(Get-CimInstance Win32_PnPEntity -ErrorAction SilentlyContinue)
+        foreach ($cimDevice in $cimDevices) {
+            $problemCode = $cimDevice.ConfigManagerErrorCode
+            $instanceId = [string]$cimDevice.PNPDeviceID
+            $signedDriver = if ($driverByDeviceId.ContainsKey($instanceId)) { $driverByDeviceId[$instanceId] } else { $null }
+            $driverDate = if ($signedDriver -and $signedDriver.DriverDate) {
+                $parsedDriverDate = Convert-CimDate $signedDriver.DriverDate
+                if ($parsedDriverDate) { $parsedDriverDate.ToUniversalTime().ToString('o') } else { $null }
+            } else { $null }
 
-        foreach ($device in $presentDevices) {
-            $problemCode = $device.ConfigManagerErrorCode
-            $entry = [pscustomobject]@{
-                Class        = $device.PNPClass
-                FriendlyName = $device.Name
-                InstanceId   = $device.PNPDeviceID
-                Status       = $device.Status
-                ProblemCode  = $problemCode
+            $entry = [pscustomobject][ordered]@{
+                FriendlyName        = [string]$cimDevice.Name
+                Class               = [string]$cimDevice.PNPClass
+                InstanceId          = $instanceId
+                Status              = [string]$cimDevice.Status
+                Present             = Get-ObjectPropertyValueSafe -InputObject $cimDevice -Name 'Present'
+                ProblemCode         = $problemCode
+                ProblemDescription  = Get-DeviceProblemDescription -ProblemCode $problemCode
+                Manufacturer        = [string]$cimDevice.Manufacturer
+                Service             = [string]$cimDevice.Service
+                ErrorDescription    = [string]$cimDevice.ErrorDescription
+                ConfigManagerUserConfig = [bool]$cimDevice.ConfigManagerUserConfig
+                HardwareIds         = New-StringArrayForJson -InputObject $cimDevice.HardwareID
+                CompatibleIds       = New-StringArrayForJson -InputObject $cimDevice.CompatibleID
+                DriverProvider      = if ($signedDriver) { [string]$signedDriver.DriverProviderName } else { $null }
+                DriverVersion       = if ($signedDriver) { [string]$signedDriver.DriverVersion } else { $null }
+                DriverDateUtc       = $driverDate
+                InfName             = if ($signedDriver) { [string]$signedDriver.InfName } else { $null }
+                DriverName          = if ($signedDriver) { [string]$signedDriver.DriverName } else { $null }
+                IsSigned            = if ($signedDriver) { [bool]$signedDriver.IsSigned } else { $null }
+                Signer              = if ($signedDriver) { [string]$signedDriver.Signer } else { $null }
             }
 
             if ($null -ne $problemCode -and [int]$problemCode -ne 0) {
                 $devices += $entry
             }
-            elseif ($device.Status -and $device.Status -ne 'OK') {
+            elseif ($cimDevice.Status -and $cimDevice.Status -ne 'OK') {
                 $informationalDegraded += $entry
             }
         }
     }
 
     if ($devices.Count -gt 0) {
-        Add-Finding -Severity 'Warning' -Category 'Hardware' -Check 'DeviceManagerProblems' `
-            -Message ("{0} actionable Device Manager problem(s) detected." -f $devices.Count) `
-            -Value $devices.Count
+        foreach ($problemDevice in $devices) {
+            $deviceName = if ([string]::IsNullOrWhiteSpace([string]$problemDevice.FriendlyName)) { $problemDevice.InstanceId } else { $problemDevice.FriendlyName }
+            $message = 'Device Manager problem: {0} ({1}) has Code {2}: {3}. Driver={4}; Provider={5}; INF={6}.' -f `
+                $deviceName,
+                $(if ([string]::IsNullOrWhiteSpace([string]$problemDevice.Class)) { 'Unknown class' } else { $problemDevice.Class }),
+                $problemDevice.ProblemCode,
+                $problemDevice.ProblemDescription,
+                $(if ([string]::IsNullOrWhiteSpace([string]$problemDevice.DriverVersion)) { 'Unknown' } else { $problemDevice.DriverVersion }),
+                $(if ([string]::IsNullOrWhiteSpace([string]$problemDevice.DriverProvider)) { 'Unknown' } else { $problemDevice.DriverProvider }),
+                $(if ([string]::IsNullOrWhiteSpace([string]$problemDevice.InfName)) { 'Unknown' } else { $problemDevice.InfName })
+
+            Add-Finding -Severity 'Warning' -Category 'Hardware' -Check 'DeviceManagerProblem' `
+                -Message $message -Value $deviceName -Details $problemDevice
+        }
     }
     else {
         Add-Finding -Severity 'Healthy' -Category 'Hardware' -Check 'DeviceManagerProblems' `
@@ -1180,7 +1370,7 @@ function Get-DeviceManagerHealth {
     if ($informationalDegraded.Count -gt 0) {
         Add-Finding -Severity 'Info' -Category 'Hardware' -Check 'DeviceManagerDegradedNonActionable' `
             -Message ("{0} degraded device(s) reported ProblemCode=0 and were not counted as actionable problems." -f $informationalDegraded.Count) `
-            -Value $informationalDegraded.Count
+            -Value $informationalDegraded.Count -Details $informationalDegraded
     }
 
     [pscustomobject]@{
@@ -1532,29 +1722,70 @@ function Get-WindowsUpdateHealth {
     }
 
     $latestDate = if ($latest -and $latest.InstalledOn) { [datetime]$latest.InstalledOn } else { $null }
+    $latestUpdateSource = if ($latestDate) { 'Get-HotFix' } else { $null }
+    $latestUpdateTitle = if ($latest) { [string]$latest.HotFixID } else { $null }
+
+    # Get-HotFix can return no InstalledOn value on otherwise healthy Windows 11
+    # systems. Fall back to successful Windows Update Agent installation history.
+    if ($null -eq $latestDate -and $history.Count -gt 0) {
+        $successfulHistory = @($history | Where-Object {
+            $_.Operation -match '(?i)Installation|^1$' -and
+            $_.ResultCode -match '(?i)Succeeded|SucceededWithErrors|^2$|^3$'
+        } | Sort-Object { [datetime]$_.Date } -Descending)
+
+        $latestSuccessfulHistory = $successfulHistory | Select-Object -First 1
+        if ($latestSuccessfulHistory -and $latestSuccessfulHistory.Date) {
+            try {
+                $latestDate = [datetime]$latestSuccessfulHistory.Date
+                $latestUpdateSource = 'WindowsUpdateHistory'
+                $latestUpdateTitle = [string]$latestSuccessfulHistory.Title
+            }
+            catch { }
+        }
+    }
+
+    # Final fallback: Windows records the last successful installation time here.
+    if ($null -eq $latestDate) {
+        $lastSuccessRaw = Get-RegistryValueSafe `
+            -Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\Results\Install' `
+            -Name 'LastSuccessTime'
+
+        if (-not [string]::IsNullOrWhiteSpace([string]$lastSuccessRaw)) {
+            $parsedLastSuccess = [datetimeoffset]::MinValue
+            if ([datetimeoffset]::TryParse([string]$lastSuccessRaw, [ref]$parsedLastSuccess)) {
+                $latestDate = $parsedLastSuccess.UtcDateTime
+                $latestUpdateSource = 'WindowsUpdateRegistry'
+                $latestUpdateTitle = 'Last successful Windows Update installation'
+            }
+        }
+    }
+
     $ageDays = if ($latestDate) { [math]::Round(((Get-Date) - $latestDate).TotalDays, 1) } else { $null }
 
     if ($null -eq $latestDate) {
         Add-Finding -Severity 'Warning' -Category 'Updates' -Check 'LastWindowsUpdate' `
-            -Message 'No installed hotfix date could be determined.'
+            -Message 'No successful Windows update date could be determined from Get-HotFix, Windows Update history, or the Windows Update registry.'
     } elseif ($ageDays -gt $UpdateLookbackDays) {
         Add-Finding -Severity 'Warning' -Category 'Updates' -Check 'LastWindowsUpdate' `
-            -Message ("Latest installed hotfix is {0} days old." -f $ageDays) -Value $ageDays
+            -Message ("Latest successful Windows update is {0} days old (source={1}; update={2})." -f $ageDays,$latestUpdateSource,$latestUpdateTitle) -Value $ageDays
     } else {
         Add-Finding -Severity 'Healthy' -Category 'Updates' -Check 'LastWindowsUpdate' `
-            -Message ("Latest installed hotfix is {0} days old." -f $ageDays) -Value $ageDays
+            -Message ("Latest successful Windows update is {0} days old (source={1}; update={2})." -f $ageDays,$latestUpdateSource,$latestUpdateTitle) -Value $ageDays
     }
 
     [pscustomobject]@{
+        LatestSuccessfulUpdate = [pscustomobject]@{
+            Source      = $latestUpdateSource
+            Title       = $latestUpdateTitle
+            Date        = if ($latestDate) { $latestDate.ToUniversalTime().ToString('o') } else { $null }
+            AgeDays     = $ageDays
+        }
         LatestHotfix = if ($latest) {
             [pscustomobject]@{
-                HotFixID    = $latest.HotFixID
-                Description = $latest.Description
-                InstalledBy = $latest.InstalledBy
-                InstalledOn = if ($latest.InstalledOn) { ([datetime]$latest.InstalledOn).ToUniversalTime().ToString('o') } else { $null }
-                AgeDays     = $ageDays
+                HotFixID=$latest.HotFixID; Description=$latest.Description; InstalledBy=$latest.InstalledBy
+                InstalledOn=if ($latest.InstalledOn) {([datetime]$latest.InstalledOn).ToUniversalTime().ToString('o')} else {$null}
             }
-        } else { $null }
+        } else {$null}
         RecentHotfixCount = $recent.Count
         RecentHotfixes    = New-ObjectArrayForJson -InputObject $recent
         UpdateHistory     = New-ObjectArrayForJson -InputObject $history
@@ -2108,6 +2339,212 @@ function Get-EdgeHealth {
     }
 }
 
+function Get-OptionalHealthBaseline {
+    if (-not (Test-Path -LiteralPath $HealthBaselinePath -PathType Leaf)) { return $null }
+    try { return Get-Content -LiteralPath $HealthBaselinePath -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop }
+    catch {
+        Write-Log -Level 'WARN' -Message ("Health baseline could not be read from {0}: {1}" -f $HealthBaselinePath, $_.Exception.Message)
+        return $null
+    }
+}
+
+function Get-BatteryHealth {
+    $batteryRows = @()
+    $batteries = @(Get-CimInstance Win32_Battery -ErrorAction SilentlyContinue)
+    if ($batteries.Count -eq 0) {
+        Add-Finding -Severity 'Info' -Category 'Hardware' -Check 'BatteryHealth' -Message 'No battery was detected; this is expected for desktop computers.'
+        return [pscustomobject]@{ Present = $false; BatteryCount = 0; Batteries = [object[]]@() }
+    }
+    $staticRows = @(Get-CimInstance -Namespace 'root\wmi' -ClassName BatteryStaticData -ErrorAction SilentlyContinue)
+    $fullRows = @(Get-CimInstance -Namespace 'root\wmi' -ClassName BatteryFullChargedCapacity -ErrorAction SilentlyContinue)
+    $cycleRows = @(Get-CimInstance -Namespace 'root\wmi' -ClassName BatteryCycleCount -ErrorAction SilentlyContinue)
+    for ($i = 0; $i -lt $batteries.Count; $i++) {
+        $battery = $batteries[$i]
+        $design = if ($i -lt $staticRows.Count) { [double]$staticRows[$i].DesignedCapacity } else { $null }
+        $full = if ($i -lt $fullRows.Count) { [double]$fullRows[$i].FullChargedCapacity } else { $null }
+        $wear = if ($design -and $design -gt 0 -and $null -ne $full) { [math]::Round((1 - ($full / $design)) * 100, 2) } else { $null }
+        $healthPercent = if ($null -ne $wear) { [math]::Round(100 - $wear, 2) } else { $null }
+        $row = [pscustomobject]@{
+            Name=$battery.Name; DeviceId=$battery.DeviceID; Status=$battery.Status; Chemistry=$battery.Chemistry
+            EstimatedChargeRemainingPercent=$battery.EstimatedChargeRemaining; EstimatedRunTimeMinutes=$battery.EstimatedRunTime
+            DesignCapacityMWh=$design; FullChargeCapacityMWh=$full; HealthPercent=$healthPercent; WearPercent=$wear
+            CycleCount=if ($i -lt $cycleRows.Count) { $cycleRows[$i].CycleCount } else { $null }
+        }
+        $batteryRows += $row
+        $severity = if ($null -ne $wear -and $wear -ge $BatteryWearWarningPercent) { 'Warning' } else { 'Healthy' }
+        Add-Finding -Severity $severity -Category 'Hardware' -Check 'BatteryHealth' `
+            -Message ("Battery health={0}%; wear={1}%; warning threshold={2}%." -f $healthPercent,$wear,$BatteryWearWarningPercent) `
+            -Value $healthPercent -Details $row
+    }
+    [pscustomobject]@{ Present=$true; BatteryCount=$batteryRows.Count; Batteries=New-ObjectArrayForJson -InputObject $batteryRows }
+}
+
+function Get-ActivationHealth {
+    $products = @(Get-CimInstance SoftwareLicensingProduct -ErrorAction SilentlyContinue | Where-Object {
+        $_.PartialProductKey -and ($_.ApplicationID -eq '55c92734-d682-4d71-983e-d6ec3f16059f' -or $_.Name -match '(?i)Office')
+    })
+    $windows = @($products | Where-Object { $_.ApplicationID -eq '55c92734-d682-4d71-983e-d6ec3f16059f' })
+    $office = @($products | Where-Object { $_.Name -match '(?i)Office' })
+    $windowsLicensed = @($windows | Where-Object LicenseStatus -eq 1).Count -gt 0
+    $officeLicensed = @($office | Where-Object LicenseStatus -eq 1).Count -gt 0
+    Add-Finding -Severity $(if ($windowsLicensed) {'Healthy'} else {'Warning'}) -Category 'Licensing' -Check 'WindowsActivation' `
+        -Message $(if ($windowsLicensed) {'Windows is activated.'} else {'Windows activation could not be confirmed.'})
+    if ($office.Count -gt 0) {
+        Add-Finding -Severity $(if ($officeLicensed) {'Healthy'} else {'Warning'}) -Category 'Licensing' -Check 'OfficeActivation' `
+            -Message $(if ($officeLicensed) {'An activated Office product was detected.'} else {'Office is installed, but no licensed Office product was detected.'})
+    } else {
+        Add-Finding -Severity 'Info' -Category 'Licensing' -Check 'OfficeActivation' -Message 'No Office licensing product was detected.'
+    }
+    $rows = @($products | ForEach-Object { [pscustomobject]@{
+        Name=$_.Name; Description=$_.Description; ApplicationId=$_.ApplicationID; LicenseStatus=$_.LicenseStatus
+        Licensed=($_.LicenseStatus -eq 1); GracePeriodRemainingMinutes=$_.GracePeriodRemaining; PartialProductKey=$_.PartialProductKey
+    }})
+    [pscustomobject]@{ WindowsLicensed=$windowsLicensed; OfficeDetected=($office.Count -gt 0); OfficeLicensed=$officeLicensed; Products=New-ObjectArrayForJson -InputObject $rows }
+}
+
+function Get-TimeSynchronizationHealth {
+    $service = Get-CimInstance Win32_Service -Filter "Name='W32Time'" -ErrorAction SilentlyContinue
+    $source = $null; $statusOutput = @()
+    try { $source = ((& w32tm.exe /query /source 2>&1) -join ' ').Trim() } catch { }
+    try { $statusOutput = @(& w32tm.exe /query /status /verbose /fo:list 2>&1 | ForEach-Object { [string]$_ }) } catch { }
+    $statusText = $statusOutput -join "`n"; $lastSync = $null; $stratum = $null; $lastSuccessfulSyncRaw = $null
+    if ($statusText -match '(?im)^Last Successful Sync Time:\s*(.+)$') {
+        $lastSuccessfulSyncRaw = $Matches[1].Trim(); $parsed = [datetime]::MinValue
+        if ([datetime]::TryParse($lastSuccessfulSyncRaw, [ref]$parsed)) { $lastSync = $parsed }
+    }
+    if ($statusText -match '(?im)^Stratum:\s*(\d+)') { $stratum = [int]$Matches[1] }
+    $ageHours = if ($lastSync) { [math]::Round(((Get-Date) - $lastSync).TotalHours, 2) } else { $null }
+    $healthy = $service -and $service.State -eq 'Running' -and $source -and $source -notmatch '(?i)Local CMOS Clock|Free-running|error' -and ($null -eq $ageHours -or $ageHours -le $TimeSyncWarningHours)
+    $result = [pscustomobject]@{
+        ServiceState=if ($service) {$service.State} else {$null}; ServiceStartMode=if ($service) {$service.StartMode} else {$null}
+        Source=$source; Stratum=$stratum; LastSuccessfulSyncTime=if ($lastSync) {$lastSync.ToUniversalTime().ToString('o')} else {$null}
+        LastSuccessfulSyncRaw=$lastSuccessfulSyncRaw; HoursSinceLastSync=$ageHours; WarningThresholdHours=$TimeSyncWarningHours
+        RawStatus=New-StringArrayForJson -InputObject $statusOutput
+    }
+    Add-Finding -Severity $(if ($healthy) {'Healthy'} else {'Warning'}) -Category 'Time' -Check 'TimeSynchronization' `
+        -Message ("Windows Time service={0}; source={1}; hours since sync={2}." -f $result.ServiceState,$source,$ageHours) -Details $result
+    return $result
+}
+
+function Get-MaintenanceScheduledTaskHealth {
+    if (-not (Get-Command Get-ScheduledTask -ErrorAction SilentlyContinue)) {
+        Add-Finding -Severity 'Warning' -Category 'ScheduledTasks' -Check 'MaintenanceTasks' -Message 'ScheduledTasks cmdlets are unavailable.'
+        return [pscustomobject]@{ Available=$false; TaskCount=0; UnhealthyCount=0; Tasks=[object[]]@() }
+    }
+    $rows = @()
+    $tasks = @(Get-ScheduledTask -ErrorAction SilentlyContinue | Where-Object {
+        $actionText = (@($_.Actions | ForEach-Object { '{0} {1}' -f $_.Execute,$_.Arguments }) -join ' ')
+        $_.TaskPath -match '(?i)Compton|Maintenance' -or $_.TaskName -match '(?i)Compton|Maintenance|Endpoint.Health|Lab.Application|Windows.Update|Force.Reboot|Time.Sync|Deep.Freeze' -or $actionText -match '(?i)C:\\Scripts\\'
+    })
+    foreach ($task in $tasks) {
+        $info = Get-ScheduledTaskInfo -TaskName $task.TaskName -TaskPath $task.TaskPath -ErrorAction SilentlyContinue
+        $lastRun = if ($info -and $info.LastRunTime -and $info.LastRunTime.Year -gt 1999) {$info.LastRunTime} else {$null}
+        $ageDays = if ($lastRun) {[math]::Round(((Get-Date)-$lastRun).TotalDays,2)} else {$null}
+        $resultCode = if ($info) {[uint32]$info.LastTaskResult} else {$null}; $enabled = [bool]$task.Settings.Enabled
+        $unhealthy = $enabled -and (($null -ne $resultCode -and $resultCode -ne 0 -and $resultCode -ne 267009) -or ($null -eq $lastRun) -or ($ageDays -gt $ScheduledTaskStaleDays))
+        $row = [pscustomobject]@{
+            TaskName=$task.TaskName; TaskPath=$task.TaskPath; State=[string]$task.State; Enabled=$enabled
+            LastRunTime=if ($lastRun) {$lastRun.ToUniversalTime().ToString('o')} else {$null}; DaysSinceLastRun=$ageDays
+            LastTaskResult=$resultCode; LastTaskResultHex=if ($null -ne $resultCode) {'0x{0:X8}' -f $resultCode} else {$null}
+            NextRunTime=if ($info -and $info.NextRunTime -and $info.NextRunTime.Year -gt 1999) {$info.NextRunTime.ToUniversalTime().ToString('o')} else {$null}
+            MissedRuns=if ($info) {$info.NumberOfMissedRuns} else {$null}; Unhealthy=$unhealthy
+            Actions=New-StringArrayForJson -InputObject @($task.Actions | ForEach-Object {('{0} {1}' -f $_.Execute,$_.Arguments).Trim()})
+        }
+        $rows += $row
+        if ($unhealthy) {
+            Add-Finding -Severity 'Warning' -Category 'ScheduledTasks' -Check 'MaintenanceTask' `
+                -Message ("Scheduled task {0}{1} is unhealthy: result={2}; days since run={3}; state={4}." -f $task.TaskPath,$task.TaskName,$row.LastTaskResultHex,$ageDays,$task.State) `
+                -Value $task.TaskName -Details $row
+        }
+    }
+    $unhealthyRows = @($rows | Where-Object Unhealthy)
+    if ($tasks.Count -eq 0) { Add-Finding -Severity 'Warning' -Category 'ScheduledTasks' -Check 'MaintenanceTasks' -Message 'No Compton maintenance scheduled tasks were detected.' }
+    elseif ($unhealthyRows.Count -eq 0) { Add-Finding -Severity 'Healthy' -Category 'ScheduledTasks' -Check 'MaintenanceTasks' -Message ("All {0} detected maintenance tasks are healthy." -f $tasks.Count) }
+    [pscustomobject]@{ Available=$true; TaskCount=$rows.Count; UnhealthyCount=$unhealthyRows.Count; StaleThresholdDays=$ScheduledTaskStaleDays; Tasks=New-ObjectArrayForJson -InputObject $rows }
+}
+
+function Get-DriverCurrencyHealth {
+    param($Baseline)
+    $cutoff=(Get-Date).AddDays(-$DriverAgeWarningDays); $rows=@(); $oldDrivers=@()
+    foreach ($driver in @(Get-CimInstance Win32_PnPSignedDriver -ErrorAction SilentlyContinue)) {
+        $driverDate=Convert-CimDate $driver.DriverDate; $ageDays=if ($driverDate) {[math]::Round(((Get-Date)-$driverDate).TotalDays,0)} else {$null}
+        $placeholder=$driver.DriverProviderName -match '(?i)^Microsoft$' -and $driverDate -and $driverDate.Year -le 2006
+        $isOld=$driverDate -and $driverDate -lt $cutoff -and -not $placeholder
+        $row=[pscustomobject]@{ DeviceName=$driver.DeviceName; DeviceId=$driver.DeviceID; DeviceClass=$driver.DeviceClass; Manufacturer=$driver.Manufacturer
+            DriverProvider=$driver.DriverProviderName; DriverVersion=$driver.DriverVersion; DriverDateUtc=if ($driverDate) {$driverDate.ToUniversalTime().ToString('o')} else {$null}
+            DriverAgeDays=$ageDays; InfName=$driver.InfName; IsSigned=[bool]$driver.IsSigned; Signer=$driver.Signer; OlderThanThreshold=$isOld }
+        $rows+=$row; if ($isOld) {$oldDrivers+=$row}
+    }
+    $baselineDriverRules = Get-ObjectPropertyValueSafe -InputObject $Baseline -Name 'Drivers'
+    $rules=if ($baselineDriverRules) {@($baselineDriverRules)} else {@()}; $mismatches=@()
+    foreach ($rule in $rules) {
+        $deviceIdRegex = Get-ObjectPropertyValueSafe -InputObject $rule -Name 'DeviceIdRegex'
+        $deviceNameRegex = Get-ObjectPropertyValueSafe -InputObject $rule -Name 'DeviceNameRegex'
+        $minimumVersion = Get-ObjectPropertyValueSafe -InputObject $rule -Name 'MinimumVersion'
+        foreach ($match in @($rows | Where-Object { ($deviceIdRegex -and $_.DeviceId -match [string]$deviceIdRegex) -or ($deviceNameRegex -and $_.DeviceName -match [string]$deviceNameRegex) })) {
+            try { if ($minimumVersion -and [version]$match.DriverVersion -lt [version]$minimumVersion) { $mismatches += [pscustomobject]@{DeviceName=$match.DeviceName;DeviceId=$match.DeviceId;CurrentVersion=$match.DriverVersion;MinimumVersion=[string]$minimumVersion} } } catch { }
+        }
+    }
+    foreach ($mismatch in $mismatches) { Add-Finding -Severity 'Warning' -Category 'Drivers' -Check 'DriverBaseline' -Message ("{0} driver {1} is below approved minimum {2}." -f $mismatch.DeviceName,$mismatch.CurrentVersion,$mismatch.MinimumVersion) -Details $mismatch }
+    if ($mismatches.Count -eq 0) { Add-Finding -Severity 'Healthy' -Category 'Drivers' -Check 'DriverBaseline' -Message ("No approved driver-baseline violations detected; baseline rules={0}." -f $rules.Count) }
+    [pscustomobject]@{ DriverCount=$rows.Count; OldDriverCount=$oldDrivers.Count; AgeThresholdDays=$DriverAgeWarningDays
+        OldDrivers=New-ObjectArrayForJson -InputObject @($oldDrivers | Sort-Object DriverAgeDays -Descending | Select-Object -First 100)
+        BaselineConfigured=($rules.Count -gt 0); BaselineRuleCount=$rules.Count; BaselineMismatchCount=$mismatches.Count; BaselineMismatches=New-ObjectArrayForJson -InputObject $mismatches }
+}
+
+function Get-NetworkDiagnosticsHealth {
+    $gatewayResults=@()
+    foreach ($gateway in @(Get-NetRoute -DestinationPrefix '0.0.0.0/0' -ErrorAction SilentlyContinue | Where-Object NextHop | Select-Object -ExpandProperty NextHop -Unique)) {
+        $gatewayResults += [pscustomobject]@{Address=$gateway;Reachable=[bool](Test-Connection -ComputerName $gateway -Count 1 -Quiet -ErrorAction SilentlyContinue)}
+    }
+    $dnsAddresses=@(); $dnsError=$null
+    try {$dnsAddresses=@(Resolve-DnsName -Name $DnsTestName -Type A -DnsOnly -ErrorAction Stop | Where-Object IPAddress | Select-Object -ExpandProperty IPAddress -Unique)} catch {$dnsError=$_.Exception.Message}
+    $statistics=@()
+    if (Get-Command Get-NetAdapterStatistics -ErrorAction SilentlyContinue) { $statistics=@(Get-NetAdapterStatistics -ErrorAction SilentlyContinue | ForEach-Object {[pscustomobject]@{
+        Name=$_.Name;ReceivedBytes=$_.ReceivedBytes;SentBytes=$_.SentBytes;ReceivedDiscarded=$_.ReceivedDiscarded;OutboundDiscarded=$_.OutboundDiscarded
+        ReceivedPacketErrors=$_.ReceivedPacketErrors;OutboundPacketErrors=$_.OutboundPacketErrors }}) }
+    $gatewayHealthy=$gatewayResults.Count -gt 0 -and @($gatewayResults | Where-Object Reachable).Count -gt 0; $dnsHealthy=$dnsAddresses.Count -gt 0; $healthy=$gatewayHealthy -and $dnsHealthy
+    $result=[pscustomobject]@{DnsTestName=$DnsTestName;DnsResolved=$dnsHealthy;DnsAddresses=New-StringArrayForJson -InputObject $dnsAddresses;DnsError=$dnsError
+        GatewayReachable=$gatewayHealthy;Gateways=New-ObjectArrayForJson -InputObject $gatewayResults;AdapterStatistics=New-ObjectArrayForJson -InputObject $statistics}
+    Add-Finding -Severity $(if ($healthy) {'Healthy'} else {'Warning'}) -Category 'Network' -Check 'NetworkDiagnostics' -Message ("Gateway reachable={0}; DNS resolution for {1}={2}." -f $gatewayHealthy,$DnsTestName,$dnsHealthy) -Details $result
+    return $result
+}
+
+function Get-CrashDiagnosticsHealth {
+    $start=(Get-Date).AddHours(-$EventLookbackHours); $events=@()
+    try {$events=@(Get-WinEvent -FilterHashtable @{LogName='System';StartTime=$start;Id=41,1001,6008} -ErrorAction Stop | Where-Object {
+        ($_.Id -eq 41 -and $_.ProviderName -eq 'Microsoft-Windows-Kernel-Power') -or
+        ($_.Id -eq 1001 -and $_.ProviderName -eq 'Microsoft-Windows-WER-SystemErrorReporting') -or
+        ($_.Id -eq 6008 -and $_.ProviderName -eq 'EventLog')
+    } | Sort-Object TimeCreated -Descending | Select-Object -First 100 | ForEach-Object {
+        [pscustomobject]@{TimeCreated=$_.TimeCreated.ToUniversalTime().ToString('o');Id=[int]$_.Id;Provider=[string]$_.ProviderName;Level=[string]$_.LevelDisplayName
+            RecordId=$_.RecordId;Message=if ($_.Message) {($_.Message -replace '\s+',' ').Trim()} else {$null}}
+    })} catch {if ($_.Exception.Message -notmatch 'No events were found') {Write-Log -Level 'WARN' -Message ("Crash diagnostic event query failed: {0}" -f $_.Exception.Message)}}
+    $dumpFiles=@(Get-ChildItem -Path "$env:SystemRoot\Minidump\*.dmp","$env:SystemRoot\MEMORY.DMP" -File -ErrorAction SilentlyContinue | Sort-Object LastWriteTimeUtc -Descending | Select-Object -First 20 | ForEach-Object {
+        [pscustomobject]@{Path=$_.FullName;SizeMB=[math]::Round($_.Length/1MB,2);LastWriteTimeUtc=$_.LastWriteTimeUtc.ToString('o')}})
+    if ($events.Count -gt 0) {Add-Finding -Severity 'Warning' -Category 'Reliability' -Check 'UnexpectedShutdowns' -Message ("{0} bugcheck, kernel-power, or unexpected-shutdown event(s) occurred in the last {1} hours." -f $events.Count,$EventLookbackHours) -Value $events.Count -Details $events[0]}
+    else {Add-Finding -Severity 'Healthy' -Category 'Reliability' -Check 'UnexpectedShutdowns' -Message ("No bugcheck or unexpected-shutdown events occurred in the last {0} hours." -f $EventLookbackHours) -Value 0}
+    [pscustomobject]@{EventCount=$events.Count;Events=New-ObjectArrayForJson -InputObject $events;DumpFileCount=$dumpFiles.Count;DumpFiles=New-ObjectArrayForJson -InputObject $dumpFiles}
+}
+
+function Get-BiosCurrencyHealth {
+    param($Identity,$Baseline)
+    $releaseDate=if ($Identity -and $Identity.BIOSDate) {[datetime]$Identity.BIOSDate} else {$null}; $ageDays=if ($releaseDate) {[math]::Round(((Get-Date)-$releaseDate).TotalDays,0)} else {$null}
+    $baselineBiosRules = Get-ObjectPropertyValueSafe -InputObject $Baseline -Name 'BIOS'
+    $approved=@(); if ($baselineBiosRules) {foreach ($rule in @($baselineBiosRules)) {
+        $modelRegex = Get-ObjectPropertyValueSafe -InputObject $rule -Name 'ModelRegex'
+        $approvedRuleVersions = Get-ObjectPropertyValueSafe -InputObject $rule -Name 'ApprovedVersions'
+        if ($modelRegex -and $Identity.Model -match [string]$modelRegex) {$approved+=@($approvedRuleVersions)}
+    }}
+    $configured=$approved.Count -gt 0; $compliant=if ($configured) {$approved -contains [string]$Identity.BIOSVersion} else {$null}
+    $result=[pscustomobject]@{Manufacturer=$Identity.Manufacturer;Model=$Identity.Model;CurrentVersion=$Identity.BIOSVersion;ReleaseDateUtc=$Identity.BIOSDate;AgeDays=$ageDays
+        AgeWarningThresholdDays=$BiosAgeWarningDays;BaselineConfigured=$configured;ApprovedVersions=New-StringArrayForJson -InputObject $approved;BaselineCompliant=$compliant}
+    if ($configured -and -not $compliant) {Add-Finding -Severity 'Warning' -Category 'Firmware' -Check 'BIOSBaseline' -Message ("BIOS {0} is not approved for model {1}." -f $Identity.BIOSVersion,$Identity.Model) -Details $result}
+    elseif ($null -ne $ageDays -and $ageDays -gt $BiosAgeWarningDays) {Add-Finding -Severity 'Warning' -Category 'Firmware' -Check 'BIOSAge' -Message ("BIOS release is {0} days old; threshold is {1} days." -f $ageDays,$BiosAgeWarningDays) -Value $ageDays -Details $result}
+    else {Add-Finding -Severity 'Healthy' -Category 'Firmware' -Check 'BIOSCurrency' -Message ("BIOS age is {0} days; approved baseline configured={1}." -f $ageDays,$configured) -Details $result}
+    return $result
+}
+
 function Get-HealthSummary {
     $healthy  = @($script:Findings | ForEach-Object { $_ } | Where-Object Severity -eq 'Healthy').Count
     $info     = @($script:Findings | ForEach-Object { $_ } | Where-Object Severity -eq 'Info').Count
@@ -2257,6 +2694,8 @@ function Write-HealthFindingTelemetry {
             ValueText    = $Finding.ValueText
             ValueTexts   = New-StringArrayForJson -InputObject $Finding.ValueTexts
             ValueJson    = $Finding.ValueJson
+            Details      = $Finding.Details
+            DetailsJson  = $Finding.DetailsJson
         }
 
         HealthSummary = [ordered]@{
@@ -2276,20 +2715,29 @@ Write-Log -Message ("Starting {0} version {1}. RunId={2}" -f
 Write-Log -Message ("Active staged text log: {0}" -f $script:LogPath)
 Write-Log -Message ("Completed text log publish path: {0}" -f $script:PublishedLogPath)
 
+$healthBaseline  = Get-OptionalHealthBaseline
 $identity        = Invoke-Collector -Name 'ComputerIdentity'       -ScriptBlock { Get-ComputerIdentity }
 $hardware        = Invoke-Collector -Name 'HardwareInventory'      -ScriptBlock { Get-HardwareInventory }
+$battery         = Invoke-Collector -Name 'BatteryHealth'          -ScriptBlock { Get-BatteryHealth }
 $operatingSystem = Invoke-Collector -Name 'OperatingSystem'       -ScriptBlock { Get-OperatingSystemHealth }
 $performance     = Invoke-Collector -Name 'Performance'           -ScriptBlock { Get-PerformanceHealth }
 $storage         = Invoke-Collector -Name 'Storage'               -ScriptBlock { Get-DiskHealth }
 $deviceManager   = Invoke-Collector -Name 'DeviceManager'         -ScriptBlock { Get-DeviceManagerHealth }
+$drivers         = Invoke-Collector -Name 'DriverCurrency'        -ScriptBlock { Get-DriverCurrencyHealth -Baseline $healthBaseline }
+$biosCurrency    = Invoke-Collector -Name 'BiosCurrency'          -ScriptBlock { Get-BiosCurrencyHealth -Identity $identity -Baseline $healthBaseline }
 $defender        = Invoke-Collector -Name 'Defender'              -ScriptBlock { Get-DefenderHealth }
 $firewall        = Invoke-Collector -Name 'Firewall'              -ScriptBlock { Get-FirewallHealth }
 $bitLocker       = Invoke-Collector -Name 'BitLocker'             -ScriptBlock { Get-BitLockerHealth }
 $tpmSecureBoot   = Invoke-Collector -Name 'TpmAndSecureBoot'      -ScriptBlock { Get-TpmAndSecureBootHealth }
+$activation      = Invoke-Collector -Name 'Activation'            -ScriptBlock { Get-ActivationHealth }
+$timeSync        = Invoke-Collector -Name 'TimeSynchronization'   -ScriptBlock { Get-TimeSynchronizationHealth }
 $network         = Invoke-Collector -Name 'Network'               -ScriptBlock { Get-NetworkHealth }
+$networkDiagnostics = Invoke-Collector -Name 'NetworkDiagnostics' -ScriptBlock { Get-NetworkDiagnosticsHealth }
 $updates         = Invoke-Collector -Name 'WindowsUpdate'         -ScriptBlock { Get-WindowsUpdateHealth }
 $eventLogs       = Invoke-Collector -Name 'EventLogs'             -ScriptBlock { Get-EventLogHealth }
+$crashDiagnostics = Invoke-Collector -Name 'CrashDiagnostics'     -ScriptBlock { Get-CrashDiagnosticsHealth }
 $services        = Invoke-Collector -Name 'Services'              -ScriptBlock { Get-ServiceHealth }
+$scheduledTasks  = Invoke-Collector -Name 'MaintenanceTasks'      -ScriptBlock { Get-MaintenanceScheduledTaskHealth }
 $agents          = Invoke-Collector -Name 'ManagementAgents'      -ScriptBlock { Get-ManagementAgentHealth }
 $edge            = Invoke-Collector -Name 'MicrosoftEdge'         -ScriptBlock { Get-EdgeHealth }
 
@@ -2372,6 +2820,18 @@ $event = [ordered]@{
         CapabilityAccessManagerWalStatus = if ($camWal) { $camWal.Status } else { $null }
         DeviceManagerProblemCount = if ($deviceManager) { $deviceManager.ProblemCount } else { $null }
         DeviceManagerDegradedNonActionableCount = if ($deviceManager) { $deviceManager.DegradedNonActionableCount } else { $null }
+        BatteryPresent = if ($battery) { $battery.Present } else { $null }
+        DriverBaselineMismatchCount = if ($drivers) { $drivers.BaselineMismatchCount } else { $null }
+        OldDriverCount = if ($drivers) { $drivers.OldDriverCount } else { $null }
+        BiosAgeDays = if ($biosCurrency) { $biosCurrency.AgeDays } else { $null }
+        BiosBaselineCompliant = if ($biosCurrency) { $biosCurrency.BaselineCompliant } else { $null }
+        WindowsLicensed = if ($activation) { $activation.WindowsLicensed } else { $null }
+        OfficeLicensed = if ($activation) { $activation.OfficeLicensed } else { $null }
+        HoursSinceLastTimeSync = if ($timeSync) { $timeSync.HoursSinceLastSync } else { $null }
+        GatewayReachable = if ($networkDiagnostics) { $networkDiagnostics.GatewayReachable } else { $null }
+        DnsResolved = if ($networkDiagnostics) { $networkDiagnostics.DnsResolved } else { $null }
+        UnhealthyMaintenanceTaskCount = if ($scheduledTasks) { $scheduledTasks.UnhealthyCount } else { $null }
+        UnexpectedShutdownEventCount = if ($crashDiagnostics) { $crashDiagnostics.EventCount } else { $null }
         CriticalEventCount = if ($eventLogs) { $eventLogs.CriticalEventCount } else { $null }
         ApplicationCrashCount = if ($eventLogs) { $eventLogs.ApplicationCrashCount } else { $null }
         UnhealthyCriticalServiceCount = if ($services) { $services.UnhealthyCount } else { $null }
@@ -2391,6 +2851,11 @@ $event = [ordered]@{
     HealthSummary = $summary
     Identity      = $identity
     Hardware      = $hardware
+    Battery       = $battery
+    Firmware      = [ordered]@{
+        BIOSCurrency = $biosCurrency
+    }
+    Drivers       = $drivers
     OperatingSystem = $operatingSystem
     Performance   = $performance
     Storage       = $storage
@@ -2401,16 +2866,25 @@ $event = [ordered]@{
         BitLocker     = $bitLocker
         TPM           = if ($tpmSecureBoot) { $tpmSecureBoot.TPM } else { $null }
         SecureBoot    = if ($tpmSecureBoot) { $tpmSecureBoot.SecureBoot } else { $null }
+        Activation    = $activation
     }
+    Time          = $timeSync
     Network       = $network
+    NetworkDiagnostics = $networkDiagnostics
     Updates       = $updates
     EventLogs     = $eventLogs
+    CrashDiagnostics = $crashDiagnostics
     Services      = $services
+    ScheduledTasks = $scheduledTasks
     ManagementAgents = $agents
     Applications   = [ordered]@{
         MicrosoftEdge = $edge
     }
     Collectors    = New-ObjectArrayForJson -InputObject $script:CollectorResults
+    Baseline      = [ordered]@{
+        Path       = $HealthBaselinePath
+        Configured = ($null -ne $healthBaseline)
+    }
 }
 
 try {

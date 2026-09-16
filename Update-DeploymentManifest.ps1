@@ -5,7 +5,7 @@
 
 <#
 .SYNOPSIS
-    Updates DeploymentManifest.json from the current files on \\filesvr\Labscripts.
+    Updates DeploymentManifest.json from the current files on \\SERVER\DeploymentShare.
 
 .DESCRIPTION
     Synchronizes the manifest Files array with the approved maintenance-file
@@ -34,7 +34,7 @@
 
 [CmdletBinding()]
 param(
-    [string]$SourceRoot = '\\filesvr\Labscripts',
+    [string]$SourceRoot = '\\SERVER\DeploymentShare',
     [string]$ManifestName = 'DeploymentManifest.json',
     [switch]$WhatIfOnly
 )

@@ -129,8 +129,8 @@ $ErrorActionPreference = 'Stop'
 # Set a value to $false to retain the section in this combined file but skip it.
 [bool]$RunPrinterAndPaperCut = $true
 [bool]$RunSystemRestore     = $true
-[bool]$RunAutologonAndEdge   = $true
-[bool]$RunElasticAgent      = $true
+[bool]$RunAutologonAndEdge   = $false
+[bool]$RunElasticAgent      = $false
 [bool]$RunBrowserHomepage   = $true
 [bool]$RunHonorlock         = $true
 [bool]$RunStellariumLocation = $true
@@ -140,11 +140,11 @@ $ErrorActionPreference = 'Stop'
 # GENERAL SETTINGS
 # ============================================================================
 [string]$HomepageUrl = 'https://www.compton.edu'
-[string]$Office2024SourcePath = '\\filesvr\Labscripts\Installers\Office2024'
+[string]$Office2024SourcePath = '\\SERVER\DeploymentShare\Installers\Office2024'
 [string]$Office2024ConfigurationFile = 'office2024config.xml'
 [string]$LogDirectory = 'C:\Logs'
 [string]$RunnerScriptName = '04_Sunday_Lab_Application_Maintenance.ps1'
-[string]$RunnerVersion = '1.6.0'
+[string]$RunnerVersion = '1.6.1'
 [string]$RunnerLogPath = Join-Path $LogDirectory '04_Sunday_Lab_Application_Maintenance.log'
 [string]$RunnerLatestPath = Join-Path $LogDirectory '04_Sunday_Lab_Application_Maintenance.latest.json'
 [string]$RunnerTelemetryPath = Join-Path $LogDirectory 'Maintenance-Telemetry.ndjson'
@@ -1322,10 +1322,10 @@ $ErrorActionPreference = 'Stop'
 # =========================
 $ScriptName = '11_Install_SharpDriver_And_PaperCut.ps1'
 $ScriptVersion = '1.2.8'
-$DriverSourcePath = '\\papercut\Printer Drivers\MFP\win\SH_D31_PCL6_PS_2410a_EnglishUS_64bit'
+$DriverSourcePath = '\\PRINT-SERVER\Printer Drivers\MFP\win\SH_D31_PCL6_PS_2410a_EnglishUS_64bit'
 $PrinterDriverName = 'Sharp BP-70C31 PCL6'
-$PaperCutMsiPath = '\\papercut\Print Deploy Clients\win\pc-print-deploy-client[10.2.3.44].msi'
-$PrinterSharePath = '\\papercut\StudentSecurePrint'
+$PaperCutMsiPath = '\\PRINT-SERVER\Print Deploy Clients\win\pc-print-deploy-client.msi'
+$PrinterSharePath = '\\PRINT-SERVER\StudentSecurePrint'
 $LocalDriverStage = 'C:\ProgramData\Compton\Drivers\Sharp'
 $StateDirectory = 'C:\ProgramData\Compton\State'
 $StatePath = Join-Path $StateDirectory 'SharpDriver-PaperCut-State.json'
@@ -2287,7 +2287,7 @@ param(
     [string]$DefaultUserName = 'CC-Student',
 
     [ValidateNotNullOrEmpty()]
-    [string]$DefaultPasswordBase64 = 'Q0MkdHVkM250IQ==',
+    [string]$DefaultPasswordBase64 = '',
 
     [string]$DefaultDomainName = 'Compton.edu',
 
@@ -3084,16 +3084,16 @@ $ScriptVersion = '2.1.5'
 
 # Fleet enrollment settings copied from the current Install.ps1.
 # NOTE: The enrollment token is sensitive. Restrict read access to this script/share.
-[string]$FleetServerUrl   = 'https://10.2.12.4:8220'
-[string]$EnrollmentToken  = 'X2lseThaOEJ2UFRmNGxFS0k1aEg6dUI2VVFOVGRnWHhmeHI5S05uWDd2dw=='
+[string]$FleetServerUrl   = 'https://ELASTIC-SERVER:8220'
+[string]$EnrollmentToken  = ''
 
 # Fleet Server is currently using the Quick Start self-signed TLS certificate.
 # Keep this $true until Fleet Server is moved to a certificate trusted by the lab PCs.
 [bool]$UseInsecureFleetTls = $true
 
 # Preferred and fallback ZIP locations.
-[string]$PreferredInstallerPath = "\\filesvr\Labscripts\ElasticAgent\elastic-agent-$ElasticAgentVersion-windows-x86_64.zip"
-[string]$FallbackInstallerPath  = "\\10.2.3.30\Labscripts\ElasticAgent\elastic-agent-$ElasticAgentVersion-windows-x86_64.zip"
+[string]$PreferredInstallerPath = "\\SERVER\DeploymentShare\ElasticAgent\elastic-agent-$ElasticAgentVersion-windows-x86_64.zip"
+[string]$FallbackInstallerPath  = "\\FALLBACK-SERVER\DeploymentShare\ElasticAgent\elastic-agent-$ElasticAgentVersion-windows-x86_64.zip"
 
 # Official Elastic download fallback. Used automatically when both internal shares are unavailable.
 [string]$DownloadUri = "https://artifacts.elastic.co/downloads/beats/elastic-agent/elastic-agent-$ElasticAgentVersion-windows-x86_64.zip"

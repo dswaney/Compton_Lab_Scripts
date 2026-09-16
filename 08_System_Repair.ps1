@@ -25,7 +25,7 @@
 # Previous: v3.0 rebuilds SoftwareDistribution.bak* cleanup with resumable state tracking, capped parallel deletion, timeout-safe jobs, and orphan job cleanup for Task Scheduler windows.
 # Previous: v2.9 adds capped parallel SoftwareDistribution.bak* deletion, a cleanup time budget, robocopy mirror cleanup per folder, and safer Task Scheduler overlap protection.
 # Previous: v2.8 adds guarded SoftwareDistribution deletion with timeout-protected robocopy/rmdir fallbacks and immediate YAML log writes before cleanup steps.
-# Previous: v2.7 adds Action1 Agent validation and silent MSI installation from \\filesvr\Labscripts when C:\Windows\Action1\action1_agent.exe is missing.
+# Previous: v2.7 adds Action1 Agent validation and silent MSI installation from \\SERVER\DeploymentShare when C:\Windows\Action1\action1_agent.exe is missing.
 # Previous: v2.6 replaces SoftwareDistribution cleanup with robocopy empty-folder mirror cleanup for the active folder and SoftwareDistribution.bak* folders.
 # =====================================================================
 
@@ -41,7 +41,7 @@ param(
     [switch]$AllowExplorerHealthRepair = $true,
     [switch]$AllowSearchServiceRestart = $true,
     [switch]$AllowHpDriverRepairFromCbs = $false,
-    [string]$HpImageAssistantSourcePath = '\\filesvr\Labscripts\HPImageAssistant',
+    [string]$HpImageAssistantSourcePath = '\\SERVER\DeploymentShare\HPImageAssistant',
     [string]$HpImageAssistantLocalPath = 'C:\ProgramData\SystemRepair\HPImageAssistant',
     [switch]$AllowCopilotRemoval = $false,
     [switch]$AggressiveCleanup = $false,
@@ -580,7 +580,7 @@ function Ensure-Action1Agent {
     [CmdletBinding()]
     param(
         [string]$AgentPath = 'C:\Windows\Action1\action1_agent.exe',
-        [string]$InstallerPath = '\\filesvr\Labscripts\action1_agent(Compton_College).msi'
+        [string]$InstallerPath = '\\SERVER\DeploymentShare\Action1-Agent.msi'
     )
 
     Write-Log 'Checking for Action1 Agent...' 'INFO'
@@ -5621,7 +5621,7 @@ exit $script:FinalExitCode
 # Previous: v3.0 rebuilds SoftwareDistribution.bak* cleanup with resumable state tracking, capped parallel deletion, timeout-safe jobs, and orphan job cleanup for Task Scheduler windows.
 # Previous: v2.9 adds capped parallel SoftwareDistribution.bak* deletion, a cleanup time budget, robocopy mirror cleanup per folder, and safer Task Scheduler overlap protection.
 # Previous: v2.8 adds guarded SoftwareDistribution deletion with timeout-protected robocopy/rmdir fallbacks and immediate YAML log writes before cleanup steps.
-# Previous: v2.7 adds Action1 Agent validation and silent MSI installation from \\filesvr\Labscripts when C:\Windows\Action1\action1_agent.exe is missing.
+# Previous: v2.7 adds Action1 Agent validation and silent MSI installation from \\SERVER\DeploymentShare when C:\Windows\Action1\action1_agent.exe is missing.
 # Previous: v2.6 replaces SoftwareDistribution cleanup with robocopy empty-folder mirror cleanup for the active folder and SoftwareDistribution.bak* folders.
 # =====================================================================
 
@@ -5637,7 +5637,7 @@ param(
     [switch]$AllowExplorerHealthRepair = $true,
     [switch]$AllowSearchServiceRestart = $true,
     [switch]$AllowHpDriverRepairFromCbs = $false,
-    [string]$HpImageAssistantSourcePath = '\\filesvr\Labscripts\HPImageAssistant',
+    [string]$HpImageAssistantSourcePath = '\\SERVER\DeploymentShare\HPImageAssistant',
     [string]$HpImageAssistantLocalPath = 'C:\ProgramData\SystemRepair\HPImageAssistant',
     [switch]$AllowCopilotRemoval = $false,
     [switch]$AggressiveCleanup = $false,
@@ -6094,7 +6094,7 @@ function Ensure-Action1Agent {
     [CmdletBinding()]
     param(
         [string]$AgentPath = 'C:\Windows\Action1\action1_agent.exe',
-        [string]$InstallerPath = '\\filesvr\Labscripts\action1_agent(Compton_College).msi'
+        [string]$InstallerPath = '\\SERVER\DeploymentShare\Action1-Agent.msi'
     )
 
     Write-Log 'Checking for Action1 Agent...' 'INFO'

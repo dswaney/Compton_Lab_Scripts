@@ -51,7 +51,7 @@ $ScriptVersion = '2.1.5'
 
 # Fleet enrollment settings copied from the current Install.ps1.
 # NOTE: The enrollment token is sensitive. Restrict read access to this script/share.
-[string]$FleetServerUrl   = 'https://10.2.12.4:8220'
+[string]$FleetServerUrl   = 'https://ELASTIC-SERVER:8220'
 [string]$EnrollmentToken  = ''
 
 # Fleet Server is currently using the Quick Start self-signed TLS certificate.
@@ -59,8 +59,8 @@ $ScriptVersion = '2.1.5'
 [bool]$UseInsecureFleetTls = $true
 
 # Preferred and fallback ZIP locations.
-[string]$PreferredInstallerPath = "\\filesvr\Labscripts\ElasticAgent\elastic-agent-$ElasticAgentVersion-windows-x86_64.zip"
-[string]$FallbackInstallerPath  = "\\10.2.3.30\Labscripts\ElasticAgent\elastic-agent-$ElasticAgentVersion-windows-x86_64.zip"
+[string]$PreferredInstallerPath = "\\SERVER\DeploymentShare\ElasticAgent\elastic-agent-$ElasticAgentVersion-windows-x86_64.zip"
+[string]$FallbackInstallerPath  = "\\FALLBACK-SERVER\DeploymentShare\ElasticAgent\elastic-agent-$ElasticAgentVersion-windows-x86_64.zip"
 
 # Official Elastic download fallback. Used automatically when both internal shares are unavailable.
 [string]$DownloadUri = "https://artifacts.elastic.co/downloads/beats/elastic-agent/elastic-agent-$ElasticAgentVersion-windows-x86_64.zip"

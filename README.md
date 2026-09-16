@@ -51,13 +51,13 @@ The scripts are designed primarily for 64-bit Windows PowerShell 5.1 and normall
 | [`09_Disable_Windows_Update_Services.ps1`](./09_Disable_Windows_Update_Services.ps1) | Applies the college's post-maintenance Windows Update service, policy, and scheduled-task state. |
 | [`10_Sync_System_Time.ps1`](./10_Sync_System_Time.ps1) | Synchronizes system time and runs independently every four hours. |
 | [`14_Endpoint_Health_Inventory.ps1`](./14_Endpoint_Health_Inventory.ps1) | Captures the endpoint's final weekly health and compliance inventory after the other Sunday stages finish. |
-| [`16_Check_Deep_Freeze_Status.ps1`](./16_Check_Deep_Freeze_Status.ps1) | Records Frozen, Thawed, or Unknown Deep Freeze state at startup and alerts on Thawed or Unknown systems. |
+| [`16_Check_Deep_Freeze_Status.ps1`](./16_Check_Deep_Freeze_Status.ps1) | Records Frozen, Thawed, or Unknown Deep Freeze state each Monday at 7:00 AM, running after a missed start when necessary. |
 
 ## Detailed script descriptions
 
 ### `00_Update-Scripts-FromShare.ps1`
 
-The manifest-driven updater maintains `C:\Scripts` from the college deployment share. It prefers `\\filesvr\Labscripts` and uses `\\10.2.3.30\Labscripts` as a fallback.
+The manifest-driven updater maintains `C:\Scripts` from the college deployment share. It prefers `\\SERVER\DeploymentShare` and uses `\\FALLBACK-SERVER\DeploymentShare` as a fallback.
 
 Major functions include:
 
@@ -125,6 +125,11 @@ The easy-to-edit configuration area near the top contains:
 - Honorlock computer wildcard patterns.
 - Stellarium computer wildcard patterns.
 - A `$true` or `$false` switch for each internal section.
+
+The current Elastic Agent target list covers `IB1-*`, `IB2-*`, `SSC-216*`, and
+`AHB-146*`. The public copy preserves this scope for documentation but keeps the
+Elastic section disabled and its enrollment token blank. Enable it only in the
+protected operational copy after supplying the correct Fleet configuration.
 
 The System Restore section runs first. Script 04 is scheduled before the general
 application-update stage so its restore point remains a pre-maintenance checkpoint.
@@ -196,7 +201,7 @@ Collected areas include:
 
 ### `16_Check_Deep_Freeze_Status.ps1`
 
-Runs at startup to classify Deep Freeze as Frozen, Thawed, or Unknown and retains its JSON status history for 14 days. Thawed and Unknown results generate alerts; systems without Deep Freeze exit safely without unnecessary maintenance-launcher telemetry.
+Runs each Monday at 7:00 AM to classify Deep Freeze as Frozen, Thawed, or Unknown and retains its JSON status history for 14 days. The scheduled task uses `StartWhenAvailable`, so a computer that was off at 7:00 AM runs the check after it next becomes available. Thawed and Unknown results generate alerts; systems without Deep Freeze exit safely without unnecessary maintenance-launcher telemetry.
 
 ## Supporting files
 
@@ -245,7 +250,7 @@ It manages:
 - Task execution settings and time limits.
 - The system-time synchronization task.
 - The post-reboot startup-resume task.
-- The Deep Freeze startup check.
+- The Monday 7:00 AM Deep Freeze check, including run-after-missed-start behavior.
 - Removal of obsolete task names from earlier schedules.
 - Removal of any managed task whose action references one of the retired standalone scripts.
 - Structured task-reconciliation telemetry and verification results.
@@ -273,14 +278,14 @@ Additional managed triggers:
 |---|---|---|
 | Every four hours | Sync System Time | `10_Sync_System_Time.ps1` |
 | At system startup | Resume Reboot Verification | `07_Force_Reboot_Install_Updates.ps1 -StartupResume` |
-| At system startup | Check Deep Freeze Status | `16_Check_Deep_Freeze_Status.ps1` |
+| Monday at 7:00 AM; run after a missed start | Check Deep Freeze Status | `16_Check_Deep_Freeze_Status.ps1` |
 
 The schedule deliberately leaves larger windows around application maintenance, drivers, Windows Updates, and system repair. Task start times are fixed; they do not guarantee that an earlier task has finished, so execution duration should continue to be monitored through telemetry.
 
 ## Deployment workflow
 
-1. Place the approved scripts and supporting files in `\\filesvr\Labscripts`.
-2. Keep the fallback share at `\\10.2.3.30\Labscripts` synchronized as required.
+1. Place the approved scripts and supporting files in `\\SERVER\DeploymentShare`.
+2. Keep the fallback share at `\\FALLBACK-SERVER\DeploymentShare` synchronized as required.
 3. Remove retired standalone scripts from the active deployment-share folder or archive them outside the managed folder.
 4. Run `Update-DeploymentManifest.ps1` after files are added, changed, renamed, or removed.
 5. Test `00_Update-Scripts-FromShare.ps1` on a pilot endpoint.

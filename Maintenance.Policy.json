@@ -2,8 +2,8 @@
   "SchemaVersion": 1,
   "PolicyVersion": "1.0.2",
   "FleetStatusRoots": [
-    "\\\\filesvr\\MaintenanceStatus",
-    "\\\\10.2.3.30\\MaintenanceStatus"
+    "\\\\SERVER\\MaintenanceStatus",
+    "\\\\FALLBACK-SERVER\\MaintenanceStatus"
   ],
   "StaleWarningDays": 3,
   "StaleCriticalDays": 7,

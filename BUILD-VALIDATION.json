@@ -1,5 +1,5 @@
 {
-  "PackageVersion": "2.5.0",
+  "PackageVersion": "2.5.1",
   "PowerShellParserExecuted": false,
   "StructuralChecks": [
     "Manifest hashes generated",
@@ -8,7 +8,9 @@
     "Consolidated script 04 included",
     "Retired standalone scripts excluded from active manifest and task rotation",
     "System Restore embedded in script 04 and standalone script 12 retired",
-    "Public script 04 credential fields blank and credential-dependent sections disabled"
+    "Public script 04 credential fields blank and credential-dependent sections disabled",
+    "Internal server names, private IP addresses, and installer shares replaced with public placeholders",
+    "Expanded Elastic target prefixes retained in script 04 and documented in README"
   ],
   "RequiresWindowsPowerShellValidation": true
 }

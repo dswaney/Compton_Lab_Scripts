@@ -789,7 +789,7 @@ function Publish-MaintenanceFleetStatus {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory)]$Record,
-        [string[]]$StatusRoots=@('\\filesvr\MaintenanceStatus','\\10.2.3.30\MaintenanceStatus'),
+        [string[]]$StatusRoots=@('\\SERVER\MaintenanceStatus','\\FALLBACK-SERVER\MaintenanceStatus'),
         [string]$LocalFallback='C:\Logs\FleetStatus-Pending'
     )
     $json=$Record | ConvertTo-Json -Depth 12
@@ -1220,7 +1220,7 @@ function Publish-MaintenanceFleetStatus {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory)]$Record,
-        [string[]]$StatusRoots=@('\\filesvr\MaintenanceStatus','\\10.2.3.30\MaintenanceStatus'),
+        [string[]]$StatusRoots=@('\\SERVER\MaintenanceStatus','\\FALLBACK-SERVER\MaintenanceStatus'),
         [string]$LocalFallback='C:\Logs\FleetStatus-Pending'
     )
     $json=$Record | ConvertTo-Json -Depth 12

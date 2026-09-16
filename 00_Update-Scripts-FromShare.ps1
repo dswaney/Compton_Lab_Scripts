@@ -11,7 +11,7 @@
 # Purpose:
 #   Manifest-driven, self-bootstrapping updater for C:\Scripts.
 #   - Uses standardized Elastic-friendly text log format: timestamp, computer, level, message.
-#   - Uses \\filesvr\Labscripts with an IP fallback.
+#   - Uses \\SERVER\DeploymentShare with an IP fallback.
 #   - Downloads Maintenance.Framework.psm1 when missing or changed.
 #   - Validates PowerShell syntax and updater structure before deployment.
 #   - Parses all PowerShell files before installation.
@@ -30,8 +30,8 @@ $ProgressPreference = 'SilentlyContinue'
 
 $ScriptName = '00_Update-Scripts-FromShare.ps1'
 $ScriptVersion = '4.7.0'
-$PreferredSourceRoot = '\\filesvr\Labscripts'
-$FallbackSourceRoot = '\\10.2.3.30\Labscripts'
+$PreferredSourceRoot = '\\SERVER\DeploymentShare'
+$FallbackSourceRoot = '\\FALLBACK-SERVER\DeploymentShare'
 $ManifestName = 'DeploymentManifest.json'
 $FrameworkName = 'Maintenance.Framework.psm1'
 $RegisterTasksName = 'Register-Tasks_SYSTEM.ps1'

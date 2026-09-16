@@ -15,12 +15,12 @@ param([string]$WorkingRoot = 'C:\Temp\DriverUpdates',
     [switch]$IncludeSoftware,
     [switch]$IncludeBIOS,
     [switch]$All,
-    [string]$HpiaSourceFolder = '\\filesvr\Labscripts\HPImageAssistant',
-    [string]$HpiaInstallerSharePath = '\\filesvr\labscripts\HPImageAssistant.exe',
+    [string]$HpiaSourceFolder = '\\SERVER\DeploymentShare\HPImageAssistant',
+    [string]$HpiaInstallerSharePath = '\\SERVER\DeploymentShare\HPImageAssistant.exe',
     [string]$HpiaInternetLandingPage = 'https://ftp.ext.hp.com/pub/caps-softpaq/cmit/HPIA.html',
     [string]$LocalHpiaFolder = 'C:\ProgramData\Compton\HPImageAssistant',
-    [string]$DellCommandUpdateSharePath = '\\filesvr\labscripts\Dell-Command-Update-Windows-Universal-Application.exe',
-    [string]$DotNetDesktopRuntimeSharePath = '\\filesvr\labscripts\windowsdesktop-runtime-8.0.25-win-x64.exe',
+    [string]$DellCommandUpdateSharePath = '\\SERVER\DeploymentShare\Dell-Command-Update-Windows-Universal-Application.exe',
+    [string]$DotNetDesktopRuntimeSharePath = '\\SERVER\DeploymentShare\windowsdesktop-runtime-8.0.25-win-x64.exe',
     [string]$DotNetDesktopRuntimeInternetUrl = 'https://aka.ms/dotnet/8.0/windowsdesktop-runtime-win-x64.exe',
     [string]$DellCommandUpdateWingetId = 'Dell.CommandUpdate.Universal'
 )
@@ -2486,7 +2486,7 @@ function Invoke-DellDriverUpdates {
     Write-Log (("Dell DCU logs: {0} ; {1} ; {2}") -f $dcuScanLog, $dcuApplyLog, $dcuReport) 'OK'
 
     Write-Log 'Running Dell BIOS settings script from the central share...' 'INFO'
-    $dellBiosScript='\\filesvr\Labscripts\Set-Dell-BIOS-Settings.ps1'
+    $dellBiosScript='\\SERVER\DeploymentShare\Set-Dell-BIOS-Settings.ps1'
     if (Test-Path -LiteralPath $dellBiosScript) {
         & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $dellBiosScript
         if ($LASTEXITCODE -eq 0) {
@@ -3158,12 +3158,12 @@ param([string]$WorkingRoot = 'C:\Temp\DriverUpdates',
     [switch]$IncludeSoftware,
     [switch]$IncludeBIOS,
     [switch]$All,
-    [string]$HpiaSourceFolder = '\\filesvr\Labscripts\HPImageAssistant',
-    [string]$HpiaInstallerSharePath = '\\filesvr\labscripts\HPImageAssistant.exe',
+    [string]$HpiaSourceFolder = '\\SERVER\DeploymentShare\HPImageAssistant',
+    [string]$HpiaInstallerSharePath = '\\SERVER\DeploymentShare\HPImageAssistant.exe',
     [string]$HpiaInternetLandingPage = 'https://ftp.ext.hp.com/pub/caps-softpaq/cmit/HPIA.html',
     [string]$LocalHpiaFolder = 'C:\ProgramData\Compton\HPImageAssistant',
-    [string]$DellCommandUpdateSharePath = '\\filesvr\labscripts\Dell-Command-Update-Windows-Universal-Application.exe',
-    [string]$DotNetDesktopRuntimeSharePath = '\\filesvr\labscripts\windowsdesktop-runtime-8.0.25-win-x64.exe',
+    [string]$DellCommandUpdateSharePath = '\\SERVER\DeploymentShare\Dell-Command-Update-Windows-Universal-Application.exe',
+    [string]$DotNetDesktopRuntimeSharePath = '\\SERVER\DeploymentShare\windowsdesktop-runtime-8.0.25-win-x64.exe',
     [string]$DotNetDesktopRuntimeInternetUrl = 'https://aka.ms/dotnet/8.0/windowsdesktop-runtime-win-x64.exe',
     [string]$DellCommandUpdateWingetId = 'Dell.CommandUpdate.Universal'
 )
@@ -5049,7 +5049,7 @@ function Invoke-DellDriverUpdates {
     Write-Log (("Dell DCU logs: {0} ; {1} ; {2}") -f $dcuScanLog, $dcuApplyLog, $dcuReport) 'OK'
 
     Write-Log 'Running Dell BIOS settings script from the central share...' 'INFO'
-    $dellBiosScript='\\filesvr\Labscripts\Set-Dell-BIOS-Settings.ps1'
+    $dellBiosScript='\\SERVER\DeploymentShare\Set-Dell-BIOS-Settings.ps1'
     if (Test-Path -LiteralPath $dellBiosScript) {
         & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $dellBiosScript
         if ($LASTEXITCODE -eq 0) {

@@ -6,7 +6,7 @@
 #requires -Version 5.1
 [CmdletBinding()]
 param(
- [string]$StatusRoot='\\filesvr\MaintenanceStatus',
+ [string]$StatusRoot='\\SERVER\MaintenanceStatus',
  [string]$OutputPath='C:\Logs\Fleet-Maintenance-Status.html',
  [int]$WarningDays=3,[int]$CriticalDays=7
 )
@@ -31,7 +31,7 @@ $rows
 ﻿#requires -Version 5.1
 [CmdletBinding()]
 param(
- [string]$StatusRoot='\\filesvr\MaintenanceStatus',
+ [string]$StatusRoot='\\SERVER\MaintenanceStatus',
  [string]$OutputPath='C:\Logs\Fleet-Maintenance-Status.html',
  [int]$WarningDays=3,[int]$CriticalDays=7
 )

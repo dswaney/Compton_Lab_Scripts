@@ -235,8 +235,8 @@ function Invoke-LatestUpdaterBootstrap {
     $localUpdaterPath = Join-Path $localScriptsRoot '00_Update-Scripts-FromShare.ps1'
 
     $sourceRoots = @(
-        '\\filesvr\Labscripts',
-        '\\10.2.3.30\Labscripts'
+        '\\SERVER\DeploymentShare',
+        '\\FALLBACK-SERVER\DeploymentShare'
     )
 
     $sourceRoot = $null
@@ -254,7 +254,7 @@ function Invoke-LatestUpdaterBootstrap {
     }
 
     if ([string]::IsNullOrWhiteSpace($sourceRoot)) {
-        throw 'Updater bootstrap failed because neither \\filesvr\Labscripts nor \\10.2.3.30\Labscripts is available.'
+        throw 'Updater bootstrap failed because neither \\SERVER\DeploymentShare nor \\FALLBACK-SERVER\DeploymentShare is available.'
     }
 
     $sourceUpdaterPath = Join-Path $sourceRoot '00_Update-Scripts-FromShare.ps1'

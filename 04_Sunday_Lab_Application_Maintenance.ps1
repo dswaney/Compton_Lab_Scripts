@@ -1,8 +1,8 @@
 #requires -Version 5.1
 #requires -RunAsAdministrator
 # ScriptName:    04_Sunday_Lab_Application_Maintenance.ps1
-# ScriptVersion: 1.6.0
-# LastUpdated:   2026-09-15
+# ScriptVersion: 1.6.1
+# LastUpdated:   2026-09-16
 <#
 .SYNOPSIS
     Runs the Sunday lab application and configuration maintenance in one script.
@@ -25,8 +25,8 @@
 
 .NOTES
     ScriptName:    04_Sunday_Lab_Application_Maintenance.ps1
-    ScriptVersion: 1.6.0
-    LastUpdated:   2026-09-15
+    ScriptVersion: 1.6.1
+    LastUpdated:   2026-09-16
     Requires:      64-bit Windows PowerShell 5.1, Administrator or SYSTEM
 
     Changes:       v1.6.0 expands Chrome lab policy enforcement to suppress the
@@ -97,8 +97,9 @@ $ErrorActionPreference = 'Stop'
 
 # --- Elastic Agent installation targets (former script 15) -----------------
 [string[]]$ElasticAgentComputerPrefixes = @(
-    'IB1-103',
-	'SSC-216*'
+    'IB1-*',
+	'SSC-216*',
+	'AHB-146*'
 )
 
 # --- Honorlock Chrome extension targets (former script 18) -----------------

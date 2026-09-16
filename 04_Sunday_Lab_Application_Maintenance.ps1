@@ -98,6 +98,7 @@ $ErrorActionPreference = 'Stop'
 # --- Elastic Agent installation targets (former script 15) -----------------
 [string[]]$ElasticAgentComputerPrefixes = @(
     'IB1-*',
+	'IB2-*',
 	'SSC-216*',
 	'AHB-146*'
 )

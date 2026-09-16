@@ -10,9 +10,13 @@
 
 .NOTES
     ScriptName:    09_Disable_Windows_Update_Services.ps1
-    ScriptVersion: 2.0.6
-    LastUpdated:   2026-08-17
-    Changes:       v2.0.3 uses Maintenance.Framework v2.4 staged text logging.
+    ScriptVersion: 2.0.7
+    LastUpdated:   2026-09-16
+    Changes:       v2.0.7 treats a stopped Delivery Optimization service
+                   (DoSvc) as successfully controlled even when Windows keeps
+                   its startup mode at Auto or Manual. The script no longer
+                   generates a false service-disable error for that state.
+                   v2.0.3 uses Maintenance.Framework v2.4 staged text logging.
 
     Script 01 is expected to restore the services and required scheduled tasks before the
     next maintenance cycle. Disabling BITS can affect non-Windows-Update software that uses
@@ -30,7 +34,7 @@ Set-StrictMode -Version 2.0
 $ErrorActionPreference = 'Stop'
 
 $ScriptName = '09_Disable_Windows_Update_Services.ps1'
-$ScriptVersion = '2.0.6'
+$ScriptVersion = '2.0.7'
 $RunId = [guid]::NewGuid().Guid
 $StartTime = Get-Date
 $UtcTimestamp = $StartTime.ToUniversalTime().ToString('o')
@@ -351,7 +355,8 @@ function Stop-AndDisableService {
     param(
         [Parameter(Mandatory)][string]$Name,
         [switch]$AllowMissing,
-        [switch]$AllowProtectedFailure
+        [switch]$AllowProtectedFailure,
+        [switch]$AllowManagedStartupMode
     )
 
     $before = @(Get-ServiceSnapshot -Names @($Name))[0]
@@ -417,22 +422,34 @@ function Stop-AndDisableService {
         $messages.Add('Service was already stopped.')
     }
 
-    $startupResult = Set-ServiceStartupDisabledWithRetry -Name $Name -Attempts 3 -DelayMilliseconds 750
-    foreach ($msg in $startupResult.Messages) {
-        $messages.Add($msg)
+    if ($AllowManagedStartupMode) {
+        $messages.Add('Startup type is managed by Windows and was not forced to Disabled.')
     }
-    if (-not $startupResult.Succeeded) {
-        $operationFailed = $true
-        $messages.Add('Startup type did not verify as Disabled after 3 attempts.')
+    else {
+        $startupResult = Set-ServiceStartupDisabledWithRetry -Name $Name -Attempts 3 -DelayMilliseconds 750
+        foreach ($msg in $startupResult.Messages) {
+            $messages.Add($msg)
+        }
+        if (-not $startupResult.Succeeded) {
+            $operationFailed = $true
+            $messages.Add('Startup type did not verify as Disabled after 3 attempts.')
+        }
     }
 
     Start-Sleep -Milliseconds 1000
     $after = @(Get-ServiceSnapshot -Names @($Name))[0]
-    $verified = $after.Exists -and $after.StartMode -eq 'Disabled' -and $after.State -eq 'Stopped'
+    $startupModeAccepted = $after.StartMode -eq 'Disabled' -or $AllowManagedStartupMode
+    $verified = $after.Exists -and $startupModeAccepted -and $after.State -eq 'Stopped'
 
     if ($verified) {
-        Write-Status "Service state change: $Name | State: $($before.State) -> $($after.State) | StartMode: $($before.StartMode) -> $($after.StartMode)" 'OK'
-        Add-OperationResult -Type 'Service' -Name $Name -Status 'Success' -Message ($messages -join ' ') -Before $before -After $after
+        if ($AllowManagedStartupMode -and $after.StartMode -ne 'Disabled') {
+            Write-Status "Service state accepted: $Name is Stopped; Windows-managed StartMode=$($after.StartMode) is expected." 'OK'
+            Add-OperationResult -Type 'Service' -Name $Name -Status 'SuccessManagedStartup' -Message ($messages -join ' ') -Before $before -After $after
+        }
+        else {
+            Write-Status "Service state change: $Name | State: $($before.State) -> $($after.State) | StartMode: $($before.StartMode) -> $($after.StartMode)" 'OK'
+            Add-OperationResult -Type 'Service' -Name $Name -Status 'Success' -Message ($messages -join ' ') -Before $before -After $after
+        }
     }
     else {
         $message = ($messages -join ' ') + " Final state: State=$($after.State), StartMode=$($after.StartMode)."
@@ -713,7 +730,11 @@ try {
     $servicesBefore = @(Get-ServiceSnapshot -Names @($servicesToDisable))
 
     foreach ($serviceName in $servicesToDisable) {
-        Stop-AndDisableService -Name $serviceName -AllowMissing -AllowProtectedFailure:($serviceName -eq 'WaaSMedicSvc')
+        Stop-AndDisableService `
+            -Name $serviceName `
+            -AllowMissing `
+            -AllowProtectedFailure:($serviceName -eq 'WaaSMedicSvc') `
+            -AllowManagedStartupMode:($serviceName -eq 'dosvc')
     }
 
     if ($KeepBITSAvailable) {

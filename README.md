@@ -39,6 +39,7 @@ The scripts are designed primarily for 64-bit Windows PowerShell 5.1 and normall
 
 | File | Purpose |
 |---|---|
+| [`Post-Deployment.ps1`](./Post-Deployment.ps1) | Prepares newly deployed HP and Dell endpoints, installs required agents, removes Microsoft Copilot through the shared module, refreshes the maintenance package, activates Office LTSC 2024, and runs initial updates. |
 | [`00_Update-Scripts-FromShare.ps1`](./00_Update-Scripts-FromShare.ps1) | Synchronizes the approved maintenance package from the primary or fallback share, validates PowerShell files, preserves rollback copies, retires replaced scripts, and reconciles scheduled tasks. |
 | [`01_Enable_Windows_Update_Services.ps1`](./01_Enable_Windows_Update_Services.ps1) | Restores Windows Update services, scheduled tasks, policy settings, and required Windows configuration before the update stages begin. |
 | [`02_Remove_User_Profiles.ps1`](./02_Remove_User_Profiles.ps1) | Removes eligible stale local profiles, enforces the standard lab UI, and runs the canonical Microsoft Copilot removal routine. |
@@ -54,6 +55,12 @@ The scripts are designed primarily for 64-bit Windows PowerShell 5.1 and normall
 | [`16_Check_Deep_Freeze_Status.ps1`](./16_Check_Deep_Freeze_Status.ps1) | Records Frozen, Thawed, or Unknown Deep Freeze state each Monday at 7:00 AM, running after a missed start when necessary. |
 
 ## Detailed script descriptions
+
+### `Post-Deployment.ps1`
+
+Runs the initial deployment workflow before the numbered maintenance schedule takes over. It supports HP and Dell driver, BIOS, and firmware servicing; refreshes `C:\Scripts`; registers scheduled tasks; installs PaperCut Print Deploy and Action1; checks Office LTSC 2024 activation; updates applications and Windows; and records an isolated result for every section.
+
+Microsoft Copilot removal loads `Maintenance.Copilot.psm1` directly from the configured central share, so the target computer does not need to have `C:\Scripts` beforehand. The public copy uses placeholder server and share paths; replace them only in the protected operational copy.
 
 ### `00_Update-Scripts-FromShare.ps1`
 

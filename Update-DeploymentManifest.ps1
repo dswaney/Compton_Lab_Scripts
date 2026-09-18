@@ -1,7 +1,7 @@
 #requires -Version 5.1
 # ScriptName:    Update-DeploymentManifest.ps1
-# ScriptVersion: 2.1.0
-# LastUpdated:   2026-09-16
+# ScriptVersion: 2.2.0
+# LastUpdated:   2026-09-18
 
 <#
 .SYNOPSIS
@@ -18,9 +18,10 @@
 
 .NOTES
     ScriptName:    Update-DeploymentManifest.ps1
-    ScriptVersion: 2.1.0
-    LastUpdated:   2026-09-16
-    Changes:       v2.1.0 removes former script 12 from the approved catalog,
+    ScriptVersion: 2.2.0
+    LastUpdated:   2026-09-18
+    Changes:       v2.2.0 adds Maintenance.Copilot.psm1 to the approved catalog.
+                   v2.1.0 removes former script 12 from the approved catalog,
                    adds it to the script 04 retirement mapping, and validates
                    that no retired file can also remain approved.
                    v2.0.0 adds consolidated script 04 and retires standalone
@@ -42,7 +43,7 @@ param(
 Set-StrictMode -Version 2.0
 $ErrorActionPreference = 'Stop'
 
-$ScriptVersion = '2.1.0'
+$ScriptVersion = '2.2.0'
 
 # Keep this catalog synchronized with $ApprovedMaintenanceFiles in
 # 00_Update-Scripts-FromShare.ps1. Files absent from the manifest are added.
@@ -62,6 +63,7 @@ $ApprovedFileCatalog = @(
     [pscustomobject]@{ Name='16_Check_Deep_Freeze_Status.ps1';                         Role='MaintenanceScript' },
     [pscustomobject]@{ Name='Get-MaintenanceFleetStatus.ps1';                          Role='Utility' },
     [pscustomobject]@{ Name='Invoke-MaintenanceScript.ps1';                            Role='Launcher' },
+    [pscustomobject]@{ Name='Maintenance.Copilot.psm1';                                Role='Framework' },
     [pscustomobject]@{ Name='Maintenance.Framework.psm1';                              Role='Framework' },
     [pscustomobject]@{ Name='Maintenance.Policy.json';                                 Role='Policy' },
     [pscustomobject]@{ Name='Register-Tasks_SYSTEM.ps1';                               Role='TaskRegistration' }

@@ -1,8 +1,10 @@
 # =====================================================================
 # ScriptName: 02_Remove_User_Profiles.ps1
-# ScriptVersion: 2.4.0
-# LastUpdated: 2026-09-14
-# Changes: v2.4.0 completely removes the Microsoft Copilot Appx package from
+# ScriptVersion: 2.4.1
+# LastUpdated: 2026-09-18
+# Changes: v2.4.1 uses the shared Maintenance.Copilot module so profile cleanup,
+#          system repair, and post-deployment use one canonical removal routine.
+#          v2.4.0 completely removes the Microsoft Copilot Appx package from
 #          existing users and online provisioning, stops Copilot processes,
 #          disables Copilot tasks, and applies machine/current/future-user
 #          policies that prevent Copilot from being enabled again.
@@ -63,7 +65,7 @@ $script:BaseFileName = "{0}-RemoveUserProfiles-{1}" -f $script:ComputerName, $sc
 $script:YamlLogPath = Join-Path $LogDirectory ($script:BaseFileName + '.yaml')
 $script:RunId = [guid]::NewGuid().ToString('N')
 $script:ScriptName = '02_Remove_User_Profiles.ps1'
-$script:ScriptVersion = '2.4.0'
+$script:ScriptVersion = '2.4.1'
 $script:Domain = $env:USERDNSDOMAIN
 $script:TextLogPath = $null
 $script:PublishedTextLogPath = $null
@@ -149,6 +151,8 @@ $script:Windows11UIPreferences = @(
 # Load the shared framework from the same directory as this script.
 $MaintenanceFrameworkPath = 'C:\Scripts\Maintenance.Framework.psm1'
 Import-Module -Name $MaintenanceFrameworkPath -Force -ErrorAction Stop
+$CopilotModulePath = 'C:\Scripts\Maintenance.Copilot.psm1'
+Import-Module -Name $CopilotModulePath -Force -ErrorAction Stop
 $MaintenanceConfig = Initialize-MaintenanceEnvironment -ScriptRoot 'C:\Scripts' -LogRoot 'C:\Logs'
 
 $requiredFrameworkVersion = [version]'2.4.0'
@@ -1662,6 +1666,27 @@ function Remove-MicrosoftCopilot {
         $script:Summary.CopilotRemovalStatus = 'RemovedOrNotPresent'
         Write-Log 'Microsoft Copilot is removed or was not installed. Disable and removal policies are applied.' 'OK'
     }
+}
+
+# Canonical Copilot implementation. This later definition intentionally
+# replaces the legacy in-file function above during the transition to the
+# shared module; the legacy block can be removed in a later general refactor.
+function Remove-MicrosoftCopilot {
+    [CmdletBinding(SupportsShouldProcess = $true)]
+    param()
+
+    $copilotResult = Invoke-ComprehensiveCopilotRemoval `
+        -Logger { param($Message,$Level) Write-Log $Message $Level } `
+        -WhatIf:$WhatIfPreference
+
+    $script:Summary.CopilotInstalledPackagesFound = [int]$copilotResult.InstalledPackagesFound
+    $script:Summary.CopilotInstalledPackagesRemoved = [int]$copilotResult.InstalledPackagesRemoved
+    $script:Summary.CopilotProvisionedPackagesFound = [int]$copilotResult.ProvisionedPackagesFound
+    $script:Summary.CopilotProvisionedPackagesRemoved = [int]$copilotResult.ProvisionedPackagesRemoved
+    $script:Summary.CopilotProcessesStopped = [int]$copilotResult.ProcessesStopped
+    $script:Summary.CopilotTasksDisabled = [int]$copilotResult.TasksDisabled
+    $script:Summary.CopilotRemovalFailures = [int]$copilotResult.Failures
+    $script:Summary.CopilotRemovalStatus = [string]$copilotResult.Status
 }
 
 if (-not (Test-IsAdministrator)) {

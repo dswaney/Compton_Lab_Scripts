@@ -1,8 +1,9 @@
 #requires -version 5.1
 # =====================================================================
 # ScriptName: 00_Update-Scripts-FromShare.ps1
-# ScriptVersion: 4.7.0
-# LastUpdated: 2026-09-09
+# ScriptVersion: 4.8.0
+# LastUpdated: 2026-09-18
+# Changes: v4.8.0 approves the shared Maintenance.Copilot.psm1 module.
 # Changes: v4.7.0 requires, approves, and supplementally deploys script 16 for the Monday Deep Freeze status audit.
 # Changes: v4.6.0 retires script 12 after its System Restore workflow was embedded in script 04 v1.3.0.
 # Changes: v4.5.0 deploys the combined script 04 and safely retires the six scripts it previously replaced.
@@ -29,7 +30,7 @@ $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 
 $ScriptName = '00_Update-Scripts-FromShare.ps1'
-$ScriptVersion = '4.7.0'
+$ScriptVersion = '4.8.0'
 $PreferredSourceRoot = '\\SERVER\DeploymentShare'
 $FallbackSourceRoot = '\\FALLBACK-SERVER\DeploymentShare'
 $ManifestName = 'DeploymentManifest.json'
@@ -76,6 +77,7 @@ $DeepFreezeStatusScriptName = '16_Check_Deep_Freeze_Status.ps1'
     '16_Check_Deep_Freeze_Status.ps1',
     'Get-MaintenanceFleetStatus.ps1',
     'Invoke-MaintenanceScript.ps1',
+    'Maintenance.Copilot.psm1',
     'Maintenance.Framework.psm1',
     'Maintenance.Policy.json',
     'Register-Tasks_SYSTEM.ps1'

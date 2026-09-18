@@ -41,13 +41,13 @@ The scripts are designed primarily for 64-bit Windows PowerShell 5.1 and normall
 |---|---|
 | [`00_Update-Scripts-FromShare.ps1`](./00_Update-Scripts-FromShare.ps1) | Synchronizes the approved maintenance package from the primary or fallback share, validates PowerShell files, preserves rollback copies, retires replaced scripts, and reconciles scheduled tasks. |
 | [`01_Enable_Windows_Update_Services.ps1`](./01_Enable_Windows_Update_Services.ps1) | Restores Windows Update services, scheduled tasks, policy settings, and required Windows configuration before the update stages begin. |
-| [`02_Remove_User_Profiles.ps1`](./02_Remove_User_Profiles.ps1) | Removes eligible stale local profiles while preserving protected profiles and maintains the configured legacy Edge InPrivate startup behavior. |
+| [`02_Remove_User_Profiles.ps1`](./02_Remove_User_Profiles.ps1) | Removes eligible stale local profiles, enforces the standard lab UI, and runs the canonical Microsoft Copilot removal routine. |
 | [`03_Weekend_Apps_Update.ps1`](./03_Weekend_Apps_Update.ps1) | Updates applications through WinGet and services Microsoft Office Click-to-Run before driver and operating-system maintenance. |
 | [`04_Sunday_Lab_Application_Maintenance.ps1`](./04_Sunday_Lab_Application_Maintenance.ps1) | Creates and verifies the weekly restore point, then runs consolidated printer, PaperCut, Office activation, Autologon, Edge, Elastic Agent, browser homepage, Honorlock, and Stellarium Location Services maintenance. |
 | [`05_Weekend_HP_Drivers_Update.ps1`](./05_Weekend_HP_Drivers_Update.ps1) | Performs supported HP and Dell driver and firmware maintenance, with safeguards around sensitive storage-related driver categories. |
 | [`06_Weekend_Windows_Updates.ps1`](./06_Weekend_Windows_Updates.ps1) | Installs Windows Updates in two Sunday passes and records detailed compliance, result, and reboot telemetry. |
 | [`07_Force_Reboot_Install_Updates.ps1`](./07_Force_Reboot_Install_Updates.ps1) | Coordinates as many as three planned reboot/update cycles and resumes verification at startup. |
-| [`08_System_Repair.ps1`](./08_System_Repair.ps1) | Runs Windows image, file-system, disk, service, management-agent, and cleanup diagnostics and repairs. |
+| [`08_System_Repair.ps1`](./08_System_Repair.ps1) | Runs Windows image, file-system, disk, service, management-agent, and cleanup diagnostics and repairs; Copilot removal remains an explicit opt-in fallback. |
 | [`09_Disable_Windows_Update_Services.ps1`](./09_Disable_Windows_Update_Services.ps1) | Applies the college's post-maintenance Windows Update service, policy, and scheduled-task state. |
 | [`10_Sync_System_Time.ps1`](./10_Sync_System_Time.ps1) | Synchronizes system time and runs independently every four hours. |
 | [`14_Endpoint_Health_Inventory.ps1`](./14_Endpoint_Health_Inventory.ps1) | Captures the endpoint's final weekly health and compliance inventory after the other Sunday stages finish. |
@@ -96,7 +96,7 @@ Performs the weekly local-profile cleanup stage. The script is intended to reduc
 
 Eligibility is controlled by the configured age threshold and exclusions. Loaded, special, system, and explicitly protected profiles are skipped. The script records reclaimed space and before-and-after disk information in its maintenance telemetry.
 
-The script also retains legacy computer-name-based Edge InPrivate startup handling for the configured lab groups. Review the profile protections and Edge patterns before expanding deployment to new computer groups.
+The script also retains legacy computer-name-based Edge InPrivate startup handling for the configured lab groups. It is the primary recurring enforcement point for Microsoft Copilot removal and calls `Maintenance.Copilot.psm1` so the same tested behavior is shared with post-deployment and system repair. Review the profile protections and Edge patterns before expanding deployment to new computer groups.
 
 ### `03_Weekend_Apps_Update.ps1`
 
@@ -164,7 +164,7 @@ Coordinates as many as three planned reboot/update cycles when maintenance requi
 
 ### `08_System_Repair.ps1`
 
-Runs system integrity and repair checks after the Windows Update stages. Operations include DISM and SFC checks, disk and NVMe health inspection, Explorer/RPC diagnostics, temporary-file cleanup, and management-agent validation, including Action1. Safety defaults constrain disruptive repairs. The task is given a one-hour window before final inventory so longer operations can complete.
+Runs system integrity and repair checks after the Windows Update stages. Operations include DISM and SFC checks, disk and NVMe health inspection, Explorer/RPC diagnostics, temporary-file cleanup, and management-agent validation, including Action1. Safety defaults constrain disruptive repairs. Microsoft Copilot removal is available only with `-AllowCopilotRemoval` and uses the shared canonical module. The task is given a one-hour window before final inventory so longer operations can complete.
 
 ### `09_Disable_Windows_Update_Services.ps1`
 
@@ -204,6 +204,10 @@ Collected areas include:
 Runs each Monday at 7:00 AM to classify Deep Freeze as Frozen, Thawed, or Unknown and retains its JSON status history for 14 days. The scheduled task uses `StartWhenAvailable`, so a computer that was off at 7:00 AM runs the check after it next becomes available. Thawed and Unknown results generate alerts; systems without Deep Freeze exit safely without unnecessary maintenance-launcher telemetry.
 
 ## Supporting files
+
+### `Maintenance.Copilot.psm1`
+
+Canonical Microsoft Copilot removal module used by script 02, the optional script 08 repair path, and Post-Deployment. It stops Copilot processes, disables related scheduled tasks, removes installed and provisioned packages, applies machine/current/offline/default-user policies, removes Copilot shortcuts, disables Edge Copilot entry points, and verifies package removal.
 
 ### `Maintenance.Framework.psm1`
 

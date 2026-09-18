@@ -1,14 +1,14 @@
 {
     "SchemaVersion":  1,
-    "ManifestVersion":  "2.5.0",
-    "PackageVersion":  "2.5.0",
-    "GeneratedUtc":  "2026-09-16T21:48:35Z",
+    "ManifestVersion":  "2.6.0",
+    "PackageVersion":  "2.6.0",
+    "GeneratedUtc":  "2026-09-18T21:28:48Z",
     "Files":  [
                   {
                       "Name":  "00_Update-Scripts-FromShare.ps1",
                       "Role":  "Updater",
-                      "Version":  "4.7.0",
-                      "SHA256":  "35660361DAE66B1CAE5E5C4F60D2B6C37A84F2F57CBED842ADD36D2E64FA20A2"
+                      "Version":  "4.8.0",
+                      "SHA256":  "3060B543D18B954C542C7887036F6718FC952101B4F1F9DEDD5E0200DE3D6F79"
                   },
                   {
                       "Name":  "01_Enable_Windows_Update_Services.ps1",
@@ -19,8 +19,8 @@
                   {
                       "Name":  "02_Remove_User_Profiles.ps1",
                       "Role":  "ManagedFile",
-                      "Version":  "2.4.0",
-                      "SHA256":  "158DEF5E9CD69A2B30D95DB0E82DD76391B36EEE7F05F5B7563454905A96FC37"
+                      "Version":  "2.4.1",
+                      "SHA256":  "05243ABD6B3813E7C70A821FACD6F5B22CBDE0ABD848CE127480D2B80C0E1CD5"
                   },
                   {
                       "Name":  "03_Weekend_Apps_Update.ps1",
@@ -55,8 +55,8 @@
                   {
                       "Name":  "08_System_Repair.ps1",
                       "Role":  "ManagedFile",
-                      "Version":  "4.5.5",
-                      "SHA256":  "BAA57461975DCE7F23293EBD56701876488B0F17779B6855E0B9807A3D29356B"
+                      "Version":  "4.6.0",
+                      "SHA256":  "EDAB558BDBCC182FE826F532394985F3C60E981E82859EDCD86B06486836E7A7"
                   },
                   {
                       "Name":  "09_Disable_Windows_Update_Services.ps1",
@@ -93,6 +93,12 @@
                       "Role":  "Launcher",
                       "Version":  "1.0.0",
                       "SHA256":  "E50EB5C53CA29419F20E7BA725EBBD23D9E31B2170884633D30D1E2638E730C7"
+                  },
+                  {
+                      "Name":  "Maintenance.Copilot.psm1",
+                      "Role":  "Framework",
+                      "Version":  "1.0.0",
+                      "SHA256":  "D5B8170986BCB5623FEEFC6DB7958D33E3DC6B87CD59FDED74842A0A30D593D0"
                   },
                   {
                       "Name":  "Maintenance.Framework.psm1",

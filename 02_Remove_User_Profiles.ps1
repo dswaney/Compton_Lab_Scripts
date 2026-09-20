@@ -1,9 +1,10 @@
 # =====================================================================
 # ScriptName: 02_Remove_User_Profiles.ps1
-# ScriptVersion: 2.4.1
+# ScriptVersion: 2.4.2
 # LastUpdated: 2026-09-18
-# Changes: v2.4.1 uses the shared Maintenance.Copilot module so profile cleanup,
-#          system repair, and post-deployment use one canonical removal routine.
+# Changes: v2.4.2 removes the superseded in-file Copilot implementation; the
+#          shared Maintenance.Copilot module is now the sole implementation.
+#          v2.4.1 introduced the shared Copilot module.
 #          v2.4.0 completely removes the Microsoft Copilot Appx package from
 #          existing users and online provisioning, stops Copilot processes,
 #          disables Copilot tasks, and applies machine/current/future-user
@@ -1498,179 +1499,8 @@ function Set-Windows11UIPreferencesForAllUsers {
     Write-Log "Completed Windows 11 UI preference application for all available users." 'OK'
 }
 
-function Set-CopilotMachinePolicies {
-    [CmdletBinding(SupportsShouldProcess = $true)]
-    param()
-
-    $settings = @(
-        [pscustomobject]@{ Path = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsAI'; Name = 'RemoveMicrosoftCopilotApp'; Value = 1; Description = 'Microsoft Copilot removal policy' },
-        [pscustomobject]@{ Path = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\Explorer'; Name = 'HideCopilotButton'; Value = 1; Description = 'Copilot taskbar-button policy' },
-        [pscustomobject]@{ Path = 'HKLM:\SOFTWARE\Policies\Microsoft\Edge'; Name = 'HubsSidebarEnabled'; Value = 0; Description = 'Edge sidebar and Copilot entry-point policy' }
-    )
-
-    foreach ($setting in $settings) {
-        try {
-            $target = "$($setting.Path)\$($setting.Name)"
-            if ($PSCmdlet.ShouldProcess($target, "Set $($setting.Description) to $($setting.Value)")) {
-                if (-not (Test-Path -LiteralPath $setting.Path)) {
-                    New-Item -Path $setting.Path -Force -ErrorAction Stop | Out-Null
-                }
-                New-ItemProperty -Path $setting.Path -Name $setting.Name -Value $setting.Value -PropertyType DWord -Force -ErrorAction Stop | Out-Null
-                Write-Log "Applied $($setting.Description): $target=$($setting.Value)" 'OK'
-            }
-        }
-        catch {
-            $script:Summary.CopilotRemovalFailures++
-            Write-Log "Failed applying $($setting.Description): $($_.Exception.Message)" 'ERROR'
-        }
-    }
-}
-
-function Remove-MicrosoftCopilot {
-    [CmdletBinding(SupportsShouldProcess = $true)]
-    param()
-
-    Write-Log 'Starting Microsoft Copilot disable and removal operation.' 'INFO'
-    $script:Summary.CopilotRemovalStatus = 'Running'
-
-    Set-CopilotMachinePolicies -WhatIf:$WhatIfPreference
-
-    try {
-        $copilotProcesses = @(Get-Process -ErrorAction SilentlyContinue | Where-Object {
-            $_.ProcessName -like '*Copilot*'
-        })
-        foreach ($process in $copilotProcesses) {
-            try {
-                if ($PSCmdlet.ShouldProcess("$($process.ProcessName) [$($process.Id)]", 'Stop Copilot process')) {
-                    Stop-Process -Id $process.Id -Force -ErrorAction Stop
-                    $script:Summary.CopilotProcessesStopped++
-                    Write-Log "Stopped Copilot process: $($process.ProcessName) [$($process.Id)]" 'OK'
-                }
-            }
-            catch {
-                $script:Summary.CopilotRemovalFailures++
-                Write-Log "Failed stopping Copilot process $($process.ProcessName) [$($process.Id)]: $($_.Exception.Message)" 'ERROR'
-            }
-        }
-    }
-    catch {
-        $script:Summary.CopilotRemovalFailures++
-        Write-Log "Failed enumerating Copilot processes: $($_.Exception.Message)" 'ERROR'
-    }
-
-    try {
-        Import-Module ScheduledTasks -ErrorAction Stop
-        $copilotTasks = @(Get-ScheduledTask -ErrorAction SilentlyContinue | Where-Object {
-            $_.TaskName -like '*Copilot*' -or $_.TaskPath -like '*Copilot*'
-        })
-        foreach ($task in $copilotTasks) {
-            $fullTaskName = '{0}{1}' -f ([string]$task.TaskPath),([string]$task.TaskName)
-            if ([string]$task.State -eq 'Disabled') {
-                Write-Log "Copilot scheduled task is already disabled: $fullTaskName" 'OK'
-                continue
-            }
-            try {
-                if ($PSCmdlet.ShouldProcess($fullTaskName, 'Disable Copilot scheduled task')) {
-                    Disable-ScheduledTask -TaskName $task.TaskName -TaskPath $task.TaskPath -ErrorAction Stop | Out-Null
-                    $script:Summary.CopilotTasksDisabled++
-                    Write-Log "Disabled Copilot scheduled task: $fullTaskName" 'OK'
-                }
-            }
-            catch {
-                $script:Summary.CopilotRemovalFailures++
-                Write-Log "Failed disabling Copilot scheduled task ${fullTaskName}: $($_.Exception.Message)" 'ERROR'
-            }
-        }
-    }
-    catch {
-        $script:Summary.CopilotRemovalFailures++
-        Write-Log "Failed enumerating Copilot scheduled tasks: $($_.Exception.Message)" 'ERROR'
-    }
-
-    try {
-        $installedPackages = @(Get-AppxPackage -AllUsers -ErrorAction Stop | Where-Object {
-            $_.Name -like '*Copilot*' -or $_.PackageFullName -like '*Copilot*'
-        } | Sort-Object PackageFullName -Unique)
-        $script:Summary.CopilotInstalledPackagesFound = $installedPackages.Count
-
-        foreach ($package in $installedPackages) {
-            try {
-                if ($PSCmdlet.ShouldProcess($package.PackageFullName, 'Remove Copilot Appx package for all users')) {
-                    Remove-AppxPackage -Package $package.PackageFullName -AllUsers -ErrorAction Stop
-                    $script:Summary.CopilotInstalledPackagesRemoved++
-                    Write-Log "Removed installed Copilot package for all users: $($package.PackageFullName)" 'OK'
-                }
-            }
-            catch {
-                $script:Summary.CopilotRemovalFailures++
-                Write-Log "Failed removing installed Copilot package $($package.PackageFullName): $($_.Exception.Message)" 'ERROR'
-            }
-        }
-    }
-    catch {
-        $script:Summary.CopilotRemovalFailures++
-        Write-Log "Failed enumerating installed Copilot Appx packages: $($_.Exception.Message)" 'ERROR'
-    }
-
-    try {
-        $provisionedPackages = @(Get-AppxProvisionedPackage -Online -ErrorAction Stop | Where-Object {
-            $_.DisplayName -like '*Copilot*' -or $_.PackageName -like '*Copilot*'
-        } | Sort-Object PackageName -Unique)
-        $script:Summary.CopilotProvisionedPackagesFound = $provisionedPackages.Count
-
-        foreach ($package in $provisionedPackages) {
-            try {
-                if ($PSCmdlet.ShouldProcess($package.PackageName, 'Remove provisioned Copilot package from Windows')) {
-                    Remove-AppxProvisionedPackage -Online -PackageName $package.PackageName -ErrorAction Stop | Out-Null
-                    $script:Summary.CopilotProvisionedPackagesRemoved++
-                    Write-Log "Removed provisioned Copilot package: $($package.PackageName)" 'OK'
-                }
-            }
-            catch {
-                $script:Summary.CopilotRemovalFailures++
-                Write-Log "Failed removing provisioned Copilot package $($package.PackageName): $($_.Exception.Message)" 'ERROR'
-            }
-        }
-    }
-    catch {
-        $script:Summary.CopilotRemovalFailures++
-        Write-Log "Failed enumerating provisioned Copilot packages: $($_.Exception.Message)" 'ERROR'
-    }
-
-    if ($WhatIfPreference) {
-        $script:Summary.CopilotRemovalStatus = 'WhatIf'
-        Write-Log 'Microsoft Copilot removal completed in WhatIf mode; no packages or settings were changed.' 'INFO'
-        return
-    }
-
-    $remainingInstalled = @(Get-AppxPackage -AllUsers -ErrorAction SilentlyContinue | Where-Object {
-        $_.Name -like '*Copilot*' -or $_.PackageFullName -like '*Copilot*'
-    })
-    $remainingProvisioned = @(Get-AppxProvisionedPackage -Online -ErrorAction SilentlyContinue | Where-Object {
-        $_.DisplayName -like '*Copilot*' -or $_.PackageName -like '*Copilot*'
-    })
-
-    if ($remainingInstalled.Count -gt 0 -or $remainingProvisioned.Count -gt 0) {
-        $remainingCount = $remainingInstalled.Count + $remainingProvisioned.Count
-        $script:Summary.CopilotRemovalFailures += $remainingCount
-        $script:Summary.CopilotRemovalStatus = 'FailedVerification'
-        Write-Log "Copilot removal verification found $remainingCount remaining installed or provisioned package(s)." 'ERROR'
-        return
-    }
-
-    if ($script:Summary.CopilotRemovalFailures -gt 0) {
-        $script:Summary.CopilotRemovalStatus = 'CompletedWithErrors'
-        Write-Log "Microsoft Copilot removal completed with $($script:Summary.CopilotRemovalFailures) failure(s)." 'ERROR'
-    }
-    else {
-        $script:Summary.CopilotRemovalStatus = 'RemovedOrNotPresent'
-        Write-Log 'Microsoft Copilot is removed or was not installed. Disable and removal policies are applied.' 'OK'
-    }
-}
-
-# Canonical Copilot implementation. This later definition intentionally
-# replaces the legacy in-file function above during the transition to the
-# shared module; the legacy block can be removed in a later general refactor.
+# Compatibility wrapper retained for this script. All Copilot removal logic is
+# implemented by Maintenance.Copilot.psm1.
 function Remove-MicrosoftCopilot {
     [CmdletBinding(SupportsShouldProcess = $true)]
     param()

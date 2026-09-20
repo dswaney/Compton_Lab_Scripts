@@ -11,7 +11,7 @@
 
 Set-StrictMode -Version 2.0
 
-$script:CopilotModuleVersion = '1.0.0'
+$script:CopilotModuleVersion = '1.0.1'
 
 function Write-CopilotMessage {
     param(
@@ -76,10 +76,11 @@ function Invoke-ComprehensiveCopilotRemoval {
         Status                        = 'Running'
     }
 
+    # Limit package removal to Copilot-named packages and the explicit
+    # Windows AI Copilot provider. MicrosoftOfficeHub is intentionally excluded.
     $packagePatterns = @(
         '*Copilot*',
-        'Microsoft.Windows.Ai.Copilot.Provider',
-        'Microsoft.MicrosoftOfficeHub'
+        'Microsoft.Windows.Ai.Copilot.Provider'
     )
 
     Write-CopilotMessage -Logger $Logger -Message "Starting comprehensive Microsoft Copilot removal (module $($script:CopilotModuleVersion))."

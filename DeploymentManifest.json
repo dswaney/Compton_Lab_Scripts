@@ -55,8 +55,8 @@
                   {
                       "Name":  "08_System_Repair.ps1",
                       "Role":  "ManagedFile",
-                      "Version":  "4.6.0",
-                      "SHA256":  "EDAB558BDBCC182FE826F532394985F3C60E981E82859EDCD86B06486836E7A7"
+                      "Version":  "4.6.1",
+                      "SHA256":  "45A9BBC761A4D97031474E0E2306E5A69B6731C642CDD1DBFB7D80DB42E6357B"
                   },
                   {
                       "Name":  "09_Disable_Windows_Update_Services.ps1",

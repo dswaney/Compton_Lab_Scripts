@@ -34,9 +34,12 @@
 
 .NOTES
     ScriptName:    14_Endpoint_Health_Inventory.ps1
-    ScriptVersion: 1.5.0
+    ScriptVersion: 1.6.0
     LastUpdated:   2026-09-21
-    Changes:       v1.5.0 classifies Windows Error Reporting event 1001 by EventName, counts only
+    Changes:       v1.6.0 adds deterministic SHA-256 fingerprints to health findings and
+                   remediation candidates, and emits one structured remediation-candidate
+                   event per stable Windows failure signature for controlled n8n workflows.
+                   v1.5.0 classifies Windows Error Reporting event 1001 by EventName, counts only
                    genuine application-failure types as application crashes, deduplicates repeated WER
                    records by ReportId, and reports Windows component-store failures separately. It also
                    adds structured remediation classifications for future Elastic/n8n orchestration.
@@ -165,7 +168,7 @@ Set-StrictMode -Version 2.0
 $ErrorActionPreference = 'Stop'
 
 $script:ScriptName       = '14_Endpoint_Health_Inventory.ps1'
-$script:ScriptVersion    = '1.5.0'
+$script:ScriptVersion    = '1.6.0'
 $script:RunId            = [guid]::NewGuid().Guid
 $script:StartTime        = Get-Date
 $script:WarningCount     = 0
@@ -367,6 +370,44 @@ function Convert-FindingValueForTelemetry {
     return [pscustomobject]$result
 }
 
+function ConvertTo-FingerprintComponent {
+    [CmdletBinding()]
+    param([AllowNull()]$Value)
+
+    if ($null -eq $Value) { return '<null>' }
+    $text = ([string]$Value).Trim().ToLowerInvariant()
+    if ([string]::IsNullOrWhiteSpace($text)) { return '<empty>' }
+    return (($text -replace '\s+', ' ') -replace '\\', '/').Trim()
+}
+
+function New-StableFingerprint {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$Namespace,
+        [AllowEmptyCollection()][object[]]$Components = @()
+    )
+
+    $canonicalComponents = New-Object System.Collections.Generic.List[string]
+    $canonicalComponents.Add('fingerprint-version=1') | Out-Null
+    $canonicalComponents.Add(('namespace={0}' -f (ConvertTo-FingerprintComponent -Value $Namespace))) | Out-Null
+    $canonicalComponents.Add(('computer={0}' -f (ConvertTo-FingerprintComponent -Value $env:COMPUTERNAME))) | Out-Null
+
+    foreach ($component in @($Components)) {
+        $canonicalComponents.Add((ConvertTo-FingerprintComponent -Value $component)) | Out-Null
+    }
+
+    $canonicalText = $canonicalComponents.ToArray() -join '|'
+    $sha256 = [Security.Cryptography.SHA256]::Create()
+    try {
+        $bytes = [Text.Encoding]::UTF8.GetBytes($canonicalText)
+        $hashBytes = $sha256.ComputeHash($bytes)
+        return (($hashBytes | ForEach-Object { $_.ToString('x2') }) -join '')
+    }
+    finally {
+        $sha256.Dispose()
+    }
+}
+
 function Add-Finding {
     param(
         [Parameter(Mandatory)]
@@ -377,7 +418,8 @@ function Add-Finding {
         [Parameter(Mandatory)][string]$Check,
         [Parameter(Mandatory)][string]$Message,
         $Value = $null,
-        [AllowNull()]$Details = $null
+        [AllowNull()]$Details = $null,
+        [AllowEmptyCollection()][object[]]$FingerprintComponents = @()
     )
 
     $typedValue = Convert-FindingValueForTelemetry -Value $Value
@@ -392,7 +434,13 @@ function Add-Finding {
         }
     }
 
+    $fingerprint = New-StableFingerprint -Namespace 'endpoint.health.finding' `
+        -Components (@($Category, $Check) + @($FingerprintComponents))
+
     $script:Findings.Add([pscustomobject]@{
+        Fingerprint  = $fingerprint
+        FingerprintVersion = '1'
+        FingerprintAlgorithm = 'SHA256'
         Severity     = $Severity
         Category     = $Category
         Check        = $Check
@@ -1400,7 +1448,8 @@ function Get-DeviceManagerHealth {
                 $(if ([string]::IsNullOrWhiteSpace([string]$problemDevice.InfName)) { 'Unknown' } else { $problemDevice.InfName })
 
             Add-Finding -Severity 'Warning' -Category 'Hardware' -Check 'DeviceManagerProblem' `
-                -Message $message -Value $deviceName -Details $problemDevice
+                -Message $message -Value $deviceName -Details $problemDevice `
+                -FingerprintComponents @($problemDevice.InstanceId, $problemDevice.ProblemCode)
         }
     }
     else {
@@ -1969,7 +2018,27 @@ function ConvertTo-ApplicationCrashRecord {
         }
     }
 
+    # Exclude timestamps, record/report IDs, process IDs, file versions, and the
+    # rendered message. Those values can change between equivalent occurrences.
+    $remediationFingerprint = New-StableFingerprint -Namespace 'endpoint.health.remediation' -Components @(
+        $remediationClass,
+        [int]$Event.Id,
+        [string]$Event.ProviderName,
+        $incidentType,
+        $werEventName,
+        $applicationName,
+        $faultingModule,
+        $exceptionCode,
+        $problemSignature.P1,
+        $problemSignature.P3,
+        $problemSignature.P4,
+        $problemSignature.P7
+    )
+
     [pscustomobject]@{
+        Fingerprint      = $remediationFingerprint
+        FingerprintVersion = '1'
+        FingerprintAlgorithm = 'SHA256'
         TimeCreated       = $Event.TimeCreated.ToUniversalTime().ToString('o')
         RecordId          = [long]$Event.RecordId
         Id                = [int]$Event.Id
@@ -2053,6 +2122,7 @@ function Get-EventLogHealth {
     $applicationWerRecords = @()
     $windowsServicingFailures = @()
     $otherWerReports = @()
+    $remediationCandidates = @()
     $rawWerEventCount = 0
     try {
         $candidateEvents = @(Get-WinEvent -FilterHashtable @{
@@ -2093,6 +2163,35 @@ function Get-EventLogHealth {
 
         $applicationCrashes = @($nonWerApplicationEvents + $applicationWerRecords |
             Sort-Object TimeCreated -Descending)
+
+        $remediationCandidates = @($convertedEvents |
+            Where-Object {
+                $_.RemediationClass -notin @('None','PolicyExpectedNoAction')
+            } |
+            Group-Object Fingerprint |
+            ForEach-Object {
+                $records = @($_.Group | Sort-Object TimeCreated)
+                $latestRecord = $records[-1]
+                $reportIds = @($records |
+                    ForEach-Object { $_.ReportId } |
+                    Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) } |
+                    Sort-Object -Unique)
+
+                [pscustomobject][ordered]@{
+                    Fingerprint          = [string]$latestRecord.Fingerprint
+                    FingerprintVersion   = [string]$latestRecord.FingerprintVersion
+                    FingerprintAlgorithm = [string]$latestRecord.FingerprintAlgorithm
+                    RemediationClass     = [string]$latestRecord.RemediationClass
+                    RemediationEligible  = [bool]$latestRecord.RemediationEligible
+                    RemediationReason    = [string]$latestRecord.RemediationReason
+                    OccurrenceCount      = $records.Count
+                    DistinctReportCount  = $reportIds.Count
+                    FirstSeen            = [string]$records[0].TimeCreated
+                    LastSeen             = [string]$latestRecord.TimeCreated
+                    Evidence             = $latestRecord
+                }
+            } |
+            Sort-Object LastSeen -Descending)
     }
     catch {
         if ($_.Exception.Message -notmatch 'No events were found') {
@@ -2251,6 +2350,8 @@ function Get-EventLogHealth {
         WindowsServicingFailures      = New-ObjectArrayForJson -InputObject $windowsServicingFailures
         OtherWerReportCount           = $otherWerReports.Count
         OtherWerReports               = New-ObjectArrayForJson -InputObject $otherWerReports
+        RemediationCandidateCount     = $remediationCandidates.Count
+        RemediationCandidates         = New-ObjectArrayForJson -InputObject $remediationCandidates
         CriticalEventCount           = $criticalEvents.Count
         CriticalEvents               = New-ObjectArrayForJson -InputObject $criticalEvents
     }
@@ -2689,7 +2790,7 @@ function Get-DriverCurrencyHealth {
             try { if ($minimumVersion -and [version]$match.DriverVersion -lt [version]$minimumVersion) { $mismatches += [pscustomobject]@{DeviceName=$match.DeviceName;DeviceId=$match.DeviceId;CurrentVersion=$match.DriverVersion;MinimumVersion=[string]$minimumVersion} } } catch { }
         }
     }
-    foreach ($mismatch in $mismatches) { Add-Finding -Severity 'Warning' -Category 'Drivers' -Check 'DriverBaseline' -Message ("{0} driver {1} is below approved minimum {2}." -f $mismatch.DeviceName,$mismatch.CurrentVersion,$mismatch.MinimumVersion) -Details $mismatch }
+    foreach ($mismatch in $mismatches) { Add-Finding -Severity 'Warning' -Category 'Drivers' -Check 'DriverBaseline' -Message ("{0} driver {1} is below approved minimum {2}." -f $mismatch.DeviceName,$mismatch.CurrentVersion,$mismatch.MinimumVersion) -Details $mismatch -FingerprintComponents @($mismatch.DeviceName,$mismatch.DeviceId) }
     if ($mismatches.Count -eq 0) { Add-Finding -Severity 'Healthy' -Category 'Drivers' -Check 'DriverBaseline' -Message ("No approved driver-baseline violations detected; baseline rules={0}." -f $rules.Count) }
     [pscustomobject]@{ DriverCount=$rows.Count; OldDriverCount=$oldDrivers.Count; AgeThresholdDays=$DriverAgeWarningDays
         OldDrivers=New-ObjectArrayForJson -InputObject @($oldDrivers | Sort-Object DriverAgeDays -Descending | Select-Object -First 100)
@@ -2880,8 +2981,11 @@ function Write-HealthFindingTelemetry {
     $findingEvent = [ordered]@{
         '@timestamp'   = $EventTime.ToUniversalTime().ToString('o')
         EventType      = 'endpoint.health.finding'
-        SchemaVersion  = '1.0'
+        SchemaVersion  = '1.1'
         RunId          = $script:RunId
+        Fingerprint    = [string]$Finding.Fingerprint
+        FingerprintVersion = [string]$Finding.FingerprintVersion
+        FingerprintAlgorithm = [string]$Finding.FingerprintAlgorithm
 
         ComputerName   = $env:COMPUTERNAME
         Domain         = if ($Identity) { $Identity.Domain } else { $env:USERDOMAIN }
@@ -2895,6 +2999,9 @@ function Write-HealthFindingTelemetry {
         FindingCount   = $FindingCount
 
         Finding = [ordered]@{
+            Fingerprint  = [string]$Finding.Fingerprint
+            FingerprintVersion = [string]$Finding.FingerprintVersion
+            FingerprintAlgorithm = [string]$Finding.FingerprintAlgorithm
             Severity     = [string]$Finding.Severity
             Category     = [string]$Finding.Category
             Check        = [string]$Finding.Check
@@ -2917,6 +3024,51 @@ function Write-HealthFindingTelemetry {
     }
 
     $jsonCompact = $findingEvent | ConvertTo-Json -Depth 12 -Compress
+    Write-MaintenanceTelemetryLine -Path $script:NdjsonPath -JsonLine $jsonCompact
+}
+
+function Write-RemediationCandidateTelemetry {
+    param(
+        [Parameter(Mandatory)]$Candidate,
+        [Parameter(Mandatory)][int]$CandidateNumber,
+        [Parameter(Mandatory)][int]$CandidateCount,
+        [Parameter(Mandatory)][datetime]$EventTime,
+        $Identity
+    )
+
+    $requiresRepeatedDetection = [bool]([string]$Candidate.RemediationClass -match 'DriverRepairCandidate$')
+    $candidateEvent = [ordered]@{
+        '@timestamp'        = $EventTime.ToUniversalTime().ToString('o')
+        EventType           = 'endpoint.health.remediation_candidate'
+        SchemaVersion       = '1.0'
+        RunId               = $script:RunId
+        Fingerprint         = [string]$Candidate.Fingerprint
+        FingerprintVersion  = [string]$Candidate.FingerprintVersion
+        FingerprintAlgorithm = [string]$Candidate.FingerprintAlgorithm
+
+        ComputerName        = $env:COMPUTERNAME
+        Domain              = if ($Identity) { $Identity.Domain } else { $env:USERDOMAIN }
+        Building            = if ($Identity) { $Identity.Building } else { $null }
+        Lab                 = if ($Identity) { $Identity.Lab } else { $null }
+        DeviceIdentifier    = if ($Identity) { $Identity.DeviceIdentifier } else { $null }
+
+        ScriptName          = $script:ScriptName
+        ScriptVersion       = $script:ScriptVersion
+        CandidateNumber     = $CandidateNumber
+        CandidateCount      = $CandidateCount
+        RemediationClass    = [string]$Candidate.RemediationClass
+        RemediationEligible = [bool]$Candidate.RemediationEligible
+        RemediationReason   = [string]$Candidate.RemediationReason
+        RequiresRepeatedDetection = $requiresRepeatedDetection
+        MinimumDetectionRuns = if ($requiresRepeatedDetection) { 2 } else { 1 }
+        OccurrenceCount     = [int]$Candidate.OccurrenceCount
+        DistinctReportCount = [int]$Candidate.DistinctReportCount
+        FirstSeen           = [string]$Candidate.FirstSeen
+        LastSeen            = [string]$Candidate.LastSeen
+        Evidence            = $Candidate.Evidence
+    }
+
+    $jsonCompact = $candidateEvent | ConvertTo-Json -Depth 14 -Compress
     Write-MaintenanceTelemetryLine -Path $script:NdjsonPath -JsonLine $jsonCompact
 }
 
@@ -3001,7 +3153,7 @@ $exitCode = if ($failedCollectors -gt 0) {
 $event = [ordered]@{
     '@timestamp' = $endTime.ToUniversalTime().ToString('o')
     EventType    = 'endpoint.health'
-    SchemaVersion= '1.0'
+    SchemaVersion= '1.1'
     RunId        = $script:RunId
 
     ComputerName = $env:COMPUTERNAME
@@ -3047,6 +3199,7 @@ $event = [ordered]@{
         ApplicationCrashCount = if ($eventLogs) { $eventLogs.ApplicationCrashCount } else { $null }
         WindowsServicingFailureCount = if ($eventLogs) { $eventLogs.WindowsServicingFailureCount } else { $null }
         OtherWerReportCount = if ($eventLogs) { $eventLogs.OtherWerReportCount } else { $null }
+        RemediationCandidateCount = if ($eventLogs) { $eventLogs.RemediationCandidateCount } else { $null }
         UnhealthyCriticalServiceCount = if ($services) { $services.UnhealthyCount } else { $null }
         DisabledFirewallProfileCount = if ($firewall) { $firewall.DisabledProfileCount } else { $null }
         DefenderRecentThreatDetectionCount = if ($defender -and $defender.Available) { $defender.RecentThreatDetectionCount } else { $null }
@@ -3101,7 +3254,7 @@ $event = [ordered]@{
 }
 
 try {
-    Write-Log -Message ("Elastic endpoint-health summary: Health={0}; Critical={1}; Warnings={2}; CPU={3}%; Memory={4}%; SystemDrive={5}%; PendingReboot={6}; DeviceProblems={7}; FirewallDisabled={8}; CollectorFailures={9}; FindingEvents={10}" -f `
+    Write-Log -Message ("Elastic endpoint-health summary: Health={0}; Critical={1}; Warnings={2}; CPU={3}%; Memory={4}%; SystemDrive={5}%; PendingReboot={6}; DeviceProblems={7}; FirewallDisabled={8}; CollectorFailures={9}; FindingEvents={10}; RemediationCandidates={11}" -f `
         $summary.Status,
         $summary.CriticalCount,
         $summary.WarningCount,
@@ -3112,7 +3265,8 @@ try {
         $(if ($deviceManager) { $deviceManager.ProblemCount } else { $null }),
         $(if ($firewall) { $firewall.DisabledProfileCount } else { $null }),
         $failedCollectors,
-        @($summary.Findings | Where-Object { $_.Severity -in @('Warning','Critical') }).Count)
+        @($summary.Findings | Where-Object { $_.Severity -in @('Warning','Critical') }).Count,
+        $(if ($eventLogs) { $eventLogs.RemediationCandidateCount } else { 0 }))
 
     Write-Telemetry -Event $event
 
@@ -3123,8 +3277,15 @@ try {
             -EventTime $endTime -Identity $identity -Summary $summary
     }
 
-    Write-Log -Message ("Endpoint snapshot completed. Health={0}; ExitCode={1}; CollectorsFailed={2}; FindingEvents={3}" -f
-        $summary.Status, $exitCode, $failedCollectors, $actionableFindings.Count)
+    $remediationCandidates = if ($eventLogs) { @($eventLogs.RemediationCandidates) } else { @() }
+    for ($candidateIndex = 0; $candidateIndex -lt $remediationCandidates.Count; $candidateIndex++) {
+        Write-RemediationCandidateTelemetry -Candidate $remediationCandidates[$candidateIndex] `
+            -CandidateNumber ($candidateIndex + 1) -CandidateCount $remediationCandidates.Count `
+            -EventTime $endTime -Identity $identity
+    }
+
+    Write-Log -Message ("Endpoint snapshot completed. Health={0}; ExitCode={1}; CollectorsFailed={2}; FindingEvents={3}; RemediationCandidateEvents={4}" -f
+        $summary.Status, $exitCode, $failedCollectors, $actionableFindings.Count, $remediationCandidates.Count)
 }
 catch {
     Write-Log -Level 'ERROR' -Message ("Unable to write endpoint telemetry: {0}" -f $_.Exception.Message)

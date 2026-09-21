@@ -1,6 +1,6 @@
 {
   "SchemaVersion": 1,
-  "PolicyVersion": "1.0.2",
+  "PolicyVersion": "1.0.3",
   "FleetStatusRoots": [
     "\\\\SERVER\\MaintenanceStatus",
     "\\\\FALLBACK-SERVER\\MaintenanceStatus"
@@ -160,6 +160,18 @@
         "Days": [],
         "Start": "00:00",
         "End": "23:59"
+      },
+      "Dependencies": []
+    },
+    {
+      "Name": "Repair-MicrosoftEdgeUpdate.ps1",
+      "Window": {
+        "Enforce": true,
+        "Days": [
+          "Sunday"
+        ],
+        "Start": "00:00",
+        "End": "10:00"
       },
       "Dependencies": []
     }

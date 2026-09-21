@@ -53,6 +53,7 @@ The scripts are designed primarily for 64-bit Windows PowerShell 5.1 and normall
 | [`10_Sync_System_Time.ps1`](./10_Sync_System_Time.ps1) | Synchronizes system time and runs independently every four hours. |
 | [`14_Endpoint_Health_Inventory.ps1`](./14_Endpoint_Health_Inventory.ps1) | Captures the endpoint's final weekly health and compliance inventory after the other Sunday stages finish. |
 | [`16_Check_Deep_Freeze_Status.ps1`](./16_Check_Deep_Freeze_Status.ps1) | Records Frozen, Thawed, or Unknown Deep Freeze state each Monday at 7:00 AM, running after a missed start when necessary. |
+| [`Repair-MicrosoftEdgeUpdate.ps1`](./Repair-MicrosoftEdgeUpdate.ps1) | Performs purpose-built, detection-first Microsoft Edge Update servicing repair for future allowlisted Elastic/n8n remediation; it is deployed but not scheduled. |
 
 ## Detailed script descriptions
 
@@ -216,6 +217,13 @@ Collected areas include:
   Copilot reports are not mislabeled as application crashes.
 - Windows component-store failures are reported separately with structured remediation
   classifications that can support a future controlled Elastic/n8n repair workflow.
+- Every finding receives a deterministic SHA-256 fingerprint derived from the hostname,
+  category, check, and any stable device-specific identity supplied by the collector.
+- Windows failure signatures also produce `endpoint.health.remediation_candidate` events.
+  Their fingerprints exclude timestamps, report/record IDs, process IDs, and version
+  values so Elastic can determine whether the same problem remains after remediation.
+- Driver repair candidates are marked as requiring at least two detection runs before
+  an orchestration workflow should permit script 05.
 - Required service health.
 - Management and monitoring agent status.
 
@@ -247,11 +255,39 @@ Central maintenance policy consumed by the framework. It defines shared configur
 
 ### `Invoke-MaintenanceScript.ps1`
 
-Standard launcher used by managed scheduled tasks. It provides consistent invocation behavior and launcher-level telemetry around maintenance scripts.
+Allowlisted launcher used by managed scheduled tasks and future n8n remediation. New callers provide a fixed `ActionId`; each action maps locally to one script and a fixed argument list. A guarded transition mode accepts old task parameters only when the supplied path resolves directly under `C:\Scripts` and the script/argument pair exactly matches the allowlist. It then discards that path and reconstructs execution from the internal catalog. Remediation metadata is separately validated, maintenance windows and dependencies are enforced, and execution produces `maintenance.launcher` telemetry.
+
+The currently approved automated remediation action is `MicrosoftEdgeUpdateRepair`. Windows component-store and repeated driver repair can be added only after their execution modes and n8n recurrence gates are approved.
 
 ### `Get-MaintenanceFleetStatus.ps1`
 
 Reads and summarizes the latest maintenance status information published by managed endpoints.
+
+### `Repair-MicrosoftEdgeUpdate.ps1`
+
+Dedicated remediation for the `MicrosoftEdgeUpdateRepair` classification emitted by script 14. It validates Edge Update policy, services, scheduled tasks, the installed updater, and the final servicing state. It can optionally use an administrator-supplied Microsoft Edge Enterprise MSI, but only after copying it locally and verifying a valid Microsoft Authenticode signature. The script does not change Edge browser policies, profiles, favorites, or user data.
+
+The remediation is included in the deployment manifest but intentionally has no recurring scheduled task. It enforces the Sunday maintenance window from `Maintenance.Policy.json`, accepts correlation and finding identifiers for Elastic/n8n, and writes `maintenance.remediation` telemetry plus `Repair-MicrosoftEdgeUpdate.latest.json`.
+
+Example technician test outside the scheduled window:
+
+```powershell
+& 'C:\Scripts\Repair-MicrosoftEdgeUpdate.ps1' `
+    -BypassMaintenanceWindow `
+    -CorrelationId 'manual-pilot-001' `
+    -FindingFingerprint '0000000000000000000000000000000000000000000000000000000000000000' `
+    -InstallerPath '\\SERVER\DeploymentShare\Installers\MicrosoftEdge\MicrosoftEdgeEnterpriseX64.msi'
+```
+
+Allowlisted launcher example during the configured maintenance window:
+
+```powershell
+& 'C:\Scripts\Invoke-MaintenanceScript.ps1' `
+    -ActionId 'MicrosoftEdgeUpdateRepair' `
+    -CorrelationId 'n8n-edge-0001' `
+    -FindingFingerprint '0000000000000000000000000000000000000000000000000000000000000000' `
+    -AttemptNumber 1
+```
 
 ### `DeploymentManifest.json`
 
@@ -364,7 +400,7 @@ The following scripts are retired. Seven standalone scripts were consolidated in
 
 | Retired file | Replacement |
 |---|---|
-| [`04_Update_Edge_Silent.ps1`](./Retired/04_Update_Edge_Silent.ps1) | Microsoft Edge application servicing plus health visibility from script 14 |
+| [`04_Update_Edge_Silent.ps1`](./Retired/04_Update_Edge_Silent.ps1) | [`Repair-MicrosoftEdgeUpdate.ps1`](./Repair-MicrosoftEdgeUpdate.ps1) plus health visibility from script 14 |
 | [`11_Install_SharpDriver_And_PaperCut.ps1`](./Retired/11_Install_SharpDriver_And_PaperCut.ps1) | SHARP printer driver, PaperCut Print Deploy, and shared printer maintenance |
 | [`12_Enable-SystemRestore-And-Create-RestorePoint.ps1`](./Retired/12_Enable-SystemRestore-And-Create-RestorePoint.ps1) | System Restore enablement, verified restore-point creation, and managed retention |
 | [`13_Configure_Autologon_And_Edge.ps1`](./Retired/13_Configure_Autologon_And_Edge.ps1) | Autologon and Edge InPrivate startup configuration |

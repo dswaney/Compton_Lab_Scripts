@@ -1,7 +1,7 @@
 #requires -Version 5.1
 #requires -RunAsAdministrator
 # ScriptName:    Register-Tasks_SYSTEM.ps1
-# ScriptVersion: 4.10.0
+# ScriptVersion: 4.11.0
 # LastUpdated:   2026-09-21
 <#
 .SYNOPSIS
@@ -14,11 +14,13 @@
 
 .NOTES
     ScriptName:    Register-Tasks_SYSTEM.ps1
-    ScriptVersion: 4.10.0
+    ScriptVersion: 4.11.0
     Change: Replaces seven standalone weekly tasks with combined script 04, removes
             tasks that reference retired scripts, and refactors Sunday timing.
     LastUpdated:   2026-09-21
-    Changes:       v4.10.0 runs script 08 with -AllowCopilotRemoval after the
+    Changes:       v4.11.0 registers launcher actions by fixed ActionId and rejects
+                   any script/argument combination outside the launcher allowlist.
+                   v4.10.0 runs script 08 with -AllowCopilotRemoval after the
                    application and Windows Update stages so Copilot packages
                    restored during maintenance are removed before inventory.
                    v4.9.0 replaces the script 16 startup trigger with a Monday
@@ -53,7 +55,7 @@ Set-StrictMode -Version 2.0
 $ErrorActionPreference = 'Stop'
 
 $script:ScriptName       = 'Register-Tasks_SYSTEM.ps1'
-$script:ScriptVersion    = '4.10.0'
+$script:ScriptVersion    = '4.11.0'
 $script:RunId            = [guid]::NewGuid().Guid
 $script:StartTime        = Get-Date
 $script:WarningCount     = 0
@@ -157,6 +159,42 @@ function Normalize-TaskPath {
     return $normalized
 }
 
+function Resolve-LauncherActionId {
+    param(
+        [Parameter(Mandatory)][string]$ScriptPath,
+        [string]$ExtraArguments = ''
+    )
+
+    $scriptName = [IO.Path]::GetFileName($ScriptPath)
+    $normalizedExtra = ($ExtraArguments -replace '\s+', ' ').Trim()
+    $actionId = switch ($scriptName) {
+        '00_Update-Scripts-FromShare.ps1'              { 'UpdateScripts' }
+        '01_Enable_Windows_Update_Services.ps1'        { 'EnableWindowsUpdateServices' }
+        '02_Remove_User_Profiles.ps1'                  { 'RemoveUserProfiles' }
+        '03_Weekend_Apps_Update.ps1'                   { 'WeekendAppsUpdate' }
+        '04_Sunday_Lab_Application_Maintenance.ps1'    { 'SundayLabApplicationMaintenance' }
+        '05_Weekend_HP_Drivers_Update.ps1'             { 'VendorDriverUpdate' }
+        '06_Weekend_Windows_Updates.ps1'               { 'WindowsUpdatePass' }
+        '07_Force_Reboot_Install_Updates.ps1'          { 'ForceRebootInstallUpdates' }
+        '08_System_Repair.ps1'                         { 'SystemRepairWeekly' }
+        '09_Disable_Windows_Update_Services.ps1'       { 'DisableWindowsUpdateServices' }
+        '10_Sync_System_Time.ps1'                      { 'SyncSystemTime' }
+        '14_Endpoint_Health_Inventory.ps1'             { 'EndpointHealthInventory' }
+        default { throw "Script is not present in the launcher allowlist: $scriptName" }
+    }
+
+    if ($scriptName -eq '08_System_Repair.ps1') {
+        if ($normalizedExtra -ne '-AllowCopilotRemoval') {
+            throw "SystemRepairWeekly requires the fixed argument '-AllowCopilotRemoval'. Received: '$normalizedExtra'"
+        }
+    }
+    elseif (-not [string]::IsNullOrWhiteSpace($normalizedExtra)) {
+        throw "Arguments are not permitted for allowlisted action $actionId. Received: '$normalizedExtra'"
+    }
+
+    return $actionId
+}
+
 function Get-DesiredActionArguments {
     param(
         [Parameter(Mandatory)][string]$ScriptPath,
@@ -164,12 +202,8 @@ function Get-DesiredActionArguments {
     )
 
     $launcherPath = Join-Path $ScriptsRoot 'Invoke-MaintenanceScript.ps1'
-    $escapedExtra = $ExtraArguments.Replace('"','\"')
-    $arguments = '-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "{0}" -TargetScript "{1}"' -f $launcherPath,$ScriptPath
-    if (-not [string]::IsNullOrWhiteSpace($escapedExtra)) {
-        $arguments += ' -TargetArguments "' + $escapedExtra + '"'
-    }
-    return $arguments
+    $actionId = Resolve-LauncherActionId -ScriptPath $ScriptPath -ExtraArguments $ExtraArguments
+    return ('-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "{0}" -ActionId "{1}"' -f $launcherPath, $actionId)
 }
 
 function Get-TimeText {

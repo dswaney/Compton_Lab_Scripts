@@ -1,8 +1,9 @@
 #requires -version 5.1
 # =====================================================================
 # ScriptName: 00_Update-Scripts-FromShare.ps1
-# ScriptVersion: 4.8.0
-# LastUpdated: 2026-09-18
+# ScriptVersion: 4.9.0
+# LastUpdated: 2026-09-21
+# Changes: v4.9.0 approves the dedicated Microsoft Edge Update remediation.
 # Changes: v4.8.0 approves the shared Maintenance.Copilot.psm1 module.
 # Changes: v4.7.0 requires, approves, and supplementally deploys script 16 for the Monday Deep Freeze status audit.
 # Changes: v4.6.0 retires script 12 after its System Restore workflow was embedded in script 04 v1.3.0.
@@ -30,7 +31,7 @@ $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 
 $ScriptName = '00_Update-Scripts-FromShare.ps1'
-$ScriptVersion = '4.8.0'
+$ScriptVersion = '4.9.0'
 $PreferredSourceRoot = '\\SERVER\DeploymentShare'
 $FallbackSourceRoot = '\\FALLBACK-SERVER\DeploymentShare'
 $ManifestName = 'DeploymentManifest.json'
@@ -80,6 +81,7 @@ $DeepFreezeStatusScriptName = '16_Check_Deep_Freeze_Status.ps1'
     'Maintenance.Copilot.psm1',
     'Maintenance.Framework.psm1',
     'Maintenance.Policy.json',
+    'Repair-MicrosoftEdgeUpdate.ps1',
     'Register-Tasks_SYSTEM.ps1'
 )
 $LocalRoot = 'C:\Scripts'

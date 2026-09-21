@@ -48,7 +48,7 @@ The scripts are designed primarily for 64-bit Windows PowerShell 5.1 and normall
 | [`05_Weekend_HP_Drivers_Update.ps1`](./05_Weekend_HP_Drivers_Update.ps1) | Performs supported HP and Dell driver and firmware maintenance, with safeguards around sensitive storage-related driver categories. |
 | [`06_Weekend_Windows_Updates.ps1`](./06_Weekend_Windows_Updates.ps1) | Installs Windows Updates in two Sunday passes and records detailed compliance, result, and reboot telemetry. |
 | [`07_Force_Reboot_Install_Updates.ps1`](./07_Force_Reboot_Install_Updates.ps1) | Coordinates as many as three planned reboot/update cycles and resumes verification at startup. |
-| [`08_System_Repair.ps1`](./08_System_Repair.ps1) | Runs Windows image, file-system, disk, service, management-agent, and cleanup diagnostics and repairs; Copilot removal remains an explicit opt-in fallback. |
+| [`08_System_Repair.ps1`](./08_System_Repair.ps1) | Runs Windows image, file-system, disk, service, management-agent, and cleanup diagnostics and repairs; cleans expired maintenance logs, `C:\Temp`, and retired HP BIOS staging; Copilot removal remains an explicit opt-in fallback. |
 | [`09_Disable_Windows_Update_Services.ps1`](./09_Disable_Windows_Update_Services.ps1) | Applies the college's post-maintenance Windows Update service, policy, and scheduled-task state. |
 | [`10_Sync_System_Time.ps1`](./10_Sync_System_Time.ps1) | Synchronizes system time and runs independently every four hours. |
 | [`14_Endpoint_Health_Inventory.ps1`](./14_Endpoint_Health_Inventory.ps1) | Captures the endpoint's final weekly health and compliance inventory after the other Sunday stages finish. |

@@ -1,5 +1,5 @@
 {
-  "PackageVersion": "2.5.1",
+  "PackageVersion": "2.6.1",
   "PowerShellParserExecuted": false,
   "StructuralChecks": [
     "Manifest hashes generated",
@@ -10,7 +10,8 @@
     "System Restore embedded in script 04 and standalone script 12 retired",
     "Public script 04 credential fields blank and credential-dependent sections disabled",
     "Internal server names, private IP addresses, and installer shares replaced with public placeholders",
-    "Expanded Elastic target prefixes retained in script 04 and documented in README"
+    "Expanded Elastic target prefixes retained in script 04 and documented in README",
+    "Script 14 safely handles optional scheduled-task actions, adapter statistics, and single-item baseline collections"
   ],
   "RequiresWindowsPowerShellValidation": true
 }

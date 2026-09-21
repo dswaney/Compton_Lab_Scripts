@@ -34,9 +34,12 @@
 
 .NOTES
     ScriptName:    14_Endpoint_Health_Inventory.ps1
-    ScriptVersion: 1.4.1
-    LastUpdated:   2026-09-16
-    Changes:       v1.4.1 makes the last-Windows-update check resilient when Get-HotFix has no usable
+    ScriptVersion: 1.4.2
+    LastUpdated:   2026-09-21
+    Changes:       v1.4.2 safely reads scheduled-task action and network-adapter statistic properties
+                   that vary by action type, driver, and Windows build. It also preserves driver-baseline
+                   rules as an array when exactly one rule is configured, preventing StrictMode Count errors.
+                   v1.4.1 makes the last-Windows-update check resilient when Get-HotFix has no usable
                    InstalledOn value by falling back to successful Windows Update Agent history and then
                    the Windows Update LastSuccessTime registry value. It also records the selected source
                    and update title for Elastic troubleshooting.
@@ -158,7 +161,7 @@ Set-StrictMode -Version 2.0
 $ErrorActionPreference = 'Stop'
 
 $script:ScriptName       = '14_Endpoint_Health_Inventory.ps1'
-$script:ScriptVersion    = '1.4.1'
+$script:ScriptVersion    = '1.4.2'
 $script:RunId            = [guid]::NewGuid().Guid
 $script:StartTime        = Get-Date
 $script:WarningCount     = 0
@@ -474,6 +477,40 @@ function Get-ObjectPropertyValueSafe {
     if ($null -eq $property) { return $null }
 
     return $property.Value
+}
+
+function Get-FirstObjectPropertyValueSafe {
+    param(
+        $InputObject,
+        [Parameter(Mandatory)][string[]]$Names
+    )
+
+    foreach ($name in $Names) {
+        $value = Get-ObjectPropertyValueSafe -InputObject $InputObject -Name $name
+        if ($null -ne $value) { return $value }
+    }
+
+    return $null
+}
+
+function ConvertTo-ScheduledTaskActionText {
+    param($Action)
+
+    if ($null -eq $Action) { return $null }
+
+    $execute = Get-ObjectPropertyValueSafe -InputObject $Action -Name 'Execute'
+    $arguments = Get-ObjectPropertyValueSafe -InputObject $Action -Name 'Arguments'
+    if (-not [string]::IsNullOrWhiteSpace([string]$execute)) {
+        return (('{0} {1}' -f $execute, $arguments).Trim())
+    }
+
+    $classId = Get-ObjectPropertyValueSafe -InputObject $Action -Name 'ClassId'
+    $data = Get-ObjectPropertyValueSafe -InputObject $Action -Name 'Data'
+    if (-not [string]::IsNullOrWhiteSpace([string]$classId)) {
+        return (('COM handler {0} {1}' -f $classId, $data).Trim())
+    }
+
+    return $Action.GetType().FullName
 }
 
 function Test-PendingReboot {
@@ -2433,7 +2470,7 @@ function Get-MaintenanceScheduledTaskHealth {
     }
     $rows = @()
     $tasks = @(Get-ScheduledTask -ErrorAction SilentlyContinue | Where-Object {
-        $actionText = (@($_.Actions | ForEach-Object { '{0} {1}' -f $_.Execute,$_.Arguments }) -join ' ')
+        $actionText = (@($_.Actions | ForEach-Object { ConvertTo-ScheduledTaskActionText -Action $_ }) -join ' ')
         $_.TaskPath -match '(?i)Compton|Maintenance' -or $_.TaskName -match '(?i)Compton|Maintenance|Endpoint.Health|Lab.Application|Windows.Update|Force.Reboot|Time.Sync|Deep.Freeze' -or $actionText -match '(?i)C:\\Scripts\\'
     })
     foreach ($task in $tasks) {
@@ -2448,7 +2485,7 @@ function Get-MaintenanceScheduledTaskHealth {
             LastTaskResult=$resultCode; LastTaskResultHex=if ($null -ne $resultCode) {'0x{0:X8}' -f $resultCode} else {$null}
             NextRunTime=if ($info -and $info.NextRunTime -and $info.NextRunTime.Year -gt 1999) {$info.NextRunTime.ToUniversalTime().ToString('o')} else {$null}
             MissedRuns=if ($info) {$info.NumberOfMissedRuns} else {$null}; Unhealthy=$unhealthy
-            Actions=New-StringArrayForJson -InputObject @($task.Actions | ForEach-Object {('{0} {1}' -f $_.Execute,$_.Arguments).Trim()})
+            Actions=New-StringArrayForJson -InputObject @($task.Actions | ForEach-Object { ConvertTo-ScheduledTaskActionText -Action $_ })
         }
         $rows += $row
         if ($unhealthy) {
@@ -2476,7 +2513,8 @@ function Get-DriverCurrencyHealth {
         $rows+=$row; if ($isOld) {$oldDrivers+=$row}
     }
     $baselineDriverRules = Get-ObjectPropertyValueSafe -InputObject $Baseline -Name 'Drivers'
-    $rules=if ($baselineDriverRules) {@($baselineDriverRules)} else {@()}; $mismatches=@()
+    [object[]]$rules = @($baselineDriverRules | Where-Object { $null -ne $_ })
+    $mismatches=@()
     foreach ($rule in $rules) {
         $deviceIdRegex = Get-ObjectPropertyValueSafe -InputObject $rule -Name 'DeviceIdRegex'
         $deviceNameRegex = Get-ObjectPropertyValueSafe -InputObject $rule -Name 'DeviceNameRegex'
@@ -2501,8 +2539,14 @@ function Get-NetworkDiagnosticsHealth {
     try {$dnsAddresses=@(Resolve-DnsName -Name $DnsTestName -Type A -DnsOnly -ErrorAction Stop | Where-Object IPAddress | Select-Object -ExpandProperty IPAddress -Unique)} catch {$dnsError=$_.Exception.Message}
     $statistics=@()
     if (Get-Command Get-NetAdapterStatistics -ErrorAction SilentlyContinue) { $statistics=@(Get-NetAdapterStatistics -ErrorAction SilentlyContinue | ForEach-Object {[pscustomobject]@{
-        Name=$_.Name;ReceivedBytes=$_.ReceivedBytes;SentBytes=$_.SentBytes;ReceivedDiscarded=$_.ReceivedDiscarded;OutboundDiscarded=$_.OutboundDiscarded
-        ReceivedPacketErrors=$_.ReceivedPacketErrors;OutboundPacketErrors=$_.OutboundPacketErrors }}) }
+        Name=(Get-ObjectPropertyValueSafe -InputObject $_ -Name 'Name')
+        ReceivedBytes=(Get-ObjectPropertyValueSafe -InputObject $_ -Name 'ReceivedBytes')
+        SentBytes=(Get-ObjectPropertyValueSafe -InputObject $_ -Name 'SentBytes')
+        ReceivedDiscarded=(Get-FirstObjectPropertyValueSafe -InputObject $_ -Names @('ReceivedDiscardedPackets','ReceivedDiscarded'))
+        OutboundDiscarded=(Get-FirstObjectPropertyValueSafe -InputObject $_ -Names @('OutboundDiscardedPackets','OutboundDiscarded'))
+        ReceivedPacketErrors=(Get-ObjectPropertyValueSafe -InputObject $_ -Name 'ReceivedPacketErrors')
+        OutboundPacketErrors=(Get-ObjectPropertyValueSafe -InputObject $_ -Name 'OutboundPacketErrors')
+    }}) }
     $gatewayHealthy=$gatewayResults.Count -gt 0 -and @($gatewayResults | Where-Object Reachable).Count -gt 0; $dnsHealthy=$dnsAddresses.Count -gt 0; $healthy=$gatewayHealthy -and $dnsHealthy
     $result=[pscustomobject]@{DnsTestName=$DnsTestName;DnsResolved=$dnsHealthy;DnsAddresses=New-StringArrayForJson -InputObject $dnsAddresses;DnsError=$dnsError
         GatewayReachable=$gatewayHealthy;Gateways=New-ObjectArrayForJson -InputObject $gatewayResults;AdapterStatistics=New-ObjectArrayForJson -InputObject $statistics}

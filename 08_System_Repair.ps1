@@ -1,8 +1,12 @@
 # =====================================================================
 # ScriptName: 08_System_Repair.ps1
-# ScriptVersion: 4.6.0
-# LastUpdated: 2026-09-18
-# Changes: v4.6.0 uses the shared Maintenance.Copilot module for opt-in Copilot
+# ScriptVersion: 4.6.1
+# LastUpdated: 2026-09-21
+# Changes: v4.6.1 fixes maintenance-log retention so .log files are included and
+#          LastWriteTime is used, prunes expired files already under C:\Logs\Old Logs,
+#          permits guarded removal of C:\HP_Bios_Config, and cleans the contents of
+#          C:\Temp while preserving the C:\Temp directory.
+#          v4.6.0 uses the shared Maintenance.Copilot module for opt-in Copilot
 #          removal and removes an accidentally appended older copy of this script.
 #          v4.5.5 moves Script 08 staging out of C:\Temp so TempCleanup cannot delete the active runtime log.
 #          Uses C:\ProgramData\Compton\Maintenance-Logs\Staging for the active log, then publishes the completed immutable log to C:\Logs.
@@ -60,7 +64,7 @@ param(
 $ErrorActionPreference = 'Stop'
 
 $script:ScriptName = '08_System_Repair.ps1'
-$script:ScriptVersion = '4.6.0'
+$script:ScriptVersion = '4.6.1'
 $script:RunId = [guid]::NewGuid().Guid
 $script:TelemetryNdjsonPath = Join-Path $LogDirectory 'Maintenance-Telemetry.ndjson'
 $script:LatestTelemetryPath = Join-Path $LogDirectory '08_System_Repair.latest.json'
@@ -1017,6 +1021,7 @@ function Test-SafeCleanupPath {
     }
 
     $allowedPatterns = @(
+        'C:\HP_Bios_Config',
         'C:\Windows\Temp*',
         'C:\Windows.old*',
         'C:\Temp*',
@@ -2594,7 +2599,7 @@ function Invoke-TempCleanup {
     # Remove HP SoftPaq/HPIA extraction staging after maintenance.
     [void]$cleanupTargets.Add([PSCustomObject]@{ Path = 'C:\SWSetup'; Description = 'HP Software Setup'; ContentsOnly = $false })
     [void]$cleanupTargets.Add([PSCustomObject]@{ Path = 'C:\HP_Bios_Config'; Description = 'HP BIOS Config Staging'; ContentsOnly = $false })
-    [void]$cleanupTargets.Add([PSCustomObject]@{ Path = 'C:\Temp'; Description = 'System Temp'; ContentsOnly = $false })
+    [void]$cleanupTargets.Add([PSCustomObject]@{ Path = 'C:\Temp'; Description = 'System Temp Contents'; ContentsOnly = $true })
     [void]$cleanupTargets.Add([PSCustomObject]@{ Path = 'C:\Windows\Temp'; Description = 'Windows Temp'; ContentsOnly = $true })
     [void]$cleanupTargets.Add([PSCustomObject]@{ Path = $env:TEMP; Description = 'User Temp'; ContentsOnly = $true })
     [void]$cleanupTargets.Add([PSCustomObject]@{ Path = "$env:LOCALAPPDATA\Temp"; Description = 'Local Temp'; ContentsOnly = $true })
@@ -4917,7 +4922,7 @@ function Invoke-LogArchiveRetention {
     Write-Log "Previous Sunday: $previousSunday" 'INFO'
     Write-Log "Two Sundays Ago: $twoSundaysAgo" 'INFO'
 
-    $extensions = @('.yaml', '.yml', '.txt')
+    $extensions = @('.log', '.yaml', '.yml', '.txt')
 
     $allLooseLogs = Get-ChildItem -LiteralPath $LogDirectory -File -Force -ErrorAction SilentlyContinue |
         Where-Object {
@@ -4926,8 +4931,8 @@ function Invoke-LogArchiveRetention {
         }
 
     $logsToArchive = $allLooseLogs | Where-Object {
-        $_.CreationTime -ge $previousSunday -and $_.CreationTime -lt $thisSunday
-    } | Sort-Object CreationTime, Name
+        $_.LastWriteTime -ge $previousSunday -and $_.LastWriteTime -lt $thisSunday
+    } | Sort-Object LastWriteTime, Name
 
     $archiveDateText = $previousSunday.ToString('yyyy-MM-dd')
     $zipPath = Join-Path $LogDirectory ("{0}-logs-{1}.zip" -f $ComputerName, $archiveDateText)
@@ -4942,6 +4947,7 @@ function Invoke-LogArchiveRetention {
         ArchivePath                = $null
         DeletedOriginalFiles       = @()
         DeletedOldLooseLogs        = @()
+        DeletedExpiredOldLogs      = @()
         DeletedExpiredZipFiles     = @()
         Errors                     = @()
     }
@@ -5012,7 +5018,7 @@ function Invoke-LogArchiveRetention {
         }
 
     $oldLooseLogsToDelete = $remainingLooseLogs | Where-Object {
-        $_.CreationTime -lt $twoSundaysAgo
+        $_.LastWriteTime -lt $twoSundaysAgo
     }
 
     foreach ($file in $oldLooseLogsToDelete) {
@@ -5028,10 +5034,33 @@ function Invoke-LogArchiveRetention {
         }
     }
 
+    $oldLogsDirectory = Join-Path $LogDirectory 'Old Logs'
+    $expiredOldLogs = @()
+    if (Test-Path -LiteralPath $oldLogsDirectory -PathType Container) {
+        $expiredOldLogs = @(Get-ChildItem -LiteralPath $oldLogsDirectory -File -Force -ErrorAction SilentlyContinue |
+            Where-Object {
+                $extensions -contains $_.Extension.ToLowerInvariant() -and
+                $_.LastWriteTime -lt $twoSundaysAgo
+            })
+    }
+
+    foreach ($file in $expiredOldLogs) {
+        try {
+            Remove-Item -LiteralPath $file.FullName -Force -ErrorAction Stop
+            $archiveSummary.DeletedExpiredOldLogs += $file.FullName
+            Write-Log "Deleted expired archived log from Old Logs: $($file.FullName)" 'OK'
+        }
+        catch {
+            $msg = "Failed to delete expired archived log $($file.FullName): $($_.Exception.Message)"
+            $archiveSummary.Errors += $msg
+            Write-Log $msg 'WARN'
+        }
+    }
+
     $zipFilesToDelete = Get-ChildItem -LiteralPath $LogDirectory -File -Filter '*.zip' -Force -ErrorAction SilentlyContinue |
         Where-Object {
             $_.Name -like "$ComputerName-logs-*.zip" -and
-            $_.CreationTime -lt $twoSundaysAgo
+            $_.LastWriteTime -lt $twoSundaysAgo
         }
 
     foreach ($zipFile in $zipFilesToDelete) {
@@ -5057,10 +5086,12 @@ function Invoke-LogArchiveRetention {
         ArchivePath                 = $archiveSummary.ArchivePath
         DeletedOriginalFilesCount   = @($archiveSummary.DeletedOriginalFiles).Count
         DeletedOldLooseLogsCount    = @($archiveSummary.DeletedOldLooseLogs).Count
+        DeletedExpiredOldLogsCount  = @($archiveSummary.DeletedExpiredOldLogs).Count
         DeletedExpiredZipFilesCount = @($archiveSummary.DeletedExpiredZipFiles).Count
         ErrorsCount                 = @($archiveSummary.Errors).Count
         DeletedOriginalFiles        = ($archiveSummary.DeletedOriginalFiles -join '; ')
         DeletedOldLooseLogs         = ($archiveSummary.DeletedOldLooseLogs -join '; ')
+        DeletedExpiredOldLogs       = ($archiveSummary.DeletedExpiredOldLogs -join '; ')
         DeletedExpiredZipFiles      = ($archiveSummary.DeletedExpiredZipFiles -join '; ')
         Errors                      = ($archiveSummary.Errors -join '; ')
     }

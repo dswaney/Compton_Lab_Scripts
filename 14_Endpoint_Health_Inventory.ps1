@@ -34,9 +34,12 @@
 
 .NOTES
     ScriptName:    14_Endpoint_Health_Inventory.ps1
-    ScriptVersion: 1.6.0
+    ScriptVersion: 1.6.1
     LastUpdated:   2026-09-21
-    Changes:       v1.6.0 adds deterministic SHA-256 fingerprints to health findings and
+    Changes:       v1.6.1 treats CapabilityAccessManager WAL access-denied results as
+                   informational inspection limitations instead of health warnings, and emits
+                   repeated-detection USB driver remediation candidates for Device Manager Code 43.
+                   v1.6.0 adds deterministic SHA-256 fingerprints to health findings and
                    remediation candidates, and emits one structured remediation-candidate
                    event per stable Windows failure signature for controlled n8n workflows.
                    v1.5.0 classifies Windows Error Reporting event 1001 by EventName, counts only
@@ -168,7 +171,7 @@ Set-StrictMode -Version 2.0
 $ErrorActionPreference = 'Stop'
 
 $script:ScriptName       = '14_Endpoint_Health_Inventory.ps1'
-$script:ScriptVersion    = '1.6.0'
+$script:ScriptVersion    = '1.6.1'
 $script:RunId            = [guid]::NewGuid().Guid
 $script:StartTime        = Get-Date
 $script:WarningCount     = 0
@@ -1222,6 +1225,7 @@ function Get-CapabilityAccessManagerHealth {
         WarningThresholdGB   = $CapabilityAccessManagerWarningGB
         CriticalThresholdGB  = $CapabilityAccessManagerCriticalGB
         Status               = 'Healthy'
+        InspectionStatus     = 'NotPresent'
         Error                = $null
     }
 
@@ -1231,12 +1235,13 @@ function Get-CapabilityAccessManagerHealth {
             $result.SystemDriveSizeGB = [math]::Round([double]$systemDisk.Size / 1GB, 2)
         }
 
-        if (Test-Path -LiteralPath $camWalPath -PathType Leaf) {
+        if (Test-Path -LiteralPath $camWalPath -PathType Leaf -ErrorAction Stop) {
             $file = Get-Item -LiteralPath $camWalPath -Force -ErrorAction Stop
             $sizeBytes = [double]$file.Length
             $sizeGB = $sizeBytes / 1GB
 
             $result.Exists        = $true
+            $result.InspectionStatus = 'Inspected'
             $result.SizeBytes     = [int64]$file.Length
             $result.SizeMB        = [math]::Round($sizeBytes / 1MB, 2)
             $result.SizeGB        = [math]::Round($sizeGB, 3)
@@ -1266,12 +1271,31 @@ function Get-CapabilityAccessManagerHealth {
         Write-Log -Level 'INFO' -Message ("CAM WAL check: status={0}; exists={1}; sizeGB={2}; percentOfSystemDrive={3}; path={4}" -f `
             $result.Status, $result.Exists, $result.SizeGB, $result.PercentOfSystemDrive, $camWalPath)
     } catch {
-        $result.Status = 'Warning'
         $result.Error = $_.Exception.Message
-        Add-Finding -Severity 'Warning' -Category 'Storage' `
-            -Check 'CapabilityAccessManagerDbWal' `
-            -Message ("CapabilityAccessManager.db-wal could not be inspected: {0}" -f $_.Exception.Message)
-        Write-Log -Level 'WARN' -Message ("CAM WAL check failed: {0}" -f $_.Exception.Message)
+        $isAccessDenied = ($_.Exception -is [System.UnauthorizedAccessException]) -or
+            ($_.Exception.Message -match '(?i)access (?:is )?denied|unauthorized')
+
+        if ($isAccessDenied) {
+            # The WAL can be protected or exclusively held by Capability Access Manager.
+            # Lack of metadata access does not establish that it is oversized or unhealthy.
+            $result.Status = 'Unknown'
+            $result.InspectionStatus = 'AccessDenied'
+            Add-Finding -Severity 'Info' -Category 'Storage' `
+                -Check 'CapabilityAccessManagerDbWalInspection' `
+                -Message 'CapabilityAccessManager.db-wal metadata access was denied; size health is unknown and no storage warning was raised.' `
+                -Value 'AccessDenied' -Details ([pscustomobject]$result) `
+                -FingerprintComponents @('AccessDenied')
+            Write-Log -Level 'INFO' -Message ("CAM WAL metadata access denied; recorded as informational. Path={0}; Error={1}" -f $camWalPath, $_.Exception.Message)
+        }
+        else {
+            $result.Status = 'Warning'
+            $result.InspectionStatus = 'Failed'
+            Add-Finding -Severity 'Warning' -Category 'Storage' `
+                -Check 'CapabilityAccessManagerDbWal' `
+                -Message ("CapabilityAccessManager.db-wal could not be inspected: {0}" -f $_.Exception.Message) `
+                -Details ([pscustomobject]$result)
+            Write-Log -Level 'WARN' -Message ("CAM WAL check failed: {0}" -f $_.Exception.Message)
+        }
     }
 
     [pscustomobject]$result
@@ -1330,6 +1354,7 @@ function Get-DeviceProblemDescription {
 function Get-DeviceManagerHealth {
     $devices = @()
     $informationalDegraded = @()
+    $remediationCandidates = @()
 
     # CIM supplies manufacturer, service, hardware IDs, and configuration status.
     # Win32_PnPSignedDriver supplies the installed driver package metadata.
@@ -1450,6 +1475,43 @@ function Get-DeviceManagerHealth {
             Add-Finding -Severity 'Warning' -Category 'Hardware' -Check 'DeviceManagerProblem' `
                 -Message $message -Value $deviceName -Details $problemDevice `
                 -FingerprintComponents @($problemDevice.InstanceId, $problemDevice.ProblemCode)
+
+            if ([int]$problemDevice.ProblemCode -eq 43 -and [string]$problemDevice.Class -match '(?i)^USB$') {
+                $observedUtc = (Get-Date).ToUniversalTime().ToString('o')
+                $remediationClass = 'UsbDriverRepairCandidate'
+                $remediationFingerprint = New-StableFingerprint -Namespace 'endpoint.health.remediation' -Components @(
+                    $remediationClass,
+                    'DeviceManagerProblem',
+                    [string]$problemDevice.InstanceId,
+                    [int]$problemDevice.ProblemCode
+                )
+
+                $evidence = [pscustomobject][ordered]@{
+                    Check                   = 'DeviceManagerProblem'
+                    Device                  = $problemDevice
+                    RecommendedRepairScript = '05_Weekend_HP_Drivers_Update.ps1'
+                    RecommendedActionId     = 'VendorDriverUpdate'
+                    RecommendedFirstSteps   = [object[]]@(
+                        'Run the approved vendor driver and firmware maintenance workflow after repeated detection.',
+                        'Reboot and rerun script 14 to verify whether the same fingerprint remains.',
+                        'If it persists, physically inspect or disconnect the USB device and test the port; usb.inf is a Microsoft inbox driver.'
+                    )
+                }
+
+                $remediationCandidates += [pscustomobject][ordered]@{
+                    Fingerprint          = $remediationFingerprint
+                    FingerprintVersion   = '1'
+                    FingerprintAlgorithm = 'SHA256'
+                    RemediationClass     = $remediationClass
+                    RemediationEligible  = $true
+                    RemediationReason    = 'A present USB device reports Device Manager Code 43; run vendor driver maintenance only after recurrence is confirmed.'
+                    OccurrenceCount      = 1
+                    DistinctReportCount  = 0
+                    FirstSeen            = $observedUtc
+                    LastSeen             = $observedUtc
+                    Evidence             = $evidence
+                }
+            }
         }
     }
     else {
@@ -1468,6 +1530,8 @@ function Get-DeviceManagerHealth {
         Problems                     = New-ObjectArrayForJson -InputObject $devices
         DegradedNonActionableCount   = $informationalDegraded.Count
         DegradedNonActionableDevices = New-ObjectArrayForJson -InputObject $informationalDegraded
+        RemediationCandidateCount    = $remediationCandidates.Count
+        RemediationCandidates        = New-ObjectArrayForJson -InputObject $remediationCandidates
     }
 }
 
@@ -3150,6 +3214,11 @@ $exitCode = if ($failedCollectors -gt 0) {
     0
 }
 
+$remediationCandidates = @(
+    $(if ($eventLogs) { @($eventLogs.RemediationCandidates) } else { @() })
+    $(if ($deviceManager) { @($deviceManager.RemediationCandidates) } else { @() })
+)
+
 $event = [ordered]@{
     '@timestamp' = $endTime.ToUniversalTime().ToString('o')
     EventType    = 'endpoint.health'
@@ -3181,6 +3250,7 @@ $event = [ordered]@{
         SystemDriveFreeGB = if ($systemVolume) { $systemVolume.FreeGB } else { $null }
         CapabilityAccessManagerWalSizeGB = if ($camWal) { $camWal.SizeGB } else { $null }
         CapabilityAccessManagerWalStatus = if ($camWal) { $camWal.Status } else { $null }
+        CapabilityAccessManagerWalInspectionStatus = if ($camWal) { $camWal.InspectionStatus } else { $null }
         DeviceManagerProblemCount = if ($deviceManager) { $deviceManager.ProblemCount } else { $null }
         DeviceManagerDegradedNonActionableCount = if ($deviceManager) { $deviceManager.DegradedNonActionableCount } else { $null }
         BatteryPresent = if ($battery) { $battery.Present } else { $null }
@@ -3199,7 +3269,7 @@ $event = [ordered]@{
         ApplicationCrashCount = if ($eventLogs) { $eventLogs.ApplicationCrashCount } else { $null }
         WindowsServicingFailureCount = if ($eventLogs) { $eventLogs.WindowsServicingFailureCount } else { $null }
         OtherWerReportCount = if ($eventLogs) { $eventLogs.OtherWerReportCount } else { $null }
-        RemediationCandidateCount = if ($eventLogs) { $eventLogs.RemediationCandidateCount } else { $null }
+        RemediationCandidateCount = $remediationCandidates.Count
         UnhealthyCriticalServiceCount = if ($services) { $services.UnhealthyCount } else { $null }
         DisabledFirewallProfileCount = if ($firewall) { $firewall.DisabledProfileCount } else { $null }
         DefenderRecentThreatDetectionCount = if ($defender -and $defender.Available) { $defender.RecentThreatDetectionCount } else { $null }
@@ -3266,7 +3336,7 @@ try {
         $(if ($firewall) { $firewall.DisabledProfileCount } else { $null }),
         $failedCollectors,
         @($summary.Findings | Where-Object { $_.Severity -in @('Warning','Critical') }).Count,
-        $(if ($eventLogs) { $eventLogs.RemediationCandidateCount } else { 0 }))
+        $remediationCandidates.Count)
 
     Write-Telemetry -Event $event
 
@@ -3277,7 +3347,6 @@ try {
             -EventTime $endTime -Identity $identity -Summary $summary
     }
 
-    $remediationCandidates = if ($eventLogs) { @($eventLogs.RemediationCandidates) } else { @() }
     for ($candidateIndex = 0; $candidateIndex -lt $remediationCandidates.Count; $candidateIndex++) {
         Write-RemediationCandidateTelemetry -Candidate $remediationCandidates[$candidateIndex] `
             -CandidateNumber ($candidateIndex + 1) -CandidateCount $remediationCandidates.Count `

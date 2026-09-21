@@ -1,8 +1,8 @@
 {
     "SchemaVersion":  1,
-    "ManifestVersion":  "2.9.0",
-    "PackageVersion":  "2.9.0",
-    "GeneratedUtc":  "2026-09-21T16:25:00Z",
+    "ManifestVersion":  "2.9.1",
+    "PackageVersion":  "2.9.1",
+    "GeneratedUtc":  "2026-09-21T17:43:48Z",
     "Files":  [
                   {
                       "Name":  "00_Update-Scripts-FromShare.ps1",
@@ -73,8 +73,8 @@
                   {
                       "Name":  "14_Endpoint_Health_Inventory.ps1",
                       "Role":  "ManagedFile",
-                      "Version":  "1.6.0",
-                      "SHA256":  "167D75B786B12F2FA71C32A282ADA08DE81CCF77E4725F02F5482EB49573DC48"
+                      "Version":  "1.6.1",
+                      "SHA256":  "93E2243C13DE1B6FE3088C00930414FD7B51F617E633929980DAF32F94060807"
                   },
                   {
                       "Name":  "16_Check_Deep_Freeze_Status.ps1",

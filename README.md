@@ -207,7 +207,10 @@ Collected areas include:
 - CPU, memory, disk utilization, and disk health.
 - Windows edition, version, build, uptime, and last boot.
 - Pending-reboot state.
-- Device Manager problems.
+- Device Manager problems. Present USB devices reporting Code 43 emit a stable
+  `UsbDriverRepairCandidate`; orchestration must observe the same fingerprint in at
+  least two script-14 runs before permitting script 05. Persistent failures after
+  driver maintenance and a reboot are flagged for physical device/port inspection.
 - Microsoft Defender and Windows Firewall status.
 - BitLocker, TPM, and Secure Boot state.
 - Network adapters, IP addressing, gateways, and DNS configuration.
@@ -224,6 +227,9 @@ Collected areas include:
   values so Elastic can determine whether the same problem remains after remediation.
 - Driver repair candidates are marked as requiring at least two detection runs before
   an orchestration workflow should permit script 05.
+- An access-denied result while reading `CapabilityAccessManager.db-wal` metadata is
+  retained as an informational `AccessDenied` inspection state. It does not create a
+  storage-health warning because the protected/active WAL could not be measured.
 - Required service health.
 - Management and monitoring agent status.
 

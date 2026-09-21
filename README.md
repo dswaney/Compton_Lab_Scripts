@@ -203,7 +203,11 @@ Collected areas include:
 - BitLocker, TPM, and Secure Boot state.
 - Network adapters, IP addressing, gateways, and DNS configuration.
 - Recent update state.
-- Critical system and crash events.
+- Critical system and crash events. Windows Error Reporting records are classified by
+  report type and deduplicated by `ReportId`, so servicing, Edge Update, and policy-expected
+  Copilot reports are not mislabeled as application crashes.
+- Windows component-store failures are reported separately with structured remediation
+  classifications that can support a future controlled Elastic/n8n repair workflow.
 - Required service health.
 - Management and monitoring agent status.
 

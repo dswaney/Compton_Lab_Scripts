@@ -34,9 +34,13 @@
 
 .NOTES
     ScriptName:    14_Endpoint_Health_Inventory.ps1
-    ScriptVersion: 1.4.2
+    ScriptVersion: 1.5.0
     LastUpdated:   2026-09-21
-    Changes:       v1.4.2 safely reads scheduled-task action and network-adapter statistic properties
+    Changes:       v1.5.0 classifies Windows Error Reporting event 1001 by EventName, counts only
+                   genuine application-failure types as application crashes, deduplicates repeated WER
+                   records by ReportId, and reports Windows component-store failures separately. It also
+                   adds structured remediation classifications for future Elastic/n8n orchestration.
+                   v1.4.2 safely reads scheduled-task action and network-adapter statistic properties
                    that vary by action type, driver, and Windows build. It also preserves driver-baseline
                    rules as an array when exactly one rule is configured, preventing StrictMode Count errors.
                    v1.4.1 makes the last-Windows-update check resilient when Get-HotFix has no usable
@@ -161,7 +165,7 @@ Set-StrictMode -Version 2.0
 $ErrorActionPreference = 'Stop'
 
 $script:ScriptName       = '14_Endpoint_Health_Inventory.ps1'
-$script:ScriptVersion    = '1.4.2'
+$script:ScriptVersion    = '1.5.0'
 $script:RunId            = [guid]::NewGuid().Guid
 $script:StartTime        = Get-Date
 $script:WarningCount     = 0
@@ -1872,6 +1876,10 @@ function ConvertTo-ApplicationCrashRecord {
     $processId          = & $getData @('ProcessId','ProcessID')
     $reportId           = & $getData @('ReportId','ReportID')
     $hangType           = & $getData @('HangType')
+    $werEventName       = & $getData @('EventName')
+    $werResponse        = & $getData @('Response')
+    $werBucket          = & $getData @('Bucket')
+    $werBucketType      = & $getData @('BucketType')
 
     if (-not $applicationName -and $message -match '(?i)Faulting application name:\s*([^,]+)') {
         $applicationName = $matches[1].Trim()
@@ -1914,8 +1922,56 @@ function ConvertTo-ApplicationCrashRecord {
         default { 'ApplicationFailure' }
     }
 
+    $remediationClass = 'None'
+    $remediationEligible = $false
+    $remediationReason = $null
+
+    if ([int]$Event.Id -eq 1001) {
+        if ([string]$werEventName -match '^WindowsWcp') {
+            $remediationClass = 'WindowsComponentStoreRepair'
+            $remediationEligible = $true
+            $remediationReason = 'Windows servicing or component-store failure detected.'
+        }
+        elseif ([string]$applicationName -match '(?i)MicrosoftEdgeUpdate\.exe' -and
+                [string]$eventData['P3'] -match '(?i)^OnLogonLaunchError\|') {
+            $remediationClass = 'MicrosoftEdgeUpdateRepair'
+            $remediationEligible = $true
+            $remediationReason = 'Microsoft Edge Update failed to launch a configured target.'
+        }
+        elseif ([string]$applicationName -match '(?i)MicrosoftEdgeUpdate\.exe' -and
+                [string]$eventData['P3'] -match '(?i)^InstallError\|copilot$') {
+            $remediationClass = 'PolicyExpectedNoAction'
+            $remediationReason = 'Copilot installation failure is expected when Copilot is intentionally blocked.'
+        }
+        elseif ([string]$werEventName -match '^(?i:APPCRASH|AppHang.*|MoAppCrash|MoBEX|BEX(?:64)?|CLR20r3)$') {
+            if ([string]$applicationName -match '(?i)AMD|Radeon') {
+                $remediationClass = 'GraphicsDriverRepairCandidate'
+                $remediationReason = 'Graphics application failure detected; validate recurrence before reinstalling a driver.'
+            }
+            else {
+                $remediationClass = 'ApplicationRepairCandidate'
+                $remediationReason = 'Application failure detected; validate recurrence before automated repair.'
+            }
+        }
+    }
+    elseif ([int]$Event.Id -in 1000,1002) {
+        $remediationClass = 'ApplicationRepairCandidate'
+        $remediationReason = 'Application crash or hang detected; validate recurrence before automated repair.'
+    }
+
+    $problemSignature = [ordered]@{}
+    foreach ($signatureName in 'P1','P2','P3','P4','P5','P6','P7','P8','P9','P10') {
+        $problemSignature[$signatureName] = if ($eventData.ContainsKey($signatureName)) {
+            [string]$eventData[$signatureName]
+        }
+        else {
+            $null
+        }
+    }
+
     [pscustomobject]@{
         TimeCreated       = $Event.TimeCreated.ToUniversalTime().ToString('o')
+        RecordId          = [long]$Event.RecordId
         Id                = [int]$Event.Id
         Provider          = [string]$Event.ProviderName
         Level             = [string]$Event.LevelDisplayName
@@ -1931,14 +1987,73 @@ function ConvertTo-ApplicationCrashRecord {
         ProcessId         = $processId
         ReportId          = $reportId
         HangType          = $hangType
+        WerEventName      = $werEventName
+        WerResponse       = $werResponse
+        WerBucket         = $werBucket
+        WerBucketType     = $werBucketType
+        ProblemSignature  = [pscustomobject]$problemSignature
+        RemediationClass  = $remediationClass
+        RemediationEligible = $remediationEligible
+        RemediationReason = $remediationReason
         Message           = $message
     }
+}
+
+function Test-ApplicationWerRecord {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]$Record
+    )
+
+    return [bool]([string]$Record.WerEventName -match
+        '^(?i:APPCRASH|AppHang.*|MoAppCrash|MoBEX|BEX(?:64)?|CLR20r3)$')
+}
+
+function Get-UniqueWerRecords {
+    [CmdletBinding()]
+    param(
+        [AllowEmptyCollection()]
+        [object[]]$Records = @()
+    )
+
+    $groups = @($Records | Group-Object {
+        if (-not [string]::IsNullOrWhiteSpace([string]$_.ReportId)) {
+            'ReportId:{0}' -f ([string]$_.ReportId).ToLowerInvariant()
+        }
+        else {
+            'RecordId:{0}' -f $_.RecordId
+        }
+    })
+
+    $uniqueRecords = New-Object System.Collections.Generic.List[object]
+    foreach ($group in $groups) {
+        $groupRecords = @($group.Group | Sort-Object TimeCreated -Descending)
+        if ($groupRecords.Count -eq 0) {
+            continue
+        }
+
+        $representative = $groupRecords[0]
+        $recordIds = @($groupRecords |
+            ForEach-Object { $_.RecordId } |
+            Where-Object { $null -ne $_ } |
+            Sort-Object -Unique)
+
+        $representative | Add-Member -NotePropertyName RawEventCount -NotePropertyValue $groupRecords.Count -Force
+        $representative | Add-Member -NotePropertyName RawRecordIds -NotePropertyValue ([object[]]$recordIds) -Force
+        $uniqueRecords.Add($representative)
+    }
+
+    return [object[]]@($uniqueRecords.ToArray() | Sort-Object TimeCreated -Descending)
 }
 
 function Get-EventLogHealth {
     $start = (Get-Date).AddHours(-$EventLookbackHours)
 
     $applicationCrashes = @()
+    $applicationWerRecords = @()
+    $windowsServicingFailures = @()
+    $otherWerReports = @()
+    $rawWerEventCount = 0
     try {
         $candidateEvents = @(Get-WinEvent -FilterHashtable @{
             LogName   = 'Application'
@@ -1946,17 +2061,38 @@ function Get-EventLogHealth {
             Id        = 1000,1001,1002
         } -ErrorAction Stop)
 
-        # Event IDs 1000/1001/1002 are reused by other providers. Only count the
-        # standard Windows application-failure providers to avoid false positives.
-        $applicationCrashes = @($candidateEvents |
+        # Event IDs 1000/1001/1002 are reused by other providers. Convert only the
+        # standard providers, then classify WER/1001 by EventName. WER creates
+        # multiple lifecycle records for one ReportId, so retain one representative.
+        $convertedEvents = @($candidateEvents |
             Where-Object {
                 ($_.Id -eq 1000 -and $_.ProviderName -eq 'Application Error') -or
                 ($_.Id -eq 1002 -and $_.ProviderName -eq 'Application Hang') -or
                 ($_.Id -eq 1001 -and $_.ProviderName -eq 'Windows Error Reporting')
             } |
             Sort-Object TimeCreated -Descending |
-            Select-Object -First 100 |
+            Select-Object -First 300 |
             ForEach-Object { ConvertTo-ApplicationCrashRecord -Event $_ })
+
+        $nonWerApplicationEvents = @($convertedEvents | Where-Object { $_.Id -in 1000,1002 })
+        $werRecords = @($convertedEvents | Where-Object { $_.Id -eq 1001 })
+        $rawWerEventCount = $werRecords.Count
+
+        $applicationWerRecords = @(Get-UniqueWerRecords -Records @(
+            $werRecords | Where-Object { Test-ApplicationWerRecord -Record $_ }
+        ))
+        $windowsServicingFailures = @(Get-UniqueWerRecords -Records @(
+            $werRecords | Where-Object { [string]$_.WerEventName -match '^WindowsWcp' }
+        ))
+        $otherWerReports = @(Get-UniqueWerRecords -Records @(
+            $werRecords | Where-Object {
+                -not (Test-ApplicationWerRecord -Record $_) -and
+                [string]$_.WerEventName -notmatch '^WindowsWcp'
+            }
+        ))
+
+        $applicationCrashes = @($nonWerApplicationEvents + $applicationWerRecords |
+            Sort-Object TimeCreated -Descending)
     }
     catch {
         if ($_.Exception.Message -notmatch 'No events were found') {
@@ -2069,13 +2205,37 @@ function Get-EventLogHealth {
         }
 
         Add-Finding -Severity 'Warning' -Category 'EventLogs' -Check 'ApplicationCrashes' `
-            -Message (("{0} application crash/hang/WER event(s) in the last {1} hours.{2}" -f
+            -Message (("{0} unique genuine application crash/hang event(s) in the last {1} hours.{2}" -f
                 $applicationCrashes.Count, $EventLookbackHours, $detailText).Trim()) `
             -Value $applicationCrashes.Count
     }
     else {
         Add-Finding -Severity 'Healthy' -Category 'EventLogs' -Check 'ApplicationCrashes' `
-            -Message ("No application crash/hang/WER events in the last {0} hours." -f $EventLookbackHours)
+            -Message ("No genuine application crash/hang events in the last {0} hours." -f $EventLookbackHours)
+    }
+
+    if ($windowsServicingFailures.Count -gt 0) {
+        $primaryServicingFailure = $windowsServicingFailures[0]
+        Add-Finding -Severity 'Warning' -Category 'EventLogs' -Check 'WindowsServicingFailures' `
+            -Message ("{0} unique Windows servicing/component-store failure report(s) in the last {1} hours. Latest type: {2}; last: {3}." -f
+                $windowsServicingFailures.Count,
+                $EventLookbackHours,
+                $primaryServicingFailure.WerEventName,
+                $primaryServicingFailure.TimeCreated) `
+            -Value $windowsServicingFailures.Count `
+            -Details $windowsServicingFailures
+    }
+    else {
+        Add-Finding -Severity 'Healthy' -Category 'EventLogs' -Check 'WindowsServicingFailures' `
+            -Message ("No Windows servicing/component-store failure reports in the last {0} hours." -f $EventLookbackHours)
+    }
+
+    if ($otherWerReports.Count -gt 0) {
+        Add-Finding -Severity 'Info' -Category 'EventLogs' -Check 'OtherWerReports' `
+            -Message ("{0} unique non-application WER report(s) were retained for investigation but do not affect health." -f
+                $otherWerReports.Count) `
+            -Value $otherWerReports.Count `
+            -Details $otherWerReports
     }
 
     [pscustomobject]@{
@@ -2084,7 +2244,13 @@ function Get-EventLogHealth {
         ApplicationCrashes           = New-ObjectArrayForJson -InputObject $applicationCrashes
         ApplicationCrashSummary      = New-ObjectArrayForJson -InputObject $applicationCrashSummary
         PrimaryApplicationCrash      = $primaryApplicationCrash
-        ApplicationCrashProviderRule = '1000=Application Error; 1002=Application Hang; 1001=Windows Error Reporting'
+        ApplicationCrashProviderRule = '1000=Application Error; 1002=Application Hang; 1001=approved application WER EventName only; WER deduplicated by ReportId'
+        RawWerEventCount              = $rawWerEventCount
+        UniqueWerReportCount          = @($applicationWerRecords).Count + $windowsServicingFailures.Count + $otherWerReports.Count
+        WindowsServicingFailureCount  = $windowsServicingFailures.Count
+        WindowsServicingFailures      = New-ObjectArrayForJson -InputObject $windowsServicingFailures
+        OtherWerReportCount           = $otherWerReports.Count
+        OtherWerReports               = New-ObjectArrayForJson -InputObject $otherWerReports
         CriticalEventCount           = $criticalEvents.Count
         CriticalEvents               = New-ObjectArrayForJson -InputObject $criticalEvents
     }
@@ -2653,11 +2819,12 @@ function Write-HealthSnapshotSummary {
         }
     }
 
-    Write-Log -Message ("Operational counts: DeviceProblems={0}; DisabledFirewallProfiles={1}; CriticalEvents={2}; ApplicationCrashes={3}; UnhealthyServices={4}; ManagementAgents={5}; EdgeHealth={6}; EdgeVersion={7}." -f `
+    Write-Log -Message ("Operational counts: DeviceProblems={0}; DisabledFirewallProfiles={1}; CriticalEvents={2}; ApplicationCrashes={3}; WindowsServicingFailures={4}; UnhealthyServices={5}; ManagementAgents={6}; EdgeHealth={7}; EdgeVersion={8}." -f `
         $(if ($DeviceManager) { $DeviceManager.ProblemCount } else { $null }), `
         $(if ($Firewall) { $Firewall.DisabledProfileCount } else { $null }), `
         $(if ($EventLogs) { $EventLogs.CriticalEventCount } else { $null }), `
         $(if ($EventLogs) { $EventLogs.ApplicationCrashCount } else { $null }), `
+        $(if ($EventLogs) { $EventLogs.WindowsServicingFailureCount } else { $null }), `
         $(if ($Services) { $Services.UnhealthyCount } else { $null }), `
         $(if ($Agents) { $Agents.DetectedCount } else { $null }), `
         $(if ($Edge) { $Edge.Health } else { $null }), `
@@ -2878,6 +3045,8 @@ $event = [ordered]@{
         UnexpectedShutdownEventCount = if ($crashDiagnostics) { $crashDiagnostics.EventCount } else { $null }
         CriticalEventCount = if ($eventLogs) { $eventLogs.CriticalEventCount } else { $null }
         ApplicationCrashCount = if ($eventLogs) { $eventLogs.ApplicationCrashCount } else { $null }
+        WindowsServicingFailureCount = if ($eventLogs) { $eventLogs.WindowsServicingFailureCount } else { $null }
+        OtherWerReportCount = if ($eventLogs) { $eventLogs.OtherWerReportCount } else { $null }
         UnhealthyCriticalServiceCount = if ($services) { $services.UnhealthyCount } else { $null }
         DisabledFirewallProfileCount = if ($firewall) { $firewall.DisabledProfileCount } else { $null }
         DefenderRecentThreatDetectionCount = if ($defender -and $defender.Available) { $defender.RecentThreatDetectionCount } else { $null }

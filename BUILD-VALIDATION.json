@@ -1,5 +1,5 @@
 {
-  "PackageVersion": "2.6.2",
+  "PackageVersion": "2.6.3",
   "PowerShellParserExecuted": false,
   "StructuralChecks": [
     "Manifest hashes generated",
@@ -11,7 +11,8 @@
     "Public script 04 credential fields blank and credential-dependent sections disabled",
     "Internal server names, private IP addresses, and installer shares replaced with public placeholders",
     "Elastic StartsWith prefixes in script 04 contain no wildcard characters and are documented in README",
-    "Script 14 safely handles optional scheduled-task actions, adapter statistics, and single-item baseline collections"
+    "Script 14 safely handles optional scheduled-task actions, adapter statistics, and single-item baseline collections",
+    "Script 14 classifies and deduplicates WER records and separates Windows servicing failures from application crashes"
   ],
   "RequiresWindowsPowerShellValidation": true
 }

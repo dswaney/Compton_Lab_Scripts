@@ -133,8 +133,9 @@ The easy-to-edit configuration area near the top contains:
 - Stellarium computer wildcard patterns.
 - A `$true` or `$false` switch for each internal section.
 
-The current Elastic Agent target list covers `IB1-*`, `IB2-*`, `SSC-216*`, and
-`AHB-146*`. The public copy preserves this scope for documentation but keeps the
+The current Elastic Agent prefix list covers `IB1`, `IB2`, `SSC-216`, and
+`AHB-146`. The embedded installer uses case-insensitive `StartsWith` matching,
+so Elastic prefixes must not contain wildcard characters. The public copy preserves this scope for documentation but keeps the
 Elastic section disabled and its enrollment token blank. Enable it only in the
 protected operational copy after supplying the correct Fleet configuration.
 

@@ -1,8 +1,8 @@
 {
     "SchemaVersion":  1,
-    "ManifestVersion":  "2.6.1",
-    "PackageVersion":  "2.6.1",
-    "GeneratedUtc":  "2026-09-21T14:13:26Z",
+    "ManifestVersion":  "2.6.2",
+    "PackageVersion":  "2.6.2",
+    "GeneratedUtc":  "2026-09-21T14:24:15Z",
     "Files":  [
                   {
                       "Name":  "00_Update-Scripts-FromShare.ps1",
@@ -31,8 +31,8 @@
                   {
                       "Name":  "04_Sunday_Lab_Application_Maintenance.ps1",
                       "Role":  "MaintenanceScript",
-                      "Version":  "1.6.1",
-                      "SHA256":  "6DAC9917D273F5A8F1F1645B9FA8ACE16A047FEBEC6BD18DB8EE621AF644501D"
+                      "Version":  "1.6.2",
+                      "SHA256":  "BFE8635D88D5A8C58A5E5BE781A121E83BADC730D89F9AE17D8C97B071B9916B"
                   },
                   {
                       "Name":  "05_Weekend_HP_Drivers_Update.ps1",

@@ -1,8 +1,8 @@
 #requires -Version 5.1
 #requires -RunAsAdministrator
 # ScriptName:    04_Sunday_Lab_Application_Maintenance.ps1
-# ScriptVersion: 1.6.1
-# LastUpdated:   2026-09-16
+# ScriptVersion: 1.6.2
+# LastUpdated:   2026-09-21
 <#
 .SYNOPSIS
     Runs the Sunday lab application and configuration maintenance in one script.
@@ -25,11 +25,14 @@
 
 .NOTES
     ScriptName:    04_Sunday_Lab_Application_Maintenance.ps1
-    ScriptVersion: 1.6.1
-    LastUpdated:   2026-09-16
+    ScriptVersion: 1.6.2
+    LastUpdated:   2026-09-21
     Requires:      64-bit Windows PowerShell 5.1, Administrator or SYSTEM
 
-    Changes:       v1.6.0 expands Chrome lab policy enforcement to suppress the
+    Changes:       v1.6.2 corrects Elastic Agent targeting for StartsWith-based
+                   prefix matching and targets every IB1, IB2, SSC-216, and
+                   AHB-146 computer without wildcard characters.
+                   v1.6.0 expands Chrome lab policy enforcement to suppress the
                    browser sign-in/onboarding experience and default-browser prompt
                    on every computer, and enriches Honorlock telemetry with
                    Building/Lab/DeviceIdentifier and target-pattern information for
@@ -97,10 +100,10 @@ $ErrorActionPreference = 'Stop'
 
 # --- Elastic Agent installation targets (former script 15) -----------------
 [string[]]$ElasticAgentComputerPrefixes = @(
-    'IB1-*',
-	'IB2-*',
-	'SSC-216*',
-	'AHB-146*'
+    'IB1',
+    'IB2',
+    'SSC-216',
+    'AHB-146'
 )
 
 # --- Honorlock Chrome extension targets (former script 18) -----------------
@@ -144,7 +147,7 @@ $ErrorActionPreference = 'Stop'
 [string]$Office2024ConfigurationFile = 'office2024config.xml'
 [string]$LogDirectory = 'C:\Logs'
 [string]$RunnerScriptName = '04_Sunday_Lab_Application_Maintenance.ps1'
-[string]$RunnerVersion = '1.6.1'
+[string]$RunnerVersion = '1.6.2'
 [string]$RunnerLogPath = Join-Path $LogDirectory '04_Sunday_Lab_Application_Maintenance.log'
 [string]$RunnerLatestPath = Join-Path $LogDirectory '04_Sunday_Lab_Application_Maintenance.latest.json'
 [string]$RunnerTelemetryPath = Join-Path $LogDirectory 'Maintenance-Telemetry.ndjson'

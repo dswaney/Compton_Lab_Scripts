@@ -73,8 +73,8 @@
                   {
                       "Name":  "14_Endpoint_Health_Inventory.ps1",
                       "Role":  "ManagedFile",
-                      "Version":  "1.4.2",
-                      "SHA256":  "C3D670FB8BF2954D9A31CC198CF29EE6A4E9D138E424AA41098AD23B2DECD1A"
+                      "Version":  "1.5.0",
+                      "SHA256":  "00A40CB03A051B76085AD8DD1379D66ACC02C69489A0798A27E0394BD8F57A43"
                   },
                   {
                       "Name":  "16_Check_Deep_Freeze_Status.ps1",

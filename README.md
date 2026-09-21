@@ -44,7 +44,7 @@ The scripts are designed primarily for 64-bit Windows PowerShell 5.1 and normall
 | [`01_Enable_Windows_Update_Services.ps1`](./01_Enable_Windows_Update_Services.ps1) | Restores Windows Update services, scheduled tasks, policy settings, and required Windows configuration before the update stages begin. |
 | [`02_Remove_User_Profiles.ps1`](./02_Remove_User_Profiles.ps1) | Removes eligible stale local profiles, enforces the standard lab UI, and runs the canonical Microsoft Copilot removal routine. |
 | [`03_Weekend_Apps_Update.ps1`](./03_Weekend_Apps_Update.ps1) | Updates applications through WinGet and services Microsoft Office Click-to-Run before driver and operating-system maintenance. |
-| [`04_Sunday_Lab_Application_Maintenance.ps1`](./04_Sunday_Lab_Application_Maintenance.ps1) | Creates and verifies the weekly restore point, then runs consolidated printer, PaperCut, Office activation, Autologon, Edge, Elastic Agent, browser homepage, Honorlock, and Stellarium Location Services maintenance. |
+| [`04_Sunday_Lab_Application_Maintenance.ps1`](./04_Sunday_Lab_Application_Maintenance.ps1) | Creates and verifies the weekly restore point, runs consolidated application/configuration maintenance, and enforces the approved Windows startup-app allowlist for existing and future profiles. |
 | [`05_Weekend_HP_Drivers_Update.ps1`](./05_Weekend_HP_Drivers_Update.ps1) | Performs supported HP and Dell driver and firmware maintenance, with safeguards around sensitive storage-related driver categories. |
 | [`06_Weekend_Windows_Updates.ps1`](./06_Weekend_Windows_Updates.ps1) | Installs Windows Updates in two Sunday passes and records detailed compliance, result, and reboot telemetry. |
 | [`07_Force_Reboot_Install_Updates.ps1`](./07_Force_Reboot_Install_Updates.ps1) | Coordinates as many as three planned reboot/update cycles and resumes verification at startup. |
@@ -124,6 +124,13 @@ The combined sections are:
 7. Honorlock Chrome extension force-install policy configuration.
 8. Windows Location Services configuration for Stellarium.
 9. Uninstalls any Microsoft Office versions that is older than 2024 edition and install 2024 LTS. Computers with Office 365 installed are skipped.
+10. Windows startup-app allowlist enforcement for existing profiles and the Default User profile.
+
+The startup allowlist leaves only `DWRCST.EXE`, `initialise.bat`, `OneDrive.exe`,
+`student.exe`, and `RtkAudUService64.exe` enabled. Other discovered Task Manager
+startup entries are disabled rather than uninstalled. This includes the Windows
+Security notification-area icon; Microsoft Defender services remain installed
+and running.
 
 The easy-to-edit configuration area near the top contains:
 
@@ -131,6 +138,7 @@ The easy-to-edit configuration area near the top contains:
 - Elastic Agent computer-name prefixes.
 - Honorlock computer wildcard patterns.
 - Stellarium computer wildcard patterns.
+- Approved Windows startup application names.
 - A `$true` or `$false` switch for each internal section.
 
 The current Elastic Agent prefix list covers `IB1`, `IB2`, `SSC-216`, and
@@ -172,7 +180,7 @@ Coordinates as many as three planned reboot/update cycles when maintenance requi
 
 ### `08_System_Repair.ps1`
 
-Runs system integrity and repair checks after the Windows Update stages. Operations include DISM and SFC checks, disk and NVMe health inspection, Explorer/RPC diagnostics, temporary-file cleanup, and management-agent validation, including Action1. Safety defaults constrain disruptive repairs. Microsoft Copilot removal is available only with `-AllowCopilotRemoval` and uses the shared canonical module. The task is given a one-hour window before final inventory so longer operations can complete.
+Runs system integrity and repair checks after the Windows Update stages. Operations include DISM and SFC checks, disk and NVMe health inspection, Explorer/RPC diagnostics, temporary-file cleanup, and management-agent validation, including Action1. Safety defaults constrain disruptive repairs. Microsoft Copilot removal uses the shared canonical module and remains controlled by `-AllowCopilotRemoval`; the registered weekly task now supplies that switch for post-update enforcement. The task is given a one-hour window before final inventory so longer operations can complete.
 
 ### `09_Disable_Windows_Update_Services.ps1`
 
@@ -219,7 +227,7 @@ Runs each Monday at 7:00 AM to classify Deep Freeze as Frozen, Thawed, or Unknow
 
 ### `Maintenance.Copilot.psm1`
 
-Canonical Microsoft Copilot removal module used by script 02, the optional script 08 repair path, and Post-Deployment. It stops Copilot processes, disables related scheduled tasks, removes installed and provisioned packages, applies machine/current/offline/default-user policies, removes Copilot shortcuts, disables Edge Copilot entry points, and verifies package removal.
+Canonical Microsoft Copilot removal module used by script 02, the script 08 post-update repair path, and Post-Deployment. It stops Copilot processes, disables related scheduled tasks and startup entries, removes standalone Copilot packages and the packaged Microsoft 365 Copilot application (`Microsoft.MicrosoftOfficeHub`), applies machine/current/offline/default-user policies, removes Copilot shortcuts, disables Edge Copilot entry points, and verifies package removal. Removing the packaged Microsoft 365 Copilot application does not uninstall the Office LTSC desktop applications.
 
 ### `Maintenance.Framework.psm1`
 
@@ -261,7 +269,7 @@ Creates, updates, validates, and removes Compton College maintenance tasks. It i
 
 It manages:
 
-- Weekly Sunday task actions and start times.
+- Weekly Sunday task actions, arguments, and start times.
 - SYSTEM principals with highest privileges.
 - Task execution settings and time limits.
 - The system-time synchronization task.
@@ -296,7 +304,12 @@ Additional managed triggers:
 | At system startup | Resume Reboot Verification | `07_Force_Reboot_Install_Updates.ps1 -StartupResume` |
 | Monday at 7:00 AM; run after a missed start | Check Deep Freeze Status | `16_Check_Deep_Freeze_Status.ps1` |
 
-The schedule deliberately leaves larger windows around application maintenance, drivers, Windows Updates, and system repair. Task start times are fixed; they do not guarantee that an earlier task has finished, so execution duration should continue to be monitored through telemetry.
+The System Repair task runs with `-AllowCopilotRemoval`, providing a second
+Copilot-removal pass after application and Windows Updates have completed. The
+schedule deliberately leaves larger windows around application maintenance,
+drivers, Windows Updates, and system repair. Task start times are fixed; they do
+not guarantee that an earlier task has finished, so execution duration should
+continue to be monitored through telemetry.
 
 ## Deployment workflow
 

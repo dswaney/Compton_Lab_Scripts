@@ -1,7 +1,7 @@
 #requires -Version 5.1
 #requires -RunAsAdministrator
 # ScriptName:    04_Sunday_Lab_Application_Maintenance.ps1
-# ScriptVersion: 1.6.2
+# ScriptVersion: 1.7.0
 # LastUpdated:   2026-09-21
 <#
 .SYNOPSIS
@@ -25,11 +25,15 @@
 
 .NOTES
     ScriptName:    04_Sunday_Lab_Application_Maintenance.ps1
-    ScriptVersion: 1.6.2
+    ScriptVersion: 1.7.0
     LastUpdated:   2026-09-21
     Requires:      64-bit Windows PowerShell 5.1, Administrator or SYSTEM
 
-    Changes:       v1.6.2 corrects Elastic Agent targeting for StartsWith-based
+    Changes:       v1.7.0 enforces a five-item startup-app allowlist for all
+                   existing user profiles and the Default User profile. All
+                   other discovered Task Manager startup entries are disabled,
+                   not deleted, and the result is logged for fleet reporting.
+                   v1.6.2 corrects Elastic Agent targeting for StartsWith-based
                    prefix matching and targets every IB1, IB2, SSC-216, and
                    AHB-146 computer without wildcard characters.
                    v1.6.0 expands Chrome lab policy enforcement to suppress the
@@ -126,6 +130,18 @@ $ErrorActionPreference = 'Stop'
     'MS-203*'
 )
 
+# --- Windows startup-app allowlist ------------------------------------------
+# Only these items are left enabled in Task Manager > Startup apps. Matching
+# considers both the startup value/display name and the executable or script
+# filename found in its command. Everything else is disabled, not uninstalled.
+[string[]]$AllowedStartupApplications = @(
+    'DWRCST.EXE',
+    'initialise.bat',
+    'OneDrive.exe',
+    'student.exe',
+    'RtkAudUService64.exe'
+)
+
 # ============================================================================
 # SECTION ENABLE/DISABLE SWITCHES
 # ============================================================================
@@ -138,6 +154,7 @@ $ErrorActionPreference = 'Stop'
 [bool]$RunHonorlock         = $true
 [bool]$RunStellariumLocation = $true
 [bool]$RunOffice2024Maintenance = $true
+[bool]$RunStartupAppAllowlist = $true
 
 # ============================================================================
 # GENERAL SETTINGS
@@ -147,7 +164,7 @@ $ErrorActionPreference = 'Stop'
 [string]$Office2024ConfigurationFile = 'office2024config.xml'
 [string]$LogDirectory = 'C:\Logs'
 [string]$RunnerScriptName = '04_Sunday_Lab_Application_Maintenance.ps1'
-[string]$RunnerVersion = '1.6.2'
+[string]$RunnerVersion = '1.7.0'
 [string]$RunnerLogPath = Join-Path $LogDirectory '04_Sunday_Lab_Application_Maintenance.log'
 [string]$RunnerLatestPath = Join-Path $LogDirectory '04_Sunday_Lab_Application_Maintenance.latest.json'
 [string]$RunnerTelemetryPath = Join-Path $LogDirectory 'Maintenance-Telemetry.ndjson'
@@ -5888,6 +5905,306 @@ function Invoke-MaintenanceSection {
     }
 }
 
+function Get-StartupCommandFileName {
+    [CmdletBinding()]
+    param([AllowEmptyString()][string]$Command)
+
+    if ([string]::IsNullOrWhiteSpace($Command)) { return '' }
+
+    $expanded = [Environment]::ExpandEnvironmentVariables($Command.Trim())
+    if ($expanded -match '^\s*"([^"]+\.(?:exe|bat|cmd|com|ps1|vbs))"') {
+        return [IO.Path]::GetFileName($Matches[1])
+    }
+    if ($expanded -match '^\s*([^\s]+\.(?:exe|bat|cmd|com|ps1|vbs))') {
+        return [IO.Path]::GetFileName($Matches[1])
+    }
+    return ''
+}
+
+function Test-StartupItemAllowed {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$Name,
+        [AllowEmptyString()][string]$Command,
+        [Parameter(Mandatory)][string[]]$AllowList
+    )
+
+    $candidates = New-Object System.Collections.Generic.List[string]
+    $candidates.Add($Name.Trim()) | Out-Null
+
+    try {
+        $nameLeaf = [IO.Path]::GetFileName($Name.Trim())
+        if (-not [string]::IsNullOrWhiteSpace($nameLeaf)) { $candidates.Add($nameLeaf) | Out-Null }
+    }
+    catch { }
+
+    $commandLeaf = Get-StartupCommandFileName -Command $Command
+    if (-not [string]::IsNullOrWhiteSpace($commandLeaf)) { $candidates.Add($commandLeaf) | Out-Null }
+
+    foreach ($candidate in $candidates) {
+        foreach ($allowed in @($AllowList)) {
+            if ($candidate -ieq $allowed) { return $true }
+            try {
+                if ([IO.Path]::GetFileNameWithoutExtension($candidate) -ieq [IO.Path]::GetFileNameWithoutExtension($allowed)) {
+                    return $true
+                }
+            }
+            catch { }
+        }
+    }
+    return $false
+}
+
+function Set-StartupApprovedState {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)][string]$Name,
+        [Parameter(Mandatory)][bool]$Enabled,
+        [Parameter(Mandatory)][System.Collections.IDictionary]$Counters,
+        [Parameter(Mandatory)][string]$Scope
+    )
+
+    if (-not (Test-Path -LiteralPath $Path)) {
+        New-Item -Path $Path -Force -ErrorAction Stop | Out-Null
+    }
+
+    $desiredByte = if ($Enabled) { [byte]2 } else { [byte]3 }
+    $existing = $null
+    try { $existing = Get-ItemPropertyValue -LiteralPath $Path -Name $Name -ErrorAction Stop } catch { }
+
+    if ($existing -is [byte[]] -and $existing.Length -gt 0 -and $existing[0] -eq $desiredByte) {
+        $Counters.Unchanged++
+        return
+    }
+
+    $state = [byte[]]($desiredByte,0,0,0,0,0,0,0,0,0,0,0)
+    New-ItemProperty -LiteralPath $Path -Name $Name -PropertyType Binary -Value $state -Force -ErrorAction Stop | Out-Null
+
+    if ($Enabled) {
+        $Counters.Enabled++
+        Write-RunnerLog -Message "Startup allowlist enabled '$Name' for $Scope."
+    }
+    else {
+        $Counters.Disabled++
+        Write-RunnerLog -Message "Startup allowlist disabled '$Name' for $Scope."
+    }
+}
+
+function Get-StartupShortcutTarget {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][string]$Path)
+
+    if ([IO.Path]::GetExtension($Path) -ine '.lnk') { return $Path }
+    try {
+        $shell = New-Object -ComObject WScript.Shell
+        return [string]($shell.CreateShortcut($Path).TargetPath)
+    }
+    catch { return $Path }
+}
+
+function Set-StartupAllowlistForHive {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$HiveRoot,
+        [Parameter(Mandatory)][string]$Scope,
+        [AllowEmptyString()][string]$ProfilePath,
+        [Parameter(Mandatory)][string[]]$AllowList,
+        [Parameter(Mandatory)][System.Collections.IDictionary]$Counters,
+        [switch]$MachineScope
+    )
+
+    $base = "$HiveRoot\Software\Microsoft\Windows\CurrentVersion"
+    $approvedBase = "$base\Explorer\StartupApproved"
+    $processed = @{}
+
+    $wowBase = "$HiveRoot\Software\WOW6432Node\Microsoft\Windows\CurrentVersion"
+    $runMappings = @(
+        [pscustomobject]@{ Source="$base\Run"; Approved="$approvedBase\Run" },
+        [pscustomobject]@{ Source="$wowBase\Run"; Approved="$approvedBase\Run32" }
+    )
+
+    foreach ($mapping in $runMappings) {
+        if (-not (Test-Path -LiteralPath $mapping.Source)) { continue }
+        $properties = (Get-ItemProperty -LiteralPath $mapping.Source -ErrorAction Stop).PSObject.Properties |
+            Where-Object { $_.Name -notmatch '^PS' }
+        foreach ($property in @($properties)) {
+            $allowed = Test-StartupItemAllowed -Name $property.Name -Command ([string]$property.Value) -AllowList $AllowList
+            Set-StartupApprovedState -Path $mapping.Approved -Name $property.Name -Enabled $allowed -Counters $Counters -Scope $Scope
+            $processed[("{0}|{1}" -f $mapping.Approved,$property.Name).ToLowerInvariant()] = $true
+        }
+    }
+
+    $startupFolder = if ($MachineScope) {
+        Join-Path $env:ProgramData 'Microsoft\Windows\Start Menu\Programs\Startup'
+    }
+    elseif (-not [string]::IsNullOrWhiteSpace($ProfilePath)) {
+        Join-Path $ProfilePath 'AppData\Roaming\Microsoft\Windows\Start Menu\Programs\Startup'
+    }
+    else { '' }
+
+    if (-not [string]::IsNullOrWhiteSpace($startupFolder) -and (Test-Path -LiteralPath $startupFolder -PathType Container)) {
+        foreach ($file in @(Get-ChildItem -LiteralPath $startupFolder -File -Force -ErrorAction SilentlyContinue)) {
+            $target = Get-StartupShortcutTarget -Path $file.FullName
+            $allowed = Test-StartupItemAllowed -Name $file.Name -Command $target -AllowList $AllowList
+            $approvedPath = "$approvedBase\StartupFolder"
+            Set-StartupApprovedState -Path $approvedPath -Name $file.Name -Enabled $allowed -Counters $Counters -Scope $Scope
+            $processed[("{0}|{1}" -f $approvedPath,$file.Name).ToLowerInvariant()] = $true
+        }
+    }
+
+    # Include packaged StartupTask entries and orphaned approval records that
+    # Task Manager still displays even when they are not represented by Run.
+    foreach ($subKey in @('Run','Run32','StartupFolder','StartupTask')) {
+        $approvedPath = "$approvedBase\$subKey"
+        if (-not (Test-Path -LiteralPath $approvedPath)) { continue }
+        $properties = (Get-ItemProperty -LiteralPath $approvedPath -ErrorAction Stop).PSObject.Properties |
+            Where-Object { $_.Name -notmatch '^PS' }
+        foreach ($property in @($properties)) {
+            $identity = ("{0}|{1}" -f $approvedPath,$property.Name).ToLowerInvariant()
+            if ($processed.ContainsKey($identity)) { continue }
+            $allowed = Test-StartupItemAllowed -Name $property.Name -Command '' -AllowList $AllowList
+            Set-StartupApprovedState -Path $approvedPath -Name $property.Name -Enabled $allowed -Counters $Counters -Scope $Scope
+        }
+    }
+
+    $Counters.HivesProcessed++
+}
+
+function Invoke-StartupAppAllowlistSection {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][string[]]$AllowList)
+
+    $started = Get-Date
+    $counters = [ordered]@{ HivesProcessed=0; Enabled=0; Disabled=0; Unchanged=0; Failures=0 }
+    $failureMessages = New-Object System.Collections.Generic.List[string]
+    Write-RunnerLog -Message "Starting startup-app allowlist enforcement. Allowed=$($AllowList -join ', ')"
+
+    # Prevent Edge Startup Boost and background mode from recreating a browser
+    # startup entry after the allowlist has disabled msedge.exe.
+    try {
+        $edgePolicyPath = 'HKLM:\SOFTWARE\Policies\Microsoft\Edge'
+        if (-not (Test-Path -LiteralPath $edgePolicyPath)) {
+            New-Item -Path $edgePolicyPath -Force -ErrorAction Stop | Out-Null
+        }
+        New-ItemProperty -LiteralPath $edgePolicyPath -Name 'StartupBoostEnabled' -PropertyType DWord -Value 0 -Force -ErrorAction Stop | Out-Null
+        New-ItemProperty -LiteralPath $edgePolicyPath -Name 'BackgroundModeEnabled' -PropertyType DWord -Value 0 -Force -ErrorAction Stop | Out-Null
+    }
+    catch {
+        $counters.Failures++
+        $failureMessages.Add("Microsoft Edge startup policies: $($_.Exception.Message)") | Out-Null
+        Write-RunnerLog -Message "Unable to enforce Microsoft Edge startup policies: $($_.Exception.Message)" -Level 'ERROR'
+    }
+
+    try {
+        Set-StartupAllowlistForHive -HiveRoot 'Registry::HKEY_LOCAL_MACHINE' -Scope 'Local Machine' -ProfilePath '' -AllowList $AllowList -Counters $counters -MachineScope
+    }
+    catch {
+        $counters.Failures++
+        $failureMessages.Add("Local Machine: $($_.Exception.Message)") | Out-Null
+        Write-RunnerLog -Message "Startup allowlist failed for Local Machine: $($_.Exception.Message)" -Level 'ERROR'
+    }
+
+    $profileEntries = @(Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList\*' -ErrorAction SilentlyContinue |
+        Where-Object { $_.PSChildName -match '^S-1-5-21-(?:\d+-){3}\d+$' })
+    $loadedSids = @(Get-ChildItem Registry::HKEY_USERS -ErrorAction SilentlyContinue |
+        Where-Object { $_.PSChildName -match '^S-1-5-21-(?:\d+-){3}\d+$' } |
+        Select-Object -ExpandProperty PSChildName)
+
+    foreach ($profile in $profileEntries) {
+        $sid = [string]$profile.PSChildName
+        $profilePath = [Environment]::ExpandEnvironmentVariables([string]$profile.ProfileImagePath)
+        if ($sid -in $loadedSids) {
+            try {
+                Set-StartupAllowlistForHive -HiveRoot "Registry::HKEY_USERS\$sid" -Scope $profilePath -ProfilePath $profilePath -AllowList $AllowList -Counters $counters
+            }
+            catch {
+                $counters.Failures++
+                $failureMessages.Add("${profilePath}: $($_.Exception.Message)") | Out-Null
+                Write-RunnerLog -Message "Startup allowlist failed for loaded profile $profilePath`: $($_.Exception.Message)" -Level 'ERROR'
+            }
+            continue
+        }
+
+        $hiveFile = Join-Path $profilePath 'NTUSER.DAT'
+        if (-not (Test-Path -LiteralPath $hiveFile -PathType Leaf)) { continue }
+        $mountName = 'ComptonStartup_{0}' -f ([guid]::NewGuid().ToString('N'))
+        $mounted = $false
+        try {
+            & reg.exe load "HKU\$mountName" $hiveFile 2>&1 | Out-Null
+            if ($LASTEXITCODE -ne 0) { throw "reg.exe load returned $LASTEXITCODE" }
+            $mounted = $true
+            Set-StartupAllowlistForHive -HiveRoot "Registry::HKEY_USERS\$mountName" -Scope $profilePath -ProfilePath $profilePath -AllowList $AllowList -Counters $counters
+        }
+        catch {
+            $counters.Failures++
+            $failureMessages.Add("${profilePath}: $($_.Exception.Message)") | Out-Null
+            Write-RunnerLog -Message "Startup allowlist failed for offline profile $profilePath`: $($_.Exception.Message)" -Level 'ERROR'
+        }
+        finally {
+            if ($mounted) {
+                [gc]::Collect(); [gc]::WaitForPendingFinalizers()
+                & reg.exe unload "HKU\$mountName" 2>&1 | Out-Null
+            }
+        }
+    }
+
+    $defaultHive = Join-Path $env:SystemDrive 'Users\Default\NTUSER.DAT'
+    if (Test-Path -LiteralPath $defaultHive -PathType Leaf) {
+        $mountName = 'ComptonStartupDefault_{0}' -f ([guid]::NewGuid().ToString('N'))
+        $mounted = $false
+        try {
+            & reg.exe load "HKU\$mountName" $defaultHive 2>&1 | Out-Null
+            if ($LASTEXITCODE -ne 0) { throw "reg.exe load returned $LASTEXITCODE" }
+            $mounted = $true
+            Set-StartupAllowlistForHive -HiveRoot "Registry::HKEY_USERS\$mountName" -Scope 'Default User' -ProfilePath (Split-Path -Parent $defaultHive) -AllowList $AllowList -Counters $counters
+        }
+        catch {
+            $counters.Failures++
+            $failureMessages.Add("Default User: $($_.Exception.Message)") | Out-Null
+            Write-RunnerLog -Message "Startup allowlist failed for Default User: $($_.Exception.Message)" -Level 'ERROR'
+        }
+        finally {
+            if ($mounted) {
+                [gc]::Collect(); [gc]::WaitForPendingFinalizers()
+                & reg.exe unload "HKU\$mountName" 2>&1 | Out-Null
+            }
+        }
+    }
+
+    $duration = [math]::Round(((Get-Date) - $started).TotalSeconds,2)
+    $success = ($counters.Failures -eq 0)
+    $event = [pscustomobject][ordered]@{
+        EventType='maintenance.startup_allowlist'; ComputerName=$env:COMPUTERNAME
+        ScriptName=$RunnerScriptName; ScriptVersion=$RunnerVersion; RunId=$RunnerRunId
+        TimestampUtc=(Get-Date).ToUniversalTime().ToString('o')
+        Status=$(if ($success) { 'Compliant' } else { 'CompletedWithErrors' })
+        AllowedItems=@($AllowList); HivesProcessed=$counters.HivesProcessed
+        ItemsEnabled=$counters.Enabled; ItemsDisabled=$counters.Disabled
+        ItemsUnchanged=$counters.Unchanged; FailureCount=$counters.Failures
+        Failures=[string[]]$failureMessages; DurationSeconds=$duration
+    }
+    try {
+        Write-RunnerTelemetryLine -Path $RunnerTelemetryPath -JsonLine ($event | ConvertTo-Json -Depth 6 -Compress)
+        Write-RunnerJsonAtomically -Path (Join-Path $LogDirectory '04_Startup_App_Allowlist.latest.json') -Json ($event | ConvertTo-Json -Depth 6)
+    }
+    catch {
+        $success = $false
+        $counters.Failures++
+        Write-RunnerLog -Message "Unable to publish startup allowlist telemetry: $($_.Exception.Message)" -Level 'ERROR'
+    }
+
+    Write-RunnerLog -Message "Completed startup-app allowlist enforcement. Hives=$($counters.HivesProcessed); Enabled=$($counters.Enabled); Disabled=$($counters.Disabled); Unchanged=$($counters.Unchanged); Failures=$($counters.Failures)" -Level $(if ($success) { 'SUCCESS' } else { 'ERROR' })
+    return [pscustomobject][ordered]@{
+        SectionId='StartupAppAllowlist'; DisplayName='Windows startup-app allowlist'
+        ExitCode=$(if ($success) { 0 } else { 1 }); Success=$success
+        RebootRequired=$false; DurationSeconds=$duration
+        HivesProcessed=$counters.HivesProcessed; ItemsEnabled=$counters.Enabled
+        ItemsDisabled=$counters.Disabled; ItemsUnchanged=$counters.Unchanged
+        FailureCount=$counters.Failures
+    }
+}
+
 function Add-SkippedSectionResult {
     [CmdletBinding()]
     param(
@@ -5938,6 +6255,7 @@ try {
         [pscustomobject]@{ Id='BrowserHomepage'; Name='Browser homepage policies'; Enabled=$RunBrowserHomepage; Settings=[ordered]@{ HomepageUrl=$HomepageUrl } }
         [pscustomobject]@{ Id='Honorlock'; Name='Honorlock Chrome extension'; Enabled=$RunHonorlock; Settings=[ordered]@{ Patterns=@($HonorlockComputerPatterns) } }
         [pscustomobject]@{ Id='StellariumLocation'; Name='Stellarium Location Services'; Enabled=$RunStellariumLocation; Settings=[ordered]@{ Patterns=@($StellariumComputerPatterns) } }
+        [pscustomobject]@{ Id='StartupAppAllowlist'; Name='Windows startup-app allowlist'; Enabled=$RunStartupAppAllowlist; Settings=[ordered]@{ AllowedItems=@($AllowedStartupApplications) } }
     )
 
     foreach ($section in $sectionPlan) {
@@ -5948,6 +6266,11 @@ try {
 
         if ($section.Id -eq 'Office2024Maintenance') {
             [void]$results.Add((Invoke-Office2024MaintenanceSection))
+            continue
+        }
+
+        if ($section.Id -eq 'StartupAppAllowlist') {
+            [void]$results.Add((Invoke-StartupAppAllowlistSection -AllowList @($section.Settings.AllowedItems)))
             continue
         }
 

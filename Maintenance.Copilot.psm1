@@ -1,4 +1,6 @@
 #requires -version 5.1
+# ModuleVersion: 1.1.0
+# LastUpdated: 2026-09-21
 <#
 .SYNOPSIS
     Shared Microsoft Copilot removal and disablement for Compton College endpoints.
@@ -7,11 +9,15 @@
     and optional system repair. The routine removes installed/provisioned
     Copilot packages, stops Copilot processes, disables Copilot tasks, applies
     machine and user policies, cleans shortcuts, and verifies the result.
+.NOTES
+    v1.1.0 removes the packaged Microsoft 365 Copilot application
+    (Microsoft.MicrosoftOfficeHub) and disables Copilot startup entries in
+    machine, existing-user, offline-user, and Default User registry hives.
 #>
 
 Set-StrictMode -Version 2.0
 
-$script:CopilotModuleVersion = '1.0.1'
+$script:CopilotModuleVersion = '1.1.0'
 
 function Write-CopilotMessage {
     param(
@@ -50,6 +56,38 @@ function Set-CopilotUserPolicies {
     Set-CopilotDword -Path "$HiveRoot\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced" -Name 'ShowCopilotButton' -Value 0
 }
 
+function Disable-CopilotStartupEntriesForHive {
+    [CmdletBinding(SupportsShouldProcess = $true)]
+    param(
+        [Parameter(Mandatory)][string]$HiveRoot,
+        [Parameter(Mandatory)][System.Collections.IDictionary]$Result,
+        [scriptblock]$Logger
+    )
+
+    $startupApprovedRoot = "$HiveRoot\Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved"
+    foreach ($subKey in @('Run','Run32','StartupFolder','StartupTask')) {
+        $path = "$startupApprovedRoot\$subKey"
+        if (-not (Test-Path -LiteralPath $path)) { continue }
+
+        try {
+            $properties = (Get-ItemProperty -LiteralPath $path -ErrorAction Stop).PSObject.Properties |
+                Where-Object { $_.Name -notmatch '^PS' -and $_.Name -match '(?i)copilot|MicrosoftOfficeHub' }
+
+            foreach ($property in @($properties)) {
+                if ($PSCmdlet.ShouldProcess("$path\$($property.Name)",'Disable Copilot startup entry')) {
+                    $disabledState = [byte[]](3,0,0,0,0,0,0,0,0,0,0,0)
+                    New-ItemProperty -LiteralPath $path -Name $property.Name -PropertyType Binary -Value $disabledState -Force -ErrorAction Stop | Out-Null
+                    $Result.StartupEntriesDisabled++
+                }
+            }
+        }
+        catch {
+            $Result.Failures++
+            Write-CopilotMessage -Logger $Logger -Message "Failed disabling Copilot startup entries under $path`: $($_.Exception.Message)" -Level WARN
+        }
+    }
+}
+
 function Invoke-ComprehensiveCopilotRemoval {
     [CmdletBinding(SupportsShouldProcess = $true, ConfirmImpact = 'Low')]
     param(
@@ -69,6 +107,7 @@ function Invoke-ComprehensiveCopilotRemoval {
         UserHivesUpdated              = 0
         OfflineUserHivesUpdated       = 0
         ShortcutsRemoved              = 0
+        StartupEntriesDisabled        = 0
         RemainingInstalledPackages   = 0
         RemainingProvisionedPackages = 0
         Failures                      = 0
@@ -76,11 +115,13 @@ function Invoke-ComprehensiveCopilotRemoval {
         Status                        = 'Running'
     }
 
-    # Limit package removal to Copilot-named packages and the explicit
-    # Windows AI Copilot provider. MicrosoftOfficeHub is intentionally excluded.
+    # Microsoft.MicrosoftOfficeHub is the packaged application now presented as
+    # "Microsoft 365 Copilot". Removing it does not uninstall the desktop Office
+    # LTSC applications such as Word, Excel, PowerPoint, or Outlook.
     $packagePatterns = @(
         '*Copilot*',
-        'Microsoft.Windows.Ai.Copilot.Provider'
+        'Microsoft.Windows.Ai.Copilot.Provider',
+        'Microsoft.MicrosoftOfficeHub'
     )
 
     Write-CopilotMessage -Logger $Logger -Message "Starting comprehensive Microsoft Copilot removal (module $($script:CopilotModuleVersion))."
@@ -106,6 +147,8 @@ function Invoke-ComprehensiveCopilotRemoval {
             Write-CopilotMessage -Logger $Logger -Message "Failed setting policy $($policy.Path)\$($policy.Name): $($_.Exception.Message)" -Level ERROR
         }
     }
+
+    Disable-CopilotStartupEntriesForHive -HiveRoot 'Registry::HKEY_LOCAL_MACHINE' -Result $result -Logger $Logger
 
     foreach ($process in @(Get-Process -ErrorAction SilentlyContinue | Where-Object { $_.ProcessName -like '*Copilot*' })) {
         try {
@@ -140,6 +183,7 @@ function Invoke-ComprehensiveCopilotRemoval {
         try {
             if ($PSCmdlet.ShouldProcess($sid,'Apply Copilot user policies')) {
                 Set-CopilotUserPolicies -HiveRoot "Registry::HKEY_USERS\$sid"
+                Disable-CopilotStartupEntriesForHive -HiveRoot "Registry::HKEY_USERS\$sid" -Result $result -Logger $Logger
                 $result.UserHivesUpdated++
             }
         }
@@ -165,6 +209,7 @@ function Invoke-ComprehensiveCopilotRemoval {
                 if ($LASTEXITCODE -ne 0) { throw "reg.exe load returned $LASTEXITCODE" }
                 try {
                     Set-CopilotUserPolicies -HiveRoot "Registry::HKEY_USERS\$mountName"
+                    Disable-CopilotStartupEntriesForHive -HiveRoot "Registry::HKEY_USERS\$mountName" -Result $result -Logger $Logger
                     $result.OfflineUserHivesUpdated++
                 }
                 finally {
@@ -187,6 +232,7 @@ function Invoke-ComprehensiveCopilotRemoval {
                     if ($LASTEXITCODE -ne 0) { throw "reg.exe load returned $LASTEXITCODE" }
                     try {
                         Set-CopilotUserPolicies -HiveRoot "Registry::HKEY_USERS\$mountName"
+                        Disable-CopilotStartupEntriesForHive -HiveRoot "Registry::HKEY_USERS\$mountName" -Result $result -Logger $Logger
                         $result.OfflineUserHivesUpdated++
                     }
                     finally {
@@ -295,7 +341,7 @@ function Invoke-ComprehensiveCopilotRemoval {
     }
 
     $level = if ($result.Failures -gt 0) { 'ERROR' } else { 'OK' }
-    Write-CopilotMessage -Logger $Logger -Level $level -Message ("Copilot removal completed. Status={0}; InstalledRemoved={1}; ProvisionedRemoved={2}; UserHives={3}; OfflineHives={4}; Failures={5}" -f $result.Status,$result.InstalledPackagesRemoved,$result.ProvisionedPackagesRemoved,$result.UserHivesUpdated,$result.OfflineUserHivesUpdated,$result.Failures)
+    Write-CopilotMessage -Logger $Logger -Level $level -Message ("Copilot removal completed. Status={0}; InstalledRemoved={1}; ProvisionedRemoved={2}; StartupEntriesDisabled={3}; UserHives={4}; OfflineHives={5}; Failures={6}" -f $result.Status,$result.InstalledPackagesRemoved,$result.ProvisionedPackagesRemoved,$result.StartupEntriesDisabled,$result.UserHivesUpdated,$result.OfflineUserHivesUpdated,$result.Failures)
     return [pscustomobject]$result
 }
 

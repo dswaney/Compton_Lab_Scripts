@@ -1,8 +1,8 @@
 #requires -Version 5.1
 #requires -RunAsAdministrator
 # ScriptName:    Register-Tasks_SYSTEM.ps1
-# ScriptVersion: 4.9.0
-# LastUpdated:   2026-09-09
+# ScriptVersion: 4.10.0
+# LastUpdated:   2026-09-21
 <#
 .SYNOPSIS
     Reconciles Compton College managed scheduled tasks under SYSTEM.
@@ -14,11 +14,14 @@
 
 .NOTES
     ScriptName:    Register-Tasks_SYSTEM.ps1
-    ScriptVersion: 4.9.0
+    ScriptVersion: 4.10.0
     Change: Replaces seven standalone weekly tasks with combined script 04, removes
             tasks that reference retired scripts, and refactors Sunday timing.
-    LastUpdated:   2026-09-09
-    Changes:       v4.9.0 replaces the script 16 startup trigger with a Monday
+    LastUpdated:   2026-09-21
+    Changes:       v4.10.0 runs script 08 with -AllowCopilotRemoval after the
+                   application and Windows Update stages so Copilot packages
+                   restored during maintenance are removed before inventory.
+                   v4.9.0 replaces the script 16 startup trigger with a Monday
                    7:00 AM weekly trigger and enables StartWhenAvailable so a
                    computer runs the check after a missed scheduled start.
                    Script 16 runs directly and publishes an explicit
@@ -50,7 +53,7 @@ Set-StrictMode -Version 2.0
 $ErrorActionPreference = 'Stop'
 
 $script:ScriptName       = 'Register-Tasks_SYSTEM.ps1'
-$script:ScriptVersion    = '4.9.0'
+$script:ScriptVersion    = '4.10.0'
 $script:RunId            = [guid]::NewGuid().Guid
 $script:StartTime        = Get-Date
 $script:WarningCount     = 0
@@ -771,7 +774,7 @@ try {
         [pscustomobject]@{ Name='08. Force Reboot Install Updates';          Script='07_Force_Reboot_Install_Updates.ps1';                 Time='06:15'; Args='' },
         [pscustomobject]@{ Name='09. Weekend Windows Updates - 2nd Pass';    Script='06_Weekend_Windows_Updates.ps1';                      Time='06:45'; Args='' },
         [pscustomobject]@{ Name='10. Disable Windows Update Services';       Script='09_Disable_Windows_Update_Services.ps1';              Time='07:45'; Args='' },
-        [pscustomobject]@{ Name='11. System Repair';                         Script='08_System_Repair.ps1';                                Time='08:00'; Args='' },
+        [pscustomobject]@{ Name='11. System Repair';                         Script='08_System_Repair.ps1';                                Time='08:00'; Args='-AllowCopilotRemoval' },
         [pscustomobject]@{ Name='12. Weekly Endpoint Health Inventory';      Script='14_Endpoint_Health_Inventory.ps1';                    Time='09:00'; Args='' }
     )
 

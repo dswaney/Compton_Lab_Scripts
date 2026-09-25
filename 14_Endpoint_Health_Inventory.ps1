@@ -6,11 +6,13 @@
 
 .DESCRIPTION
     Collects hardware, operating system, performance, storage, security,
-    networking, update, event-log, service, and management-agent health.
+    networking, update, event-log, service, management-agent, and normalized
+    managed-software inventory.
 
-    Writes one endpoint.health summary event and one endpoint.health.finding
-    event for every Warning or Critical finding. The individual finding events
-    support clean Kibana tables, filtering, drilldowns, and alerting.
+    Writes one endpoint.health summary event, one endpoint.health.finding event
+    for every Warning or Critical finding, and one endpoint.software event for
+    every tracked package. Software removals are emitted as tombstone events so
+    an Elastic latest-state transform can accurately represent current state.
 
     The script is fault-tolerant: individual collectors can fail without
     preventing the remaining endpoint snapshot from being written.
@@ -31,18 +33,39 @@
     C:\Logs\Maintenance-Telemetry.ndjson
     C:\Logs\14_Endpoint_Health_Inventory.latest.json
     C:\Logs\14_Endpoint_Health_Inventory.log
+    C:\ProgramData\Compton\Autopilot\<COMPUTERNAME>-Autopilot.csv
+    C:\ProgramData\Compton\Inventory\SoftwareInventory.latest.json
+    C:\ProgramData\Compton\Inventory\BIOSSettings.latest.json
 
 .NOTES
     ScriptName:    14_Endpoint_Health_Inventory.ps1
-    ScriptVersion: 1.6.1
-    LastUpdated:   2026-09-21
-    Changes:       v1.6.1 treats CapabilityAccessManager WAL access-denied results as
+    ScriptVersion: 1.8.0
+    LastUpdated:   2026-09-24
+    Changes:       v1.8.0 inventories supported HP and Dell BIOS settings as normalized
+                   name/value rows, redacts password-related values, writes a local BIOS-settings
+                   snapshot, and includes the settings and installed BIOS version in Elastic telemetry.
+                   v1.7.1 makes scheduled-task action, network-adapter statistics, and driver-baseline
+                   collection resilient to optional properties and singleton PowerShell results.
+                   v1.7.0 adds policy-driven machine and loaded-user software inventory without
+                   Win32_Product, emits one endpoint.software event per tracked package, compares
+                   against a protected local snapshot, emits removal tombstones, and expands system,
+                   BIOS, baseboard, enclosure, monitor, audio, printer, and optical-drive inventory.
+                   v1.6.0 adds HP warranty and entitlement inventory through HPCMSL, prefers HP's
+                   30-day local WMI cache, deterministically staggers missing/stale lookups to protect
+                   the shared public-IP rate limit, and publishes stable lifecycle fields to Elastic.
+                   v1.5.1 makes WinRM configuration idempotent, records which settings required
+                   correction, and restarts WinRM once whenever configuration changes are applied.
+                   v1.6.1 treats CapabilityAccessManager WAL access-denied results as
                    informational inspection limitations instead of health warnings, and emits
                    repeated-detection USB driver remediation candidates for Device Manager Code 43.
-                   v1.6.0 adds deterministic SHA-256 fingerprints to health findings and
+                   v1.6.0 also adds deterministic SHA-256 fingerprints to health findings and
                    remediation candidates, and emits one structured remediation-candidate
                    event per stable Windows failure signature for controlled n8n workflows.
-                   v1.5.0 classifies Windows Error Reporting event 1001 by EventName, counts only
+                   v1.5.1 makes WinRM configuration idempotent, records which settings required
+                   correction, and restarts WinRM once whenever configuration changes are applied.
+                   v1.5.0 configures domain-profile, administrator-only WinRM, saves a local
+                   Autopilot hardware-hash CSV with restricted NTFS permissions, classifies
+                   Windows Error Reporting event 1001 by EventName, and counts only
                    genuine application-failure types as application crashes, deduplicates repeated WER
                    records by ReportId, and reports Windows component-store failures separately. It also
                    adds structured remediation classifications for future Elastic/n8n orchestration.
@@ -164,14 +187,35 @@ param(
         'Kaseya'
     ),
 
-    [string]$LogDirectory = 'C:\Logs'
+    [string]$LogDirectory = 'C:\Logs',
+
+    [string]$AutopilotHashDirectory = 'C:\ProgramData\Compton\Autopilot',
+
+    [ValidateRange(1, 365)]
+    [int]$HPWarrantyCacheMaxAgeDays = 30,
+
+    [ValidateRange(0, 3600)]
+    [int]$HPWarrantyLookupStaggerMaxSeconds = 900,
+
+    [ValidateRange(1, 730)]
+    [int]$HPWarrantyExpirationWarningDays = 90,
+
+    [string]$SoftwareInventoryPolicyPath = 'C:\Scripts\SoftwareInventory.Policy.json',
+
+    [string]$SoftwareInventorySnapshotPath = 'C:\ProgramData\Compton\Inventory\SoftwareInventory.latest.json',
+
+    [string]$BiosSettingsSnapshotPath = 'C:\ProgramData\Compton\Inventory\BIOSSettings.latest.json',
+
+    [string]$HpBiosConfigShare = '\\filesvr\labscripts\HP_Bios_Config',
+
+    [string]$DellCommandConfigureShare = '\\filesvr\labscripts\Dell\Command Configure'
 )
 
 Set-StrictMode -Version 2.0
 $ErrorActionPreference = 'Stop'
 
 $script:ScriptName       = '14_Endpoint_Health_Inventory.ps1'
-$script:ScriptVersion    = '1.6.1'
+$script:ScriptVersion    = '1.8.0'
 $script:RunId            = [guid]::NewGuid().Guid
 $script:StartTime        = Get-Date
 $script:WarningCount     = 0
@@ -534,40 +578,6 @@ function Get-ObjectPropertyValueSafe {
     return $property.Value
 }
 
-function Get-FirstObjectPropertyValueSafe {
-    param(
-        $InputObject,
-        [Parameter(Mandatory)][string[]]$Names
-    )
-
-    foreach ($name in $Names) {
-        $value = Get-ObjectPropertyValueSafe -InputObject $InputObject -Name $name
-        if ($null -ne $value) { return $value }
-    }
-
-    return $null
-}
-
-function ConvertTo-ScheduledTaskActionText {
-    param($Action)
-
-    if ($null -eq $Action) { return $null }
-
-    $execute = Get-ObjectPropertyValueSafe -InputObject $Action -Name 'Execute'
-    $arguments = Get-ObjectPropertyValueSafe -InputObject $Action -Name 'Arguments'
-    if (-not [string]::IsNullOrWhiteSpace([string]$execute)) {
-        return (('{0} {1}' -f $execute, $arguments).Trim())
-    }
-
-    $classId = Get-ObjectPropertyValueSafe -InputObject $Action -Name 'ClassId'
-    $data = Get-ObjectPropertyValueSafe -InputObject $Action -Name 'Data'
-    if (-not [string]::IsNullOrWhiteSpace([string]$classId)) {
-        return (('COM handler {0} {1}' -f $classId, $data).Trim())
-    }
-
-    return $Action.GetType().FullName
-}
-
 function Test-PendingReboot {
     $reasons = New-Object System.Collections.Generic.List[string]
 
@@ -683,6 +693,377 @@ function Convert-SmbiosMemoryType {
         35 { 'LPDDR5' }
         default { 'Type{0}' -f [int]$MemoryType }
     }
+}
+
+function Get-Sha256TextHash {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][string]$Text)
+
+    $algorithm = [Security.Cryptography.SHA256]::Create()
+    try {
+        $bytes = [Text.Encoding]::UTF8.GetBytes($Text)
+        return (($algorithm.ComputeHash($bytes) | ForEach-Object { $_.ToString('x2') }) -join '')
+    }
+    finally {
+        $algorithm.Dispose()
+    }
+}
+
+function Test-RegexListMatch {
+    [CmdletBinding()]
+    param(
+        [AllowNull()][string]$Value,
+        [AllowNull()]$Patterns
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Value)) { return $false }
+    foreach ($pattern in @($Patterns)) {
+        if ([string]::IsNullOrWhiteSpace([string]$pattern)) { continue }
+        if ($Value -match [string]$pattern) { return $true }
+    }
+    return $false
+}
+
+function Get-SoftwareInventoryPolicy {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][string]$Path)
+
+    if (Test-Path -LiteralPath $Path) {
+        $raw = Get-Content -LiteralPath $Path -Raw -ErrorAction Stop
+        $policy = $raw | ConvertFrom-Json -ErrorAction Stop
+        if (-not (Get-ObjectPropertyValueSafe -InputObject $policy -Name 'PolicyVersion')) {
+            throw "Software inventory policy '$Path' does not contain PolicyVersion."
+        }
+        return [pscustomobject]@{
+            Policy = $policy
+            Source = $Path
+            UsedEmbeddedDefault = $false
+        }
+    }
+
+    Write-Log -Level 'WARN' -Message ("Software inventory policy was not found at '{0}'; using the embedded safe default." -f $Path)
+    $policy = [pscustomobject]@{
+        SchemaVersion = '1.0'
+        PolicyVersion = '1.0.0-embedded'
+        TrackAllNonSystemApplications = $true
+        IncludePerUserRegistryForLoadedProfiles = $false
+        ExcludeSystemComponents = $true
+        ExcludeUpdatesAndHotfixes = $true
+        IncludeNameRegex = @(
+            '(?i)Google Chrome', '(?i)Mozilla Firefox', '(?i)^Microsoft Edge$',
+            '(?i)Microsoft (?:365|Office)', '(?i)Office LTSC',
+            '(?i)Adobe (?:Acrobat|Reader|Creative Cloud)', '(?i)VLC media player',
+            '(?i)Stellarium', '(?i)Zoom', '(?i)Respondus', '(?i)Honorlock',
+            '(?i)PaperCut', '(?i)Elastic Agent', '(?i)Action1', '(?i)Deep Freeze'
+        )
+        IncludePublisherRegex = @()
+        ExcludeNameRegex = @(
+            '(?i)^(?:Security Update|Update|Hotfix|Service Pack|Language Pack) for Microsoft Windows',
+            '(?i)^KB\d+', '(?i)^Microsoft Visual C\+\+ .*Redistributable',
+            '(?i)^Microsoft Edge WebView2 Runtime$', '(?i)^Microsoft Update Health Tools$',
+            '(?i)^Windows (?:Driver|Software Development Kit|Assessment and Deployment Kit)',
+            '(?i)^Microsoft Windows Desktop Runtime',
+            '(?i)^Microsoft ASP\.NET Core .*Shared Framework',
+            '(?i)^Microsoft \.NET (?:Runtime|Host|Host FX Resolver|Targeting Pack|SDK)'
+        )
+        ExcludePublisherRegex = @()
+        ProductRules = @(
+            [pscustomobject]@{ NameRegex = '(?i)Google Chrome'; CanonicalName = 'Google Chrome'; Category = 'Browser' },
+            [pscustomobject]@{ NameRegex = '(?i)Mozilla Firefox'; CanonicalName = 'Mozilla Firefox'; Category = 'Browser' },
+            [pscustomobject]@{ NameRegex = '(?i)^Microsoft Edge$'; CanonicalName = 'Microsoft Edge'; Category = 'Browser' },
+            [pscustomobject]@{ NameRegex = '(?i)Microsoft Visio'; CanonicalName = 'Microsoft Visio'; Category = 'Microsoft Office' },
+            [pscustomobject]@{ NameRegex = '(?i)Microsoft Project'; CanonicalName = 'Microsoft Project'; Category = 'Microsoft Office' },
+            [pscustomobject]@{ NameRegex = '(?i)Microsoft 365 Apps'; CanonicalName = 'Microsoft 365 Apps'; Category = 'Microsoft Office' },
+            [pscustomobject]@{ NameRegex = '(?i)(?:Microsoft Office|Office LTSC).*2024'; CanonicalName = 'Microsoft Office LTSC 2024'; Category = 'Microsoft Office' },
+            [pscustomobject]@{ NameRegex = '(?i)(?:Microsoft Office|Office LTSC).*2021'; CanonicalName = 'Microsoft Office LTSC 2021'; Category = 'Microsoft Office' },
+            [pscustomobject]@{ NameRegex = '(?i)(?:Microsoft Office|Office LTSC).*2019'; CanonicalName = 'Microsoft Office 2019'; Category = 'Microsoft Office' },
+            [pscustomobject]@{ NameRegex = '(?i)(?:Microsoft Office|Office LTSC).*2016'; CanonicalName = 'Microsoft Office 2016'; Category = 'Microsoft Office' },
+            [pscustomobject]@{ NameRegex = '(?i)(?:Microsoft Office|Office LTSC)'; CanonicalName = 'Microsoft Office'; Category = 'Microsoft Office' },
+            [pscustomobject]@{ NameRegex = '(?i)Adobe (?:Acrobat|Reader)'; CanonicalName = 'Adobe Acrobat'; Category = 'Adobe' },
+            [pscustomobject]@{ NameRegex = '(?i)Adobe Creative Cloud'; CanonicalName = 'Adobe Creative Cloud'; Category = 'Adobe' },
+            [pscustomobject]@{ NameRegex = '(?i)VLC media player'; CanonicalName = 'VLC media player'; Category = 'Media' },
+            [pscustomobject]@{ NameRegex = '(?i)Stellarium'; CanonicalName = 'Stellarium'; Category = 'Academic' },
+            [pscustomobject]@{ NameRegex = '(?i)Respondus'; CanonicalName = 'Respondus'; Category = 'Academic' },
+            [pscustomobject]@{ NameRegex = '(?i)Honorlock'; CanonicalName = 'Honorlock'; Category = 'Academic' },
+            [pscustomobject]@{ NameRegex = '(?i)Zoom'; CanonicalName = 'Zoom'; Category = 'Communication' },
+            [pscustomobject]@{ NameRegex = '(?i)PaperCut'; CanonicalName = 'PaperCut'; Category = 'Printing' },
+            [pscustomobject]@{ NameRegex = '(?i)Elastic Agent'; CanonicalName = 'Elastic Agent'; Category = 'Management Agent' },
+            [pscustomobject]@{ NameRegex = '(?i)Action1'; CanonicalName = 'Action1'; Category = 'Management Agent' },
+            [pscustomobject]@{ NameRegex = '(?i)Deep Freeze'; CanonicalName = 'Deep Freeze'; Category = 'Endpoint Protection' },
+            [pscustomobject]@{ NameRegex = '(?i)(?:CrowdStrike|SentinelOne|Wazuh|Tanium|Qualys)'; CanonicalName = '$0'; Category = 'Security' }
+        )
+        DefaultCategory = 'Other Third-Party'
+    }
+
+    return [pscustomobject]@{
+        Policy = $policy
+        Source = 'EmbeddedDefault'
+        UsedEmbeddedDefault = $true
+    }
+}
+
+function Convert-SoftwareInstallDate {
+    [CmdletBinding()]
+    param([AllowNull()]$Value)
+
+    $text = ([string]$Value).Trim()
+    if ([string]::IsNullOrWhiteSpace($text)) { return $null }
+
+    $parsed = [datetime]::MinValue
+    if ($text -match '^\d{8}$' -and
+        [datetime]::TryParseExact($text, 'yyyyMMdd', [Globalization.CultureInfo]::InvariantCulture,
+            [Globalization.DateTimeStyles]::None, [ref]$parsed)) {
+        return $parsed.ToString('yyyy-MM-dd')
+    }
+    if ([datetime]::TryParse($text, [Globalization.CultureInfo]::InvariantCulture,
+        [Globalization.DateTimeStyles]::AllowWhiteSpaces, [ref]$parsed)) {
+        return $parsed.ToString('yyyy-MM-dd')
+    }
+    return $text
+}
+
+function Get-SoftwareProductClassification {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$DisplayName,
+        [Parameter(Mandatory)]$Policy
+    )
+
+    foreach ($rule in @((Get-ObjectPropertyValueSafe -InputObject $Policy -Name 'ProductRules'))) {
+        $nameRegex = [string](Get-ObjectPropertyValueSafe -InputObject $rule -Name 'NameRegex')
+        if (-not [string]::IsNullOrWhiteSpace($nameRegex) -and $DisplayName -match $nameRegex) {
+            $canonical = [string](Get-ObjectPropertyValueSafe -InputObject $rule -Name 'CanonicalName')
+            if ($canonical -eq '$0' -or [string]::IsNullOrWhiteSpace($canonical)) { $canonical = $DisplayName }
+            return [pscustomobject]@{
+                CanonicalName = $canonical.Trim()
+                Category = [string](Get-ObjectPropertyValueSafe -InputObject $rule -Name 'Category')
+            }
+        }
+    }
+
+    $defaultCategory = [string](Get-ObjectPropertyValueSafe -InputObject $Policy -Name 'DefaultCategory')
+    if ([string]::IsNullOrWhiteSpace($defaultCategory)) { $defaultCategory = 'Other Third-Party' }
+    return [pscustomobject]@{ CanonicalName = $DisplayName.Trim(); Category = $defaultCategory }
+}
+
+function Get-InstalledSoftwareInventory {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$PolicyPath,
+        [Parameter(Mandatory)][string]$SnapshotPath
+    )
+
+    $policyResult = Get-SoftwareInventoryPolicy -Path $PolicyPath
+    $policy = $policyResult.Policy
+    $registrySources = New-Object System.Collections.Generic.List[object]
+    $registrySources.Add([pscustomobject]@{
+        Path = 'Registry::HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*'
+        Architecture = 'x64'; Scope = 'Machine'
+    })
+    $registrySources.Add([pscustomobject]@{
+        Path = 'Registry::HKEY_LOCAL_MACHINE\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*'
+        Architecture = 'x86'; Scope = 'Machine'
+    })
+
+    $includePerUser = [bool](Get-ObjectPropertyValueSafe -InputObject $policy -Name 'IncludePerUserRegistryForLoadedProfiles')
+    if ($includePerUser) {
+        foreach ($hive in @(Get-ChildItem -Path 'Registry::HKEY_USERS' -ErrorAction SilentlyContinue)) {
+            $sid = [string](Get-ObjectPropertyValueSafe -InputObject $hive -Name 'PSChildName')
+            if ($sid -notmatch '^S-1-5-21-(?:\d+-){3}\d+$') { continue }
+            $registrySources.Add([pscustomobject]@{
+                Path = "Registry::HKEY_USERS\$sid\Software\Microsoft\Windows\CurrentVersion\Uninstall\*"
+                Architecture = 'User'; Scope = $sid
+            })
+        }
+    }
+
+    $packageById = @{}
+    $sourceReadCount = 0
+    foreach ($source in $registrySources) {
+        $entries = @(Get-ItemProperty -Path $source.Path -ErrorAction SilentlyContinue)
+        if ($entries.Count -gt 0) { $sourceReadCount++ }
+
+        foreach ($entry in $entries) {
+            $displayName = ([string](Get-ObjectPropertyValueSafe -InputObject $entry -Name 'DisplayName')).Trim()
+            if ([string]::IsNullOrWhiteSpace($displayName)) { continue }
+
+            $publisher = ([string](Get-ObjectPropertyValueSafe -InputObject $entry -Name 'Publisher')).Trim()
+            $explicitInclude = (Test-RegexListMatch -Value $displayName -Patterns (Get-ObjectPropertyValueSafe -InputObject $policy -Name 'IncludeNameRegex')) -or
+                (Test-RegexListMatch -Value $publisher -Patterns (Get-ObjectPropertyValueSafe -InputObject $policy -Name 'IncludePublisherRegex'))
+
+            $systemComponent = 0
+            try { $systemComponent = [int](Get-ObjectPropertyValueSafe -InputObject $entry -Name 'SystemComponent') } catch { }
+            if ([bool](Get-ObjectPropertyValueSafe -InputObject $policy -Name 'ExcludeSystemComponents') -and
+                $systemComponent -eq 1 -and -not $explicitInclude) { continue }
+
+            $releaseType = [string](Get-ObjectPropertyValueSafe -InputObject $entry -Name 'ReleaseType')
+            $parentKeyName = [string](Get-ObjectPropertyValueSafe -InputObject $entry -Name 'ParentKeyName')
+            if ([bool](Get-ObjectPropertyValueSafe -InputObject $policy -Name 'ExcludeUpdatesAndHotfixes') -and
+                -not $explicitInclude -and
+                ($releaseType -match '(?i)(?:Update|Hotfix|Security Update|Update Rollup)' -or
+                 -not [string]::IsNullOrWhiteSpace($parentKeyName))) { continue }
+
+            $explicitExclude = (Test-RegexListMatch -Value $displayName -Patterns (Get-ObjectPropertyValueSafe -InputObject $policy -Name 'ExcludeNameRegex')) -or
+                (Test-RegexListMatch -Value $publisher -Patterns (Get-ObjectPropertyValueSafe -InputObject $policy -Name 'ExcludePublisherRegex'))
+            if ($explicitExclude -and -not $explicitInclude) { continue }
+
+            $trackAll = [bool](Get-ObjectPropertyValueSafe -InputObject $policy -Name 'TrackAllNonSystemApplications')
+            if (-not $trackAll -and -not $explicitInclude) { continue }
+
+            $classification = Get-SoftwareProductClassification -DisplayName $displayName -Policy $policy
+            $scopeType = if ($source.Scope -eq 'Machine') { 'Machine' } else { 'User' }
+            $softwareKey = '{0}|{1}|{2}|{3}' -f $classification.CanonicalName.ToLowerInvariant(),
+                $publisher.ToLowerInvariant(), $source.Architecture.ToLowerInvariant(), $scopeType.ToLowerInvariant()
+            $softwareId = Get-Sha256TextHash -Text $softwareKey
+            $registryKeyName = [string](Get-ObjectPropertyValueSafe -InputObject $entry -Name 'PSChildName')
+            $estimatedSizeKB = Get-ObjectPropertyValueSafe -InputObject $entry -Name 'EstimatedSize'
+            $estimatedSizeMB = $null
+            if ($null -ne $estimatedSizeKB) {
+                try { $estimatedSizeMB = [math]::Round(([double]$estimatedSizeKB / 1024), 2) } catch { }
+            }
+
+            $package = [pscustomobject][ordered]@{
+                SoftwareId       = $softwareId
+                Present          = $true
+                ChangeType       = $null
+                Name             = $displayName
+                CanonicalName    = $classification.CanonicalName
+                Version          = ([string](Get-ObjectPropertyValueSafe -InputObject $entry -Name 'DisplayVersion')).Trim()
+                PreviousVersion  = $null
+                Publisher        = $publisher
+                Category         = $classification.Category
+                Architecture     = $source.Architecture
+                Scope            = $source.Scope
+                ScopeType        = $scopeType
+                InstallDate      = Convert-SoftwareInstallDate -Value (Get-ObjectPropertyValueSafe -InputObject $entry -Name 'InstallDate')
+                InstallLocation  = [string](Get-ObjectPropertyValueSafe -InputObject $entry -Name 'InstallLocation')
+                EstimatedSizeMB  = $estimatedSizeMB
+                ProductCode      = if ($registryKeyName -match '^\{[0-9A-Fa-f-]{36}\}$') { $registryKeyName } else { $null }
+                RegistryPath     = [string](Get-ObjectPropertyValueSafe -InputObject $entry -Name 'PSPath')
+                HelpLink         = [string](Get-ObjectPropertyValueSafe -InputObject $entry -Name 'HelpLink')
+                AboutUrl         = [string](Get-ObjectPropertyValueSafe -InputObject $entry -Name 'URLInfoAbout')
+            }
+
+            if (-not $packageById.ContainsKey($softwareId)) {
+                $packageById[$softwareId] = $package
+            }
+            elseif ([string]::IsNullOrWhiteSpace([string]$packageById[$softwareId].Version) -and
+                -not [string]::IsNullOrWhiteSpace([string]$package.Version)) {
+                $packageById[$softwareId] = $package
+            }
+        }
+    }
+
+    [object[]]$currentPackages = @($packageById.Values | Sort-Object CanonicalName, Architecture, Scope)
+    $previousPackages = @()
+    $previousRunId = $null
+    if (Test-Path -LiteralPath $SnapshotPath) {
+        try {
+            $previousSnapshot = Get-Content -LiteralPath $SnapshotPath -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
+            $previousPackages = @((Get-ObjectPropertyValueSafe -InputObject $previousSnapshot -Name 'Packages'))
+            $previousRunId = [string](Get-ObjectPropertyValueSafe -InputObject $previousSnapshot -Name 'InventoryRunId')
+        }
+        catch {
+            Write-Log -Level 'WARN' -Message ("Previous software inventory snapshot could not be read and will be replaced after this successful run: {0}" -f $_.Exception.Message)
+            $previousPackages = @()
+        }
+    }
+
+    if ($currentPackages.Count -eq 0 -and $previousPackages.Count -gt 0) {
+        throw ("Software collection returned zero packages while the previous snapshot contained {0}; snapshot and tombstone generation were stopped." -f $previousPackages.Count)
+    }
+    if ($sourceReadCount -eq 0 -and $currentPackages.Count -eq 0) {
+        throw 'No software uninstall registry source returned data; snapshot and tombstone generation were stopped.'
+    }
+
+    $previousById = @{}
+    foreach ($previous in $previousPackages) {
+        $previousId = [string](Get-ObjectPropertyValueSafe -InputObject $previous -Name 'SoftwareId')
+        if (-not [string]::IsNullOrWhiteSpace($previousId)) { $previousById[$previousId] = $previous }
+    }
+
+    $events = New-Object System.Collections.Generic.List[object]
+    $installedCount = 0; $updatedCount = 0; $presentCount = 0; $removedCount = 0
+    foreach ($package in $currentPackages) {
+        if (-not $previousById.ContainsKey($package.SoftwareId)) {
+            $package.ChangeType = 'Installed'; $installedCount++
+        }
+        else {
+            $previousVersion = [string](Get-ObjectPropertyValueSafe -InputObject $previousById[$package.SoftwareId] -Name 'Version')
+            if ([string]$package.Version -ne $previousVersion) {
+                $package.ChangeType = 'Updated'; $package.PreviousVersion = $previousVersion; $updatedCount++
+            }
+            else { $package.ChangeType = 'Present'; $presentCount++ }
+        }
+        $events.Add($package)
+    }
+
+    foreach ($previous in $previousPackages) {
+        $previousId = [string](Get-ObjectPropertyValueSafe -InputObject $previous -Name 'SoftwareId')
+        if ([string]::IsNullOrWhiteSpace($previousId) -or $packageById.ContainsKey($previousId)) { continue }
+        $events.Add([pscustomobject][ordered]@{
+            SoftwareId = $previousId; Present = $false; ChangeType = 'Removed'
+            Name = [string](Get-ObjectPropertyValueSafe -InputObject $previous -Name 'Name')
+            CanonicalName = [string](Get-ObjectPropertyValueSafe -InputObject $previous -Name 'CanonicalName')
+            Version = $null
+            PreviousVersion = [string](Get-ObjectPropertyValueSafe -InputObject $previous -Name 'Version')
+            Publisher = [string](Get-ObjectPropertyValueSafe -InputObject $previous -Name 'Publisher')
+            Category = [string](Get-ObjectPropertyValueSafe -InputObject $previous -Name 'Category')
+            Architecture = [string](Get-ObjectPropertyValueSafe -InputObject $previous -Name 'Architecture')
+            Scope = [string](Get-ObjectPropertyValueSafe -InputObject $previous -Name 'Scope')
+            ScopeType = [string](Get-ObjectPropertyValueSafe -InputObject $previous -Name 'ScopeType')
+            InstallDate = Get-ObjectPropertyValueSafe -InputObject $previous -Name 'InstallDate'
+            InstallLocation = [string](Get-ObjectPropertyValueSafe -InputObject $previous -Name 'InstallLocation')
+            EstimatedSizeMB = Get-ObjectPropertyValueSafe -InputObject $previous -Name 'EstimatedSizeMB'
+            ProductCode = [string](Get-ObjectPropertyValueSafe -InputObject $previous -Name 'ProductCode')
+            RegistryPath = [string](Get-ObjectPropertyValueSafe -InputObject $previous -Name 'RegistryPath')
+            HelpLink = [string](Get-ObjectPropertyValueSafe -InputObject $previous -Name 'HelpLink')
+            AboutUrl = [string](Get-ObjectPropertyValueSafe -InputObject $previous -Name 'AboutUrl')
+        })
+        $removedCount++
+    }
+
+    $collectedAt = (Get-Date).ToUniversalTime().ToString('o')
+    $summary = [pscustomobject][ordered]@{
+        PolicyVersion = [string](Get-ObjectPropertyValueSafe -InputObject $policy -Name 'PolicyVersion')
+        PolicySource = $policyResult.Source
+        UsedEmbeddedDefault = $policyResult.UsedEmbeddedDefault
+        SnapshotPath = $SnapshotPath
+        PreviousInventoryRunId = $previousRunId
+        CurrentPackageCount = $currentPackages.Count
+        InstalledCount = $installedCount
+        UpdatedCount = $updatedCount
+        PresentCount = $presentCount
+        RemovedCount = $removedCount
+        EventCount = $events.Count
+        MachineRegistrySourceCount = @($registrySources | Where-Object Scope -eq 'Machine').Count
+        LoadedUserRegistrySourceCount = @($registrySources | Where-Object Scope -ne 'Machine').Count
+        PerUserRegistryEnabled = $includePerUser
+        Complete = $true
+    }
+
+    [pscustomobject]@{
+        Summary = $summary
+        Events = New-ObjectArrayForJson -InputObject $events
+        Snapshot = [ordered]@{
+            SchemaVersion = '1.0'
+            ComputerName = $env:COMPUTERNAME
+            InventoryRunId = $script:RunId
+            CollectedAt = $collectedAt
+            PolicyVersion = $summary.PolicyVersion
+            Packages = New-ObjectArrayForJson -InputObject $currentPackages
+        }
+    }
+}
+
+function Convert-WmiCharacterArray {
+    [CmdletBinding()]
+    param([AllowNull()]$Value)
+
+    if ($null -eq $Value) { return $null }
+    $characters = @($Value | Where-Object { [int]$_ -gt 0 } | ForEach-Object { [char][int]$_ })
+    if ($characters.Count -eq 0) { return $null }
+    return (-join $characters).Trim()
 }
 
 function Get-HardwareInventory {
@@ -818,10 +1199,78 @@ function Get-HardwareInventory {
         Adapters            = New-ObjectArrayForJson -InputObject $gpuRows
     }
 
+    # ----- Monitors -----
+    $monitorRows = @()
+    foreach ($monitor in @(Get-CimInstance -Namespace 'root\wmi' -ClassName WmiMonitorID -ErrorAction SilentlyContinue)) {
+        $monitorRows += [pscustomobject]@{
+            InstanceName       = [string]$monitor.InstanceName
+            ManufacturerCode   = Convert-WmiCharacterArray -Value $monitor.ManufacturerName
+            Model              = Convert-WmiCharacterArray -Value $monitor.UserFriendlyName
+            SerialNumber       = Convert-WmiCharacterArray -Value $monitor.SerialNumberID
+            ProductCodeId      = $monitor.ProductCodeID
+            ManufactureWeek    = $monitor.WeekOfManufacture
+            ManufactureYear    = $monitor.YearOfManufacture
+            Active             = [bool]$monitor.Active
+        }
+    }
+
+    # ----- Audio devices -----
+    $audioRows = @()
+    foreach ($audio in @(Get-CimInstance Win32_SoundDevice -ErrorAction SilentlyContinue)) {
+        $audioRows += [pscustomobject]@{
+            Name          = $audio.Name
+            Manufacturer  = $audio.Manufacturer
+            ProductName   = $audio.ProductName
+            PnpDeviceId   = $audio.PNPDeviceID
+            Status        = $audio.Status
+            StatusInfo    = $audio.StatusInfo
+        }
+    }
+
+    # ----- Installed printer queues -----
+    $printerRows = @()
+    foreach ($printer in @(Get-CimInstance Win32_Printer -ErrorAction SilentlyContinue)) {
+        $printerRows += [pscustomobject]@{
+            Name          = $printer.Name
+            DriverName    = $printer.DriverName
+            PortName      = $printer.PortName
+            DeviceId      = $printer.DeviceID
+            Network       = [bool]$printer.Network
+            Local         = [bool]$printer.Local
+            Shared        = [bool]$printer.Shared
+            ShareName     = $printer.ShareName
+            Default       = [bool]$printer.Default
+            WorkOffline   = [bool]$printer.WorkOffline
+            PrinterStatus = $printer.PrinterStatus
+        }
+    }
+
+    # ----- Optical drives -----
+    $opticalRows = @()
+    foreach ($drive in @(Get-CimInstance Win32_CDROMDrive -ErrorAction SilentlyContinue)) {
+        $opticalRows += [pscustomobject]@{
+            Name          = $drive.Name
+            Manufacturer  = $drive.Manufacturer
+            Drive         = $drive.Drive
+            MediaType     = $drive.MediaType
+            PnpDeviceId   = $drive.PNPDeviceID
+            RevisionLevel = $drive.RevisionLevel
+            Status        = $drive.Status
+        }
+    }
+
     [pscustomobject]@{
-        CPU    = $cpu
-        Memory = $memory
-        GPU    = $gpu
+        CPU           = $cpu
+        Memory        = $memory
+        GPU           = $gpu
+        MonitorCount  = $monitorRows.Count
+        Monitors      = New-ObjectArrayForJson -InputObject $monitorRows
+        AudioDeviceCount = $audioRows.Count
+        AudioDevices  = New-ObjectArrayForJson -InputObject $audioRows
+        PrinterCount  = $printerRows.Count
+        Printers      = New-ObjectArrayForJson -InputObject $printerRows
+        OpticalDriveCount = $opticalRows.Count
+        OpticalDrives = New-ObjectArrayForJson -InputObject $opticalRows
     }
 }
 
@@ -830,6 +1279,7 @@ function Get-ComputerIdentity {
     $bios = Get-CimInstance Win32_BIOS
     $baseboard = Get-CimInstance Win32_BaseBoard -ErrorAction SilentlyContinue
     $enclosure = Get-CimInstance Win32_SystemEnclosure -ErrorAction SilentlyContinue
+    $product = Get-CimInstance Win32_ComputerSystemProduct -ErrorAction SilentlyContinue
     $location = Get-ComputerLocationIdentity -ComputerName $env:COMPUTERNAME
 
     [pscustomobject]@{
@@ -845,6 +1295,15 @@ function Get-ComputerIdentity {
         SystemType    = $computer.SystemType
         SystemFamily  = $computer.SystemFamily
         SystemSKU     = $computer.SystemSKUNumber
+        SystemUUID    = if ($product) { $product.UUID } else { $null }
+        ProductName   = if ($product) { $product.Name } else { $null }
+        ProductVersion= if ($product) { $product.Version } else { $null }
+        ProductVendor = if ($product) { $product.Vendor } else { $null }
+        ProductIdentifyingNumber = if ($product) { $product.IdentifyingNumber } else { $null }
+        PCSystemType  = Get-ObjectPropertyValueSafe -InputObject $computer -Name 'PCSystemType'
+        PCSystemTypeEx= Get-ObjectPropertyValueSafe -InputObject $computer -Name 'PCSystemTypeEx'
+        BootupState   = $computer.BootupState
+        HypervisorPresent = [bool](Get-ObjectPropertyValueSafe -InputObject $computer -Name 'HypervisorPresent')
         SerialNumber  = $bios.SerialNumber
         BIOSVersion   = (($bios.SMBIOSBIOSVersion, $bios.Version | Where-Object { $_ }) -join ' / ')
         BIOSDate      = if ($bios.ReleaseDate) { (Convert-CimDate $bios.ReleaseDate).ToUniversalTime().ToString('o') } else { $null }
@@ -852,6 +1311,43 @@ function Get-ComputerIdentity {
         AssetTag      = if ($enclosure) { $enclosure.SMBIOSAssetTag } else { $null }
         ChassisTypes  = New-ObjectArrayForJson -InputObject $(if ($enclosure) { @($enclosure.ChassisTypes) } else { @() })
         TotalMemoryGB = [math]::Round($computer.TotalPhysicalMemory / 1GB, 2)
+        BIOS = [ordered]@{
+            Manufacturer = $bios.Manufacturer
+            Name = $bios.Name
+            Caption = $bios.Caption
+            SMBIOSBIOSVersion = $bios.SMBIOSBIOSVersion
+            Version = $bios.Version
+            ReleaseDate = if ($bios.ReleaseDate) { (Convert-CimDate $bios.ReleaseDate).ToUniversalTime().ToString('o') } else { $null }
+            SerialNumber = $bios.SerialNumber
+            SMBIOSMajorVersion = Get-ObjectPropertyValueSafe -InputObject $bios -Name 'SMBIOSMajorVersion'
+            SMBIOSMinorVersion = Get-ObjectPropertyValueSafe -InputObject $bios -Name 'SMBIOSMinorVersion'
+            EmbeddedControllerMajorVersion = Get-ObjectPropertyValueSafe -InputObject $bios -Name 'EmbeddedControllerMajorVersion'
+            EmbeddedControllerMinorVersion = Get-ObjectPropertyValueSafe -InputObject $bios -Name 'EmbeddedControllerMinorVersion'
+            Characteristics = New-ObjectArrayForJson -InputObject @($bios.BiosCharacteristics)
+        }
+        BaseboardDetails = if ($baseboard) {
+            [ordered]@{
+                Manufacturer = $baseboard.Manufacturer
+                Product = $baseboard.Product
+                Version = $baseboard.Version
+                SerialNumber = $baseboard.SerialNumber
+                HostingBoard = Get-ObjectPropertyValueSafe -InputObject $baseboard -Name 'HostingBoard'
+                HotSwappable = Get-ObjectPropertyValueSafe -InputObject $baseboard -Name 'HotSwappable'
+                Removable = Get-ObjectPropertyValueSafe -InputObject $baseboard -Name 'Removable'
+                Replaceable = Get-ObjectPropertyValueSafe -InputObject $baseboard -Name 'Replaceable'
+            }
+        } else { $null }
+        EnclosureDetails = if ($enclosure) {
+            [ordered]@{
+                Manufacturer = $enclosure.Manufacturer
+                Model = $enclosure.Model
+                SerialNumber = $enclosure.SerialNumber
+                SMBIOSAssetTag = $enclosure.SMBIOSAssetTag
+                SKU = Get-ObjectPropertyValueSafe -InputObject $enclosure -Name 'SKU'
+                ChassisTypes = New-ObjectArrayForJson -InputObject @($enclosure.ChassisTypes)
+                SecurityStatus = $enclosure.SecurityStatus
+            }
+        } else { $null }
     }
 }
 
@@ -2800,8 +3296,33 @@ function Get-MaintenanceScheduledTaskHealth {
         return [pscustomobject]@{ Available=$false; TaskCount=0; UnhealthyCount=0; Tasks=[object[]]@() }
     }
     $rows = @()
+    $getActionDescription = {
+        param($Action)
+
+        if ($null -eq $Action) { return '[Unknown action]' }
+
+        $execute = Get-ObjectPropertyValueSafe -InputObject $Action -Name 'Execute'
+        $arguments = Get-ObjectPropertyValueSafe -InputObject $Action -Name 'Arguments'
+        if (-not [string]::IsNullOrWhiteSpace([string]$execute)) {
+            return ('{0} {1}' -f $execute, $arguments).Trim()
+        }
+
+        $classId = Get-ObjectPropertyValueSafe -InputObject $Action -Name 'ClassId'
+        if (-not [string]::IsNullOrWhiteSpace([string]$classId)) {
+            return ('COM Handler: {0}' -f $classId)
+        }
+
+        $actionType = $null
+        if ($Action.PSObject.Properties['CimClass'] -and $Action.CimClass) {
+            $actionType = Get-ObjectPropertyValueSafe -InputObject $Action.CimClass -Name 'CimClassName'
+        }
+        if ([string]::IsNullOrWhiteSpace([string]$actionType)) {
+            $actionType = $Action.GetType().Name
+        }
+        return ('[{0}]' -f $actionType)
+    }
     $tasks = @(Get-ScheduledTask -ErrorAction SilentlyContinue | Where-Object {
-        $actionText = (@($_.Actions | ForEach-Object { ConvertTo-ScheduledTaskActionText -Action $_ }) -join ' ')
+        $actionText = (@($_.Actions | ForEach-Object { & $getActionDescription $_ }) -join ' ')
         $_.TaskPath -match '(?i)Compton|Maintenance' -or $_.TaskName -match '(?i)Compton|Maintenance|Endpoint.Health|Lab.Application|Windows.Update|Force.Reboot|Time.Sync|Deep.Freeze' -or $actionText -match '(?i)C:\\Scripts\\'
     })
     foreach ($task in $tasks) {
@@ -2816,7 +3337,7 @@ function Get-MaintenanceScheduledTaskHealth {
             LastTaskResult=$resultCode; LastTaskResultHex=if ($null -ne $resultCode) {'0x{0:X8}' -f $resultCode} else {$null}
             NextRunTime=if ($info -and $info.NextRunTime -and $info.NextRunTime.Year -gt 1999) {$info.NextRunTime.ToUniversalTime().ToString('o')} else {$null}
             MissedRuns=if ($info) {$info.NumberOfMissedRuns} else {$null}; Unhealthy=$unhealthy
-            Actions=New-StringArrayForJson -InputObject @($task.Actions | ForEach-Object { ConvertTo-ScheduledTaskActionText -Action $_ })
+            Actions=New-StringArrayForJson -InputObject @($task.Actions | ForEach-Object { & $getActionDescription $_ })
         }
         $rows += $row
         if ($unhealthy) {
@@ -2844,7 +3365,10 @@ function Get-DriverCurrencyHealth {
         $rows+=$row; if ($isOld) {$oldDrivers+=$row}
     }
     $baselineDriverRules = Get-ObjectPropertyValueSafe -InputObject $Baseline -Name 'Drivers'
-    [object[]]$rules = @($baselineDriverRules | Where-Object { $null -ne $_ })
+    $rules = @()
+    if ($null -ne $baselineDriverRules) {
+        $rules = @($baselineDriverRules | ForEach-Object { $_ })
+    }
     $mismatches=@()
     foreach ($rule in $rules) {
         $deviceIdRegex = Get-ObjectPropertyValueSafe -InputObject $rule -Name 'DeviceIdRegex'
@@ -2869,15 +3393,19 @@ function Get-NetworkDiagnosticsHealth {
     $dnsAddresses=@(); $dnsError=$null
     try {$dnsAddresses=@(Resolve-DnsName -Name $DnsTestName -Type A -DnsOnly -ErrorAction Stop | Where-Object IPAddress | Select-Object -ExpandProperty IPAddress -Unique)} catch {$dnsError=$_.Exception.Message}
     $statistics=@()
-    if (Get-Command Get-NetAdapterStatistics -ErrorAction SilentlyContinue) { $statistics=@(Get-NetAdapterStatistics -ErrorAction SilentlyContinue | ForEach-Object {[pscustomobject]@{
-        Name=(Get-ObjectPropertyValueSafe -InputObject $_ -Name 'Name')
-        ReceivedBytes=(Get-ObjectPropertyValueSafe -InputObject $_ -Name 'ReceivedBytes')
-        SentBytes=(Get-ObjectPropertyValueSafe -InputObject $_ -Name 'SentBytes')
-        ReceivedDiscarded=(Get-FirstObjectPropertyValueSafe -InputObject $_ -Names @('ReceivedDiscardedPackets','ReceivedDiscarded'))
-        OutboundDiscarded=(Get-FirstObjectPropertyValueSafe -InputObject $_ -Names @('OutboundDiscardedPackets','OutboundDiscarded'))
-        ReceivedPacketErrors=(Get-ObjectPropertyValueSafe -InputObject $_ -Name 'ReceivedPacketErrors')
-        OutboundPacketErrors=(Get-ObjectPropertyValueSafe -InputObject $_ -Name 'OutboundPacketErrors')
-    }}) }
+    if (Get-Command Get-NetAdapterStatistics -ErrorAction SilentlyContinue) {
+        $statistics = @(Get-NetAdapterStatistics -ErrorAction SilentlyContinue | ForEach-Object {
+            [pscustomobject]@{
+                Name                 = Get-ObjectPropertyValueSafe -InputObject $_ -Name 'Name'
+                ReceivedBytes        = Get-ObjectPropertyValueSafe -InputObject $_ -Name 'ReceivedBytes'
+                SentBytes            = Get-ObjectPropertyValueSafe -InputObject $_ -Name 'SentBytes'
+                ReceivedDiscarded    = Get-ObjectPropertyValueSafe -InputObject $_ -Name 'ReceivedDiscarded'
+                OutboundDiscarded    = Get-ObjectPropertyValueSafe -InputObject $_ -Name 'OutboundDiscarded'
+                ReceivedPacketErrors = Get-ObjectPropertyValueSafe -InputObject $_ -Name 'ReceivedPacketErrors'
+                OutboundPacketErrors = Get-ObjectPropertyValueSafe -InputObject $_ -Name 'OutboundPacketErrors'
+            }
+        })
+    }
     $gatewayHealthy=$gatewayResults.Count -gt 0 -and @($gatewayResults | Where-Object Reachable).Count -gt 0; $dnsHealthy=$dnsAddresses.Count -gt 0; $healthy=$gatewayHealthy -and $dnsHealthy
     $result=[pscustomobject]@{DnsTestName=$DnsTestName;DnsResolved=$dnsHealthy;DnsAddresses=New-StringArrayForJson -InputObject $dnsAddresses;DnsError=$dnsError
         GatewayReachable=$gatewayHealthy;Gateways=New-ObjectArrayForJson -InputObject $gatewayResults;AdapterStatistics=New-ObjectArrayForJson -InputObject $statistics}
@@ -3022,6 +3550,187 @@ function Write-JsonAtomically {
     Move-Item -LiteralPath $temporary -Destination $Path -Force
 }
 
+function Test-BiosSettingSensitive {
+    param([string]$Name)
+    return ([string]$Name -match '(?i)password|passwd|credential|certificate|private\s*key|secure\s*key')
+}
+
+function ConvertFrom-HpBcuExport {
+    param([Parameter(Mandatory)][string[]]$Lines)
+
+    $settings = New-Object System.Collections.Generic.List[object]
+    for ($i = 0; $i -lt $Lines.Count; $i++) {
+        $name = [string]$Lines[$i]
+        if ([string]::IsNullOrWhiteSpace($name) -or $name -match '^\s' -or $name.Trim() -eq 'BIOSConfig 1.0') { continue }
+
+        $values = New-Object System.Collections.Generic.List[string]
+        $selected = $null
+        for ($j = $i + 1; $j -lt $Lines.Count; $j++) {
+            $raw = [string]$Lines[$j]
+            if ([string]::IsNullOrWhiteSpace($raw)) { continue }
+            if ($raw -notmatch '^\s') { break }
+            $value = $raw.Trim()
+            if ($value.StartsWith('*')) {
+                $selected = $value.TrimStart('*')
+                $value = $selected
+            }
+            if (-not [string]::IsNullOrWhiteSpace($value)) { $values.Add($value) | Out-Null }
+        }
+
+        if ($null -eq $selected -and $values.Count -gt 0) { $selected = $values[0] }
+        $sensitive = Test-BiosSettingSensitive -Name $name.Trim()
+        $settings.Add([pscustomobject][ordered]@{
+            Name          = $name.Trim()
+            CurrentValue  = if ($sensitive -and $null -ne $selected) { '[REDACTED]' } else { $selected }
+            AllowedValues = if ($sensitive) { [object[]]@() } else { New-ObjectArrayForJson -InputObject @($values | Select-Object -Unique) }
+            Sensitive     = [bool]$sensitive
+        }) | Out-Null
+    }
+    return @($settings | Sort-Object Name)
+}
+
+function ConvertFrom-DellCctkExport {
+    param([Parameter(Mandatory)][string[]]$Lines)
+
+    $settings = New-Object System.Collections.Generic.List[object]
+    foreach ($line in $Lines) {
+        $text = [string]$line
+        if ([string]::IsNullOrWhiteSpace($text) -or $text.TrimStart().StartsWith(';') -or $text.TrimStart().StartsWith('#') -or $text.Trim() -match '^\[.+\]$') { continue }
+        if ($text -notmatch '^\s*([^=]+?)\s*=\s*(.*)$') { continue }
+        $name = $Matches[1].Trim()
+        $value = $Matches[2].Trim()
+        if ([string]::IsNullOrWhiteSpace($name)) { continue }
+        $sensitive = Test-BiosSettingSensitive -Name $name
+        $settings.Add([pscustomobject][ordered]@{
+            Name          = $name
+            CurrentValue  = if ($sensitive -and -not [string]::IsNullOrWhiteSpace($value)) { '[REDACTED]' } else { $value }
+            AllowedValues = [object[]]@()
+            Sensitive     = [bool]$sensitive
+        }) | Out-Null
+    }
+    return @($settings | Sort-Object Name -Unique)
+}
+
+function Get-VendorBiosSettingsInventory {
+    param([Parameter(Mandatory)]$Identity)
+
+    $manufacturer = [string](Get-ObjectPropertyValueSafe -InputObject $Identity -Name 'Manufacturer')
+    $vendor = if ($manufacturer -match '(?i)Dell') { 'Dell' } elseif ($manufacturer -match '(?i)HP|Hewlett') { 'HP' } else { 'Other' }
+    $result = [ordered]@{
+        Vendor           = $vendor
+        Provider         = $null
+        Status           = 'NotApplicable'
+        CollectedAtUtc   = (Get-Date).ToUniversalTime().ToString('o')
+        BIOSVersion      = [string](Get-ObjectPropertyValueSafe -InputObject $Identity -Name 'BIOSVersion')
+        BIOSReleaseDateUtc = [string](Get-ObjectPropertyValueSafe -InputObject $Identity -Name 'BIOSDate')
+        SettingsCount    = 0
+        Settings         = [object[]]@()
+        CollectionError  = $null
+        SnapshotPath     = $BiosSettingsSnapshotPath
+    }
+
+    $working = Join-Path $env:TEMP ("Compton-BIOS-Inventory-{0}" -f $script:RunId)
+    try {
+        Ensure-Directory -Path $working
+        if ($vendor -eq 'HP') {
+            $result.Provider = 'HP BIOS Configuration Utility'
+            $bcuSource = Join-Path $HpBiosConfigShare 'BIOSConfigUtility64.exe'
+            if (-not (Test-Path -LiteralPath $bcuSource -PathType Leaf)) { throw "HP BIOS Configuration Utility was not found: $bcuSource" }
+            foreach ($file in @(Get-ChildItem -LiteralPath $HpBiosConfigShare -File -ErrorAction Stop | Where-Object { $_.Name -match '^(BIOSConfigUtility64\.exe|BCUsignature64\.dll)$' })) {
+                Copy-Item -LiteralPath $file.FullName -Destination $working -Force -ErrorAction Stop
+            }
+            $bcu = Join-Path $working 'BIOSConfigUtility64.exe'
+            $export = Join-Path $working 'hp-bios-settings.txt'
+            $output = @(& $bcu "/Get:$export" 2>&1)
+            $exitCode = $LASTEXITCODE
+            if ($exitCode -ne 0 -or -not (Test-Path -LiteralPath $export -PathType Leaf)) {
+                throw "HP BIOS settings export failed (exit $exitCode): $($output -join ' ')"
+            }
+            $result.Settings = New-ObjectArrayForJson -InputObject @(ConvertFrom-HpBcuExport -Lines @(Get-Content -LiteralPath $export -ErrorAction Stop))
+        }
+        elseif ($vendor -eq 'Dell') {
+            $result.Provider = 'Dell Command Configure'
+            $cctkSource = Join-Path $DellCommandConfigureShare 'X86_64\cctk.exe'
+            if (-not (Test-Path -LiteralPath $cctkSource -PathType Leaf)) { throw "Dell Command Configure was not found: $cctkSource" }
+            $source = Get-Item -LiteralPath $cctkSource -ErrorAction Stop
+            Copy-Item -Path (Join-Path $source.DirectoryName '*') -Destination $working -Recurse -Force -ErrorAction Stop
+            $cctk = Join-Path $working 'cctk.exe'
+            $export = Join-Path $working 'dell-bios-settings.ini'
+            $output = @(& $cctk ("--outfile={0}" -f $export) 2>&1)
+            $exitCode = $LASTEXITCODE
+            if ($exitCode -ne 0 -or -not (Test-Path -LiteralPath $export -PathType Leaf)) {
+                throw "Dell BIOS settings export failed (exit $exitCode): $($output -join ' ')"
+            }
+            $result.Settings = New-ObjectArrayForJson -InputObject @(ConvertFrom-DellCctkExport -Lines @(Get-Content -LiteralPath $export -ErrorAction Stop))
+        }
+
+        if ($vendor -in @('HP','Dell')) {
+            $result.SettingsCount = @($result.Settings).Count
+            $result.Status = if ($result.SettingsCount -gt 0) { 'Collected' } else { 'NoSettingsReturned' }
+            if ($result.SettingsCount -eq 0) { throw "$vendor BIOS utility completed without returning any settings." }
+        }
+    }
+    catch {
+        $result.Status = 'CollectionFailed'
+        $result.CollectionError = $_.Exception.Message
+        Add-Finding -Severity 'Info' -Category 'Firmware' -Check 'BIOSSettingsInventory' `
+            -Message ("{0} BIOS settings could not be inventoried: {1}" -f $vendor, $_.Exception.Message) -Details ([pscustomobject]$result)
+    }
+    finally {
+        Remove-Item -LiteralPath $working -Recurse -Force -ErrorAction SilentlyContinue
+    }
+
+    $snapshot = [pscustomobject][ordered]@{
+        SchemaVersion = '1.0'
+        ComputerName  = $env:COMPUTERNAME
+        RunId         = $script:RunId
+        Inventory     = [pscustomobject]$result
+    }
+    $snapshotDirectory = Split-Path -Parent $BiosSettingsSnapshotPath
+    Ensure-Directory -Path $snapshotDirectory
+    Write-JsonAtomically -Path $BiosSettingsSnapshotPath -Json ($snapshot | ConvertTo-Json -Depth 14)
+    return [pscustomobject]$result
+}
+
+function Get-VendorBiosUpdateEvidence {
+    param(
+        [Parameter(Mandatory)]$Identity,
+        [string]$Script05LatestPath = 'C:\Logs\05_Weekend_HP_Drivers_Update.latest.json'
+    )
+
+    $result = [ordered]@{
+        SourceAvailable         = $false
+        SourcePath              = $Script05LatestPath
+        SourceScriptVersion     = $null
+        SourceTimestamp         = $null
+        CurrentVersion          = [string](Get-ObjectPropertyValueSafe -InputObject $Identity -Name 'BIOSVersion')
+        UpdateAvailable         = $false
+        AvailableVersionCount   = 0
+        AvailableVersions       = [object[]]@()
+        UpdatePackages          = [object[]]@()
+        CollectionError         = $null
+    }
+
+    try {
+        if (-not (Test-Path -LiteralPath $Script05LatestPath -PathType Leaf)) { return [pscustomobject]$result }
+        $source = Get-Content -LiteralPath $Script05LatestPath -Raw -Encoding UTF8 -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
+        $result.SourceAvailable = $true
+        $result.SourceScriptVersion = [string](Get-ObjectPropertyValueSafe -InputObject $source -Name 'ScriptVersion')
+        $result.SourceTimestamp = [string](Get-ObjectPropertyValueSafe -InputObject $source -Name 'Timestamp')
+        $updates = @(Get-ObjectPropertyValueSafe -InputObject $source -Name 'BiosFirmwareUpdates')
+        $biosUpdates = @($updates | Where-Object { [string](Get-ObjectPropertyValueSafe -InputObject $_ -Name 'UpdateKind') -eq 'BIOS' })
+        $versions = @($biosUpdates | ForEach-Object { [string](Get-ObjectPropertyValueSafe -InputObject $_ -Name 'AvailableVersion') } | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Sort-Object -Unique)
+        $result.UpdatePackages = New-ObjectArrayForJson -InputObject $biosUpdates
+        $result.AvailableVersions = New-ObjectArrayForJson -InputObject $versions
+        $result.AvailableVersionCount = $versions.Count
+        $result.UpdateAvailable = ($biosUpdates.Count -gt 0)
+    }
+    catch {
+        $result.CollectionError = $_.Exception.Message
+    }
+    return [pscustomobject]$result
+}
+
 function Write-Telemetry {
     param([Parameter(Mandatory)]$Event)
 
@@ -3030,6 +3739,55 @@ function Write-Telemetry {
 
     Write-MaintenanceTelemetryLine -Path $script:NdjsonPath -JsonLine $jsonCompact
     Write-JsonAtomically -Path $script:LatestPath -Json $jsonPretty
+}
+
+function Write-SoftwareInventoryTelemetry {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]$Inventory,
+        [Parameter(Mandatory)][datetime]$EventTime,
+        $Identity
+    )
+
+    $eventNumber = 0
+    foreach ($software in @($Inventory.Events)) {
+        $eventNumber++
+        $softwareEvent = [ordered]@{
+            '@timestamp' = $EventTime.ToUniversalTime().ToString('o')
+            EventType = 'endpoint.software'
+            SchemaVersion = '1.0'
+            RunId = $script:RunId
+            InventoryRunId = $script:RunId
+            InventoryEventNumber = $eventNumber
+            InventoryEventCount = [int]$Inventory.Summary.EventCount
+
+            ComputerName = $env:COMPUTERNAME
+            Domain = if ($Identity) { $Identity.Domain } else { $env:USERDOMAIN }
+            Building = if ($Identity) { $Identity.Building } else { $null }
+            Lab = if ($Identity) { $Identity.Lab } else { $null }
+            DeviceIdentifier = if ($Identity) { $Identity.DeviceIdentifier } else { $null }
+
+            ScriptName = $script:ScriptName
+            ScriptVersion = $script:ScriptVersion
+            TextLogPath = $script:PublishedLogPath
+            Inventory = [ordered]@{
+                Complete = [bool]$Inventory.Summary.Complete
+                PolicyVersion = [string]$Inventory.Summary.PolicyVersion
+                PolicySource = [string]$Inventory.Summary.PolicySource
+                PreviousInventoryRunId = [string]$Inventory.Summary.PreviousInventoryRunId
+                CurrentPackageCount = [int]$Inventory.Summary.CurrentPackageCount
+            }
+            Software = $software
+        }
+
+        $jsonCompact = $softwareEvent | ConvertTo-Json -Depth 12 -Compress
+        Write-MaintenanceTelemetryLine -Path $script:NdjsonPath -JsonLine $jsonCompact
+    }
+
+    $snapshotDirectory = Split-Path -Parent $SoftwareInventorySnapshotPath
+    Ensure-Directory -Path $snapshotDirectory
+    $snapshotJson = $Inventory.Snapshot | ConvertTo-Json -Depth 12
+    Write-JsonAtomically -Path $SoftwareInventorySnapshotPath -Json $snapshotJson
 }
 
 function Write-HealthFindingTelemetry {
@@ -3091,6 +3849,480 @@ function Write-HealthFindingTelemetry {
     Write-MaintenanceTelemetryLine -Path $script:NdjsonPath -JsonLine $jsonCompact
 }
 
+function Initialize-RestrictedWinRM {
+    $computer = Get-CimInstance -ClassName Win32_ComputerSystem -ErrorAction Stop
+    if (-not $computer.PartOfDomain) { throw 'Device is not joined to Active Directory; WinRM configuration skipped.' }
+    $domainProfile = @(Get-NetConnectionProfile -ErrorAction Stop | Where-Object NetworkCategory -eq 'DomainAuthenticated')
+    if ($domainProfile.Count -eq 0) { throw 'No authenticated domain network profile; WinRM configuration skipped.' }
+
+    # Resolve the actual domain SID, including renamed AD domains. Built-in
+    # Administrators includes delegated local admins; Domain Admins is explicit.
+    $domainName = [string]$computer.Domain
+    $domainAdmins = (New-Object Security.Principal.NTAccount($domainName, 'Domain Admins')).Translate(
+        [Security.Principal.SecurityIdentifier]).Value
+    if ($domainAdmins -notmatch '-512$') { throw 'Resolved Domain Admins SID did not end in RID 512.' }
+    $sddl = "O:BAG:BAD:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GA;;;$domainAdmins)"
+
+    $changes = New-Object System.Collections.Generic.List[string]
+    $restartRequired = $false
+    $winrmRestarted = $false
+
+    # Refuse to expose the listener if the built-in PowerShell endpoints cannot
+    # be restricted. WinRM transport alone is not an authorization boundary.
+    $winrm = Get-Service -Name WinRM -ErrorAction Stop
+    $winrmConfig = Get-CimInstance -ClassName Win32_Service -Filter "Name='WinRM'" -ErrorAction Stop
+    $listeners = @(Get-ChildItem -Path 'WSMan:\localhost\Listener' -ErrorAction SilentlyContinue)
+
+    if ($listeners.Count -eq 0) {
+        Enable-PSRemoting -Force -ErrorAction Stop | Out-Null
+        $changes.Add('Created a WinRM listener and enabled PowerShell remoting.') | Out-Null
+        $restartRequired = $true
+    }
+
+    if ([string]$winrmConfig.StartMode -ne 'Auto') {
+        Set-Service -Name WinRM -StartupType Automatic -ErrorAction Stop
+        $changes.Add('Set the WinRM service startup type to Automatic.') | Out-Null
+        $restartRequired = $true
+    }
+
+    $winrm = Get-Service -Name WinRM -ErrorAction Stop
+    if ($winrm.Status -ne 'Running') {
+        Start-Service -Name WinRM -ErrorAction Stop
+        $changes.Add('Started the WinRM service.') | Out-Null
+    }
+
+    $basicAuth = [string](Get-Item -Path 'WSMan:\localhost\Service\Auth\Basic' -ErrorAction Stop).Value
+    if ($basicAuth -notmatch '^(?i:false|0)$') {
+        Set-Item -Path 'WSMan:\localhost\Service\Auth\Basic' -Value $false -ErrorAction Stop
+        $changes.Add('Disabled WinRM Basic authentication.') | Out-Null
+        $restartRequired = $true
+    }
+
+    $allowUnencrypted = [string](Get-Item -Path 'WSMan:\localhost\Service\AllowUnencrypted' -ErrorAction Stop).Value
+    if ($allowUnencrypted -notmatch '^(?i:false|0)$') {
+        Set-Item -Path 'WSMan:\localhost\Service\AllowUnencrypted' -Value $false -ErrorAction Stop
+        $changes.Add('Disabled unencrypted WinRM traffic.') | Out-Null
+        $restartRequired = $true
+    }
+    $endpoints = @(Get-PSSessionConfiguration -ErrorAction Stop | Where-Object {
+        $_.Name -in @('Microsoft.PowerShell', 'Microsoft.PowerShell32', 'Microsoft.PowerShell.Workflow')
+    })
+    if (-not ($endpoints.Name -contains 'Microsoft.PowerShell')) { throw 'Default Microsoft.PowerShell session endpoint missing.' }
+    foreach ($endpoint in $endpoints) {
+        if ([string]$endpoint.SecurityDescriptorSddl -ne $sddl) {
+            Set-PSSessionConfiguration -Name $endpoint.Name -SecurityDescriptorSddl $sddl `
+                -Force -NoServiceRestart -ErrorAction Stop | Out-Null
+            $changes.Add("Restricted WinRM endpoint '$($endpoint.Name)' to SYSTEM, local Administrators, and Domain Admins.") | Out-Null
+            $restartRequired = $true
+        }
+    }
+    foreach ($endpoint in $endpoints) {
+        $verified = Get-PSSessionConfiguration -Name $endpoint.Name -ErrorAction Stop
+        $verifiedSddl = [string]$verified.SecurityDescriptorSddl
+        if ($verifiedSddl -notmatch [regex]::Escape($domainAdmins) -or
+            $verifiedSddl -notmatch '\(A;;GA;;;BA\)' -or
+            $verifiedSddl -notmatch '\(A;;GA;;;SY\)') {
+            throw "WinRM endpoint '$($endpoint.Name)' did not retain the restricted security descriptor."
+        }
+    }
+
+    # The built-in client WinRM HTTP rule is limited to the authenticated
+    # domain profile. Explicitly disable the public-profile rule if present.
+    $httpRule = Get-NetFirewallRule -Name 'WINRM-HTTP-In-TCP' -ErrorAction Stop
+    if ([string]$httpRule.Enabled -ne 'True' -or [string]$httpRule.Profile -ne 'Domain') {
+        Set-NetFirewallRule -Name $httpRule.Name -Enabled True -Profile Domain -ErrorAction Stop
+        $changes.Add('Enabled the WinRM HTTP firewall rule for the Domain profile only.') | Out-Null
+        $restartRequired = $true
+    }
+
+    $publicRule = Get-NetFirewallRule -Name 'WINRM-HTTP-In-TCP-PUBLIC' -ErrorAction SilentlyContinue
+    if ($publicRule -and [string]$publicRule.Enabled -ne 'False') {
+        Set-NetFirewallRule -Name $publicRule.Name -Enabled False -ErrorAction Stop
+        $changes.Add('Disabled the WinRM public-profile firewall rule.') | Out-Null
+        $restartRequired = $true
+    }
+
+    if ($restartRequired) {
+        Restart-Service -Name WinRM -Force -ErrorAction Stop
+        $winrmRestarted = $true
+        $changes.Add('Restarted the WinRM service after applying configuration changes.') | Out-Null
+        Write-Log -Level 'INFO' -Message ('WinRM configuration updated: {0}' -f ($changes -join ' '))
+    } else {
+        Write-Log -Level 'INFO' -Message 'WinRM is already configured correctly; no configuration changes or service restart were required.'
+    }
+
+    $effective = Get-NetFirewallRule -Name $httpRule.Name -ErrorAction Stop
+    if ([string]$effective.Enabled -ne 'True' -or [string]$effective.Profile -ne 'Domain') {
+        throw 'WinRM Domain firewall rule did not verify after configuration.'
+    }
+
+    $verifiedBasicAuth = [string](Get-Item -Path 'WSMan:\localhost\Service\Auth\Basic' -ErrorAction Stop).Value
+    $verifiedAllowUnencrypted = [string](Get-Item -Path 'WSMan:\localhost\Service\AllowUnencrypted' -ErrorAction Stop).Value
+    if ($verifiedBasicAuth -notmatch '^(?i:false|0)$' -or $verifiedAllowUnencrypted -notmatch '^(?i:false|0)$') {
+        throw 'WinRM authentication or encryption settings did not verify after configuration.'
+    }
+
+    $verifiedService = Get-Service -Name WinRM -ErrorAction Stop
+    $verifiedServiceConfig = Get-CimInstance -ClassName Win32_Service -Filter "Name='WinRM'" -ErrorAction Stop
+    if ($verifiedService.Status -ne 'Running' -or [string]$verifiedServiceConfig.StartMode -ne 'Auto') {
+        throw 'WinRM service state or startup mode did not verify after configuration.'
+    }
+    return [pscustomobject]@{
+        Status = if ($restartRequired) { 'Updated' } else { 'AlreadyConfigured' }
+        ConfigurationChanged = [bool]$restartRequired
+        WinRMRestarted = [bool]$winrmRestarted
+        Changes = New-StringArrayForJson -InputObject $changes
+        Domain = $domainName
+        ServiceStatus = [string]$verifiedService.Status
+        ServiceStartMode = [string]$verifiedServiceConfig.StartMode
+        FirewallProfile = 'Domain'
+        AllowedPrincipals = 'SYSTEM; BUILTIN\\Administrators; Domain Admins'
+        EndpointCount = $endpoints.Count
+    }
+}
+
+function Save-LocalAutopilotHardwareHash {
+    $detail = Get-CimInstance -Namespace 'root/cimv2/mdm/dmmap' -ClassName MDM_DevDetail_Ext01 `
+        -Filter "InstanceID='Ext' AND ParentID='./DevDetail'" -ErrorAction Stop |
+        Select-Object -First 1
+    $hash = [string]$detail.DeviceHardwareData
+    if ([string]::IsNullOrWhiteSpace($hash) -or $hash.Length -lt 100 -or
+        $hash -notmatch '^[A-Za-z0-9+/=]+$') { throw 'Autopilot hardware hash is missing or malformed.' }
+    $null = [Convert]::FromBase64String($hash)
+    $serial = [string](Get-CimInstance -ClassName Win32_BIOS -ErrorAction Stop).SerialNumber
+    if ([string]::IsNullOrWhiteSpace($serial)) { throw 'BIOS serial number is missing.' }
+
+    Ensure-Directory -Path $AutopilotHashDirectory
+    # Remove all existing allow entries, including explicit entries left by a
+    # prior deployment. Only SYSTEM and built-in Administrators retain access.
+    $acl = Get-Acl -LiteralPath $AutopilotHashDirectory -ErrorAction Stop
+    $acl.SetAccessRuleProtection($true, $false)
+    foreach ($rule in @($acl.GetAccessRules($true, $true, [Security.Principal.SecurityIdentifier]))) {
+        $acl.RemoveAccessRuleSpecific($rule)
+    }
+    foreach ($sid in @('S-1-5-18', 'S-1-5-32-544')) {
+        $identity = New-Object Security.Principal.SecurityIdentifier($sid)
+        $rule = [Security.AccessControl.FileSystemAccessRule]::new(
+            $identity,
+            [Security.AccessControl.FileSystemRights]::FullControl,
+            ([Security.AccessControl.InheritanceFlags]::ContainerInherit -bor [Security.AccessControl.InheritanceFlags]::ObjectInherit),
+            [Security.AccessControl.PropagationFlags]::None,
+            [Security.AccessControl.AccessControlType]::Allow)
+        $acl.AddAccessRule($rule)
+    }
+    Set-Acl -LiteralPath $AutopilotHashDirectory -AclObject $acl -ErrorAction Stop
+    $path = Join-Path $AutopilotHashDirectory ("{0}-Autopilot.csv" -f $env:COMPUTERNAME)
+    $temporary = Join-Path $AutopilotHashDirectory ("{0}.tmp" -f ([guid]::NewGuid().ToString('N')))
+    try {
+        [pscustomobject][ordered]@{
+            'Device Serial Number' = $serial
+            'Windows Product ID' = ''
+            'Hardware Hash' = $hash
+            'Group Tag' = ''
+            'Assigned User' = ''
+        } | Export-Csv -LiteralPath $temporary -NoTypeInformation -Encoding UTF8 -ErrorAction Stop
+        if (Test-Path -LiteralPath $path -PathType Leaf) {
+            Remove-Item -LiteralPath $path -Force -ErrorAction Stop
+        }
+        Move-Item -LiteralPath $temporary -Destination $path -Force -ErrorAction Stop
+    }
+    finally { Remove-Item -LiteralPath $temporary -Force -ErrorAction SilentlyContinue }
+    $csv = @(Import-Csv -LiteralPath $path -ErrorAction Stop)
+    if ($csv.Count -ne 1 -or $csv[0].'Device Serial Number' -ne $serial -or
+        $csv[0].'Hardware Hash' -ne $hash) { throw 'Autopilot CSV verification failed.' }
+    return [pscustomobject]@{ Status = 'Saved'; Path = $path; SerialNumber = $serial; HashLength = $hash.Length }
+}
+
+function Convert-HPWarrantyDate {
+    [CmdletBinding()]
+    param([AllowNull()]$Value)
+
+    if ($null -eq $Value) { return $null }
+    if ($Value -is [datetime]) { return [datetime]$Value }
+
+    $text = ([string]$Value).Trim()
+    if ([string]::IsNullOrWhiteSpace($text)) { return $null }
+
+    if ($text -match '^\d{14}\.\d{6}[+-]\d{3}$') {
+        try { return [Management.ManagementDateTimeConverter]::ToDateTime($text) } catch { }
+    }
+
+    $parsed = [datetime]::MinValue
+    if ([datetime]::TryParse($text, [ref]$parsed)) { return $parsed }
+    return $null
+}
+
+function Get-HPWarrantyHealth {
+    [CmdletBinding()]
+    param([AllowNull()]$Identity)
+
+    $manufacturer = if ($Identity) { [string]$Identity.Manufacturer } else {
+        [string](Get-CimInstance -ClassName Win32_ComputerSystem -ErrorAction Stop).Manufacturer
+    }
+
+    $result = [ordered]@{
+        Applicable                 = $false
+        Provider                   = $null
+        Manufacturer               = $manufacturer
+        LookupStatus               = 'NotApplicable'
+        LookupAttempted            = $false
+        LookupDelaySeconds         = 0
+        LookupError                = $null
+        ClientModuleVersion        = $null
+        DataSource                 = $null
+        CacheFresh                 = $false
+        CacheAgeDays               = $null
+        LastCheckedUtc             = $null
+        SerialNumber               = $null
+        ProductNumber              = $null
+        Status                     = $null
+        State                      = $null
+        StatusCode                 = $null
+        StatusDetail               = $null
+        Caption                    = $null
+        WarrantyType               = $null
+        WarrantyTypeDescription    = $null
+        WarrantyStartDate          = $null
+        WarrantyEndDate            = $null
+        WarrantyDaysRemaining      = $null
+        HardwareCarePackEndDate    = $null
+        SoftwareCarePackEndDate    = $null
+        ServiceType                = $null
+        OnSite                     = $null
+        Countries                  = $null
+        ServiceLevelJson           = $null
+        DeliverablesJson           = $null
+        ActiveEntitlementCount     = 0
+        ExpiredEntitlementCount    = 0
+        OtherEntitlementCount      = 0
+        Entitlements               = [object[]]@()
+    }
+
+    if ($manufacturer -notmatch '(?i)^(HP|Hewlett-Packard)') {
+        return [pscustomobject]$result
+    }
+
+    $result.Applicable = $true
+    $result.Provider = 'HP CMSL'
+    $namespace = 'root/HP/InstrumentedServices/v1'
+    $availableModule = Get-Module -ListAvailable -Name HPCMSL -ErrorAction SilentlyContinue |
+        Sort-Object Version -Descending |
+        Select-Object -First 1
+    if ($availableModule) { $result.ClientModuleVersion = [string]$availableModule.Version }
+
+    $warrantyRows = @()
+    try {
+        $warrantyRows = @(Get-CimInstance -Namespace $namespace -ClassName HP_Warranty -ErrorAction Stop)
+    } catch {
+        Write-Log -Level 'INFO' -Message ('No readable HP warranty cache was found: {0}' -f $_.Exception.Message)
+    }
+
+    $warranty = $warrantyRows | Select-Object -First 1
+    $lastCheck = if ($warranty) {
+        Convert-HPWarrantyDate -Value (Get-ObjectPropertyValueSafe -InputObject $warranty -Name 'LastCMSLCheck')
+    } else { $null }
+
+    if ($lastCheck) {
+        $result.CacheAgeDays = [math]::Round([math]::Max(0, ((Get-Date) - $lastCheck).TotalDays), 2)
+        $result.LastCheckedUtc = $lastCheck.ToUniversalTime().ToString('o')
+    }
+
+    $cacheFresh = ($null -ne $warranty -and $null -ne $lastCheck -and
+        $result.CacheAgeDays -le $HPWarrantyCacheMaxAgeDays)
+    $result.CacheFresh = [bool]$cacheFresh
+
+    if ($cacheFresh) {
+        $result.LookupStatus = 'CacheFresh'
+        $result.DataSource = 'HP WMI cache'
+    }
+    else {
+        $warrantyCommand = Get-Command -Name Get-HPWarrantyInfo -ErrorAction SilentlyContinue
+        if (-not $warrantyCommand) {
+            try {
+                Import-Module -Name HPCMSL -Force -ErrorAction Stop
+                $warrantyCommand = Get-Command -Name Get-HPWarrantyInfo -ErrorAction Stop
+                $loadedModule = Get-Module -Name HPCMSL | Sort-Object Version -Descending | Select-Object -First 1
+                if ($loadedModule) { $result.ClientModuleVersion = [string]$loadedModule.Version }
+            }
+            catch {
+                $result.LookupError = $_.Exception.Message
+            }
+        }
+
+        if ($warrantyCommand) {
+            $result.LookupAttempted = $true
+
+            if ($HPWarrantyLookupStaggerMaxSeconds -gt 0) {
+                $sha256 = [Security.Cryptography.SHA256]::Create()
+                try {
+                    $nameBytes = [Text.Encoding]::UTF8.GetBytes([string]$env:COMPUTERNAME)
+                    $nameHash = $sha256.ComputeHash($nameBytes)
+                    $delaySeconds = [int]([BitConverter]::ToUInt32($nameHash, 0) %
+                        ([uint32]$HPWarrantyLookupStaggerMaxSeconds + 1))
+                }
+                finally { $sha256.Dispose() }
+
+                $result.LookupDelaySeconds = $delaySeconds
+                if ($delaySeconds -gt 0) {
+                    Write-Log -Level 'INFO' -Message ("HP warranty cache is missing or stale; staggering lookup by {0} second(s)." -f $delaySeconds)
+                    Start-Sleep -Seconds $delaySeconds
+                }
+            }
+
+            try {
+                Get-HPWarrantyInfo -ErrorAction Stop | Out-Null
+                $warrantyRows = @(Get-CimInstance -Namespace $namespace -ClassName HP_Warranty -ErrorAction Stop)
+                $warranty = $warrantyRows | Select-Object -First 1
+                if (-not $warranty) { throw 'HPCMSL completed without creating an HP_Warranty record.' }
+
+                $lastCheck = Convert-HPWarrantyDate -Value (
+                    Get-ObjectPropertyValueSafe -InputObject $warranty -Name 'LastCMSLCheck')
+                if ($lastCheck) {
+                    $result.CacheAgeDays = [math]::Round([math]::Max(0, ((Get-Date) - $lastCheck).TotalDays), 2)
+                    $result.LastCheckedUtc = $lastCheck.ToUniversalTime().ToString('o')
+                }
+                $result.CacheFresh = $true
+                $result.LookupStatus = 'Refreshed'
+                $result.DataSource = 'HP CMSL refresh'
+                $result.LookupError = $null
+            }
+            catch {
+                $result.LookupError = $_.Exception.Message
+                if ($warranty) {
+                    $result.LookupStatus = 'RefreshFailedUsingStaleCache'
+                    $result.DataSource = 'Stale HP WMI cache'
+                }
+                else {
+                    $result.LookupStatus = 'RefreshFailed'
+                }
+                Write-Log -Level 'WARN' -Message ('HP warranty refresh failed without stopping endpoint inventory: {0}' -f $result.LookupError)
+            }
+        }
+        elseif ($warranty) {
+            $result.LookupStatus = 'ModuleUnavailableUsingStaleCache'
+            $result.DataSource = 'Stale HP WMI cache'
+            Write-Log -Level 'WARN' -Message ('HPCMSL is unavailable; using stale HP warranty data. {0}' -f $result.LookupError)
+        }
+        else {
+            $result.LookupStatus = 'ModuleUnavailable'
+            Write-Log -Level 'WARN' -Message ('HP warranty data was not collected because HPCMSL is unavailable. {0}' -f $result.LookupError)
+        }
+    }
+
+    if (-not $warranty) {
+        Add-Finding -Severity 'Info' -Category 'Lifecycle' -Check 'HPWarrantyLookup' `
+            -Message ('HP warranty information is unavailable. LookupStatus={0}.' -f $result.LookupStatus) `
+            -Value $result.LookupStatus
+        return [pscustomobject]$result
+    }
+
+    $warrantyStart = Convert-HPWarrantyDate -Value (
+        Get-ObjectPropertyValueSafe -InputObject $warranty -Name 'WarrantyStartDate')
+    $warrantyEnd = Convert-HPWarrantyDate -Value (
+        Get-ObjectPropertyValueSafe -InputObject $warranty -Name 'WarrantyEndDate')
+    $hardwareCarePackEnd = Convert-HPWarrantyDate -Value (
+        Get-ObjectPropertyValueSafe -InputObject $warranty -Name 'HardwareCarePackEndDate')
+    $softwareCarePackEnd = Convert-HPWarrantyDate -Value (
+        Get-ObjectPropertyValueSafe -InputObject $warranty -Name 'SoftwareCarePackEndDate')
+
+    $result.SerialNumber = [string](Get-ObjectPropertyValueSafe -InputObject $warranty -Name 'SerialNumber')
+    $result.ProductNumber = [string](Get-ObjectPropertyValueSafe -InputObject $warranty -Name 'ProductNumber')
+    $result.Status = [string](Get-ObjectPropertyValueSafe -InputObject $warranty -Name 'Status')
+    $result.State = [string](Get-ObjectPropertyValueSafe -InputObject $warranty -Name 'State')
+    $result.StatusCode = Get-ObjectPropertyValueSafe -InputObject $warranty -Name 'StatusCode'
+    $result.StatusDetail = [string](Get-ObjectPropertyValueSafe -InputObject $warranty -Name 'StatusDetail')
+    $result.Caption = [string](Get-ObjectPropertyValueSafe -InputObject $warranty -Name 'Caption')
+    $result.WarrantyType = Get-ObjectPropertyValueSafe -InputObject $warranty -Name 'WarrantyType'
+    $result.WarrantyTypeDescription = [string](Get-ObjectPropertyValueSafe -InputObject $warranty -Name 'WarrantyTypeDescription')
+    $result.WarrantyStartDate = if ($warrantyStart) { $warrantyStart.ToString('yyyy-MM-dd') } else { $null }
+    $result.WarrantyEndDate = if ($warrantyEnd) { $warrantyEnd.ToString('yyyy-MM-dd') } else { $null }
+    $result.WarrantyDaysRemaining = if ($warrantyEnd) {
+        [int][math]::Floor(($warrantyEnd.Date - (Get-Date).Date).TotalDays)
+    } else { $null }
+    $result.HardwareCarePackEndDate = if ($hardwareCarePackEnd) { $hardwareCarePackEnd.ToString('yyyy-MM-dd') } else { $null }
+    $result.SoftwareCarePackEndDate = if ($softwareCarePackEnd) { $softwareCarePackEnd.ToString('yyyy-MM-dd') } else { $null }
+    $result.ServiceType = [string](Get-ObjectPropertyValueSafe -InputObject $warranty -Name 'ServiceType')
+    $onSiteValue = Get-ObjectPropertyValueSafe -InputObject $warranty -Name 'OnSite'
+    $result.OnSite = if ($null -eq $onSiteValue) { $null } else {
+        ([string]$onSiteValue -match '^(?i:true|1)$')
+    }
+    $result.Countries = [string](Get-ObjectPropertyValueSafe -InputObject $warranty -Name 'Countries')
+    $result.ServiceLevelJson = [string](Get-ObjectPropertyValueSafe -InputObject $warranty -Name 'ServiceLevel')
+    $result.DeliverablesJson = [string](Get-ObjectPropertyValueSafe -InputObject $warranty -Name 'Deliverables')
+
+    $entitlementRows = @()
+    try {
+        $entitlementRows = @(Get-CimInstance -Namespace $namespace -ClassName HP_Entitlements -ErrorAction Stop)
+    }
+    catch {
+        Write-Log -Level 'WARN' -Message ('HP warranty summary was collected, but entitlement details could not be read: {0}' -f $_.Exception.Message)
+    }
+
+    $entitlements = @(
+        foreach ($entitlement in $entitlementRows) {
+            $entitlementStart = Convert-HPWarrantyDate -Value (
+                Get-ObjectPropertyValueSafe -InputObject $entitlement -Name 'WarrantyStartDate')
+            $entitlementEnd = Convert-HPWarrantyDate -Value (
+                Get-ObjectPropertyValueSafe -InputObject $entitlement -Name 'WarrantyEndDate')
+
+            [pscustomobject][ordered]@{
+                Status                  = [string](Get-ObjectPropertyValueSafe -InputObject $entitlement -Name 'Status')
+                StatusCode              = Get-ObjectPropertyValueSafe -InputObject $entitlement -Name 'StatusCode'
+                Caption                 = [string](Get-ObjectPropertyValueSafe -InputObject $entitlement -Name 'Caption')
+                ServiceType             = [string](Get-ObjectPropertyValueSafe -InputObject $entitlement -Name 'ServiceType')
+                WarrantyType            = Get-ObjectPropertyValueSafe -InputObject $entitlement -Name 'WarrantyType'
+                WarrantyTypeDescription = [string](Get-ObjectPropertyValueSafe -InputObject $entitlement -Name 'WarrantyTypeDescription')
+                WarrantyStartDate       = if ($entitlementStart) { $entitlementStart.ToString('yyyy-MM-dd') } else { $null }
+                WarrantyEndDate         = if ($entitlementEnd) { $entitlementEnd.ToString('yyyy-MM-dd') } else { $null }
+                ServiceLevelJson        = [string](Get-ObjectPropertyValueSafe -InputObject $entitlement -Name 'ServiceLevel')
+                DeliverablesJson        = [string](Get-ObjectPropertyValueSafe -InputObject $entitlement -Name 'Deliverables')
+            }
+        }
+    )
+
+    $result.Entitlements = New-ObjectArrayForJson -InputObject $entitlements
+    $result.ActiveEntitlementCount = @($entitlements | Where-Object Status -eq 'Active').Count
+    $result.ExpiredEntitlementCount = @($entitlements | Where-Object Status -eq 'Expired').Count
+    $result.OtherEntitlementCount = $entitlements.Count -
+        $result.ActiveEntitlementCount - $result.ExpiredEntitlementCount
+
+    $findingDetails = [pscustomobject][ordered]@{
+        Provider              = $result.Provider
+        LookupStatus          = $result.LookupStatus
+        Status                = $result.Status
+        StatusDetail          = $result.StatusDetail
+        WarrantyEndDate       = $result.WarrantyEndDate
+        WarrantyDaysRemaining = $result.WarrantyDaysRemaining
+        ServiceType           = $result.ServiceType
+    }
+
+    if ($result.Status -eq 'Active' -and
+        ($null -eq $result.WarrantyDaysRemaining -or
+         $result.WarrantyDaysRemaining -gt $HPWarrantyExpirationWarningDays)) {
+        Add-Finding -Severity 'Healthy' -Category 'Lifecycle' -Check 'HPWarrantyStatus' `
+            -Message ('HP warranty is active through {0}.' -f $result.WarrantyEndDate) `
+            -Value $result.Status -Details $findingDetails
+    }
+    elseif ($result.Status -eq 'Active' -and $result.WarrantyDaysRemaining -ge 0) {
+        Add-Finding -Severity 'Warning' -Category 'Lifecycle' -Check 'HPWarrantyExpiring' `
+            -Message ('HP warranty expires in {0} day(s) on {1}.' -f $result.WarrantyDaysRemaining, $result.WarrantyEndDate) `
+            -Value $result.WarrantyDaysRemaining -Details $findingDetails
+    }
+    elseif ($result.Status -eq 'Expired' -or
+            ($null -ne $result.WarrantyDaysRemaining -and $result.WarrantyDaysRemaining -lt 0)) {
+        Add-Finding -Severity 'Warning' -Category 'Lifecycle' -Check 'HPWarrantyExpired' `
+            -Message ('HP warranty expired on {0}.' -f $result.WarrantyEndDate) `
+            -Value $result.WarrantyDaysRemaining -Details $findingDetails
+    }
+    else {
+        Add-Finding -Severity 'Info' -Category 'Lifecycle' -Check 'HPWarrantyStatus' `
+            -Message ('HP warranty status is {0}. {1}' -f $result.Status, $result.StatusDetail) `
+            -Value $result.Status -Details $findingDetails
+    }
+
+    return [pscustomobject]$result
+}
+
 function Write-RemediationCandidateTelemetry {
     param(
         [Parameter(Mandatory)]$Candidate,
@@ -3143,7 +4375,12 @@ Write-Log -Message ("Active staged text log: {0}" -f $script:LogPath)
 Write-Log -Message ("Completed text log publish path: {0}" -f $script:PublishedLogPath)
 
 $healthBaseline  = Get-OptionalHealthBaseline
+$remoteAccess    = Invoke-Collector -Name 'RestrictedWinRM' -ScriptBlock { Initialize-RestrictedWinRM }
+$autopilotHash   = Invoke-Collector -Name 'LocalAutopilotHardwareHash' -ScriptBlock { Save-LocalAutopilotHardwareHash }
 $identity        = Invoke-Collector -Name 'ComputerIdentity'       -ScriptBlock { Get-ComputerIdentity }
+$biosSettings    = Invoke-Collector -Name 'BIOSSettingsInventory'  -ScriptBlock { Get-VendorBiosSettingsInventory -Identity $identity }
+$biosUpdateEvidence = Invoke-Collector -Name 'BIOSUpdateEvidence'  -ScriptBlock { Get-VendorBiosUpdateEvidence -Identity $identity }
+$hpWarranty      = Invoke-Collector -Name 'HPWarranty'             -ScriptBlock { Get-HPWarrantyHealth -Identity $identity }
 $hardware        = Invoke-Collector -Name 'HardwareInventory'      -ScriptBlock { Get-HardwareInventory }
 $battery         = Invoke-Collector -Name 'BatteryHealth'          -ScriptBlock { Get-BatteryHealth }
 $operatingSystem = Invoke-Collector -Name 'OperatingSystem'       -ScriptBlock { Get-OperatingSystemHealth }
@@ -3167,6 +4404,9 @@ $services        = Invoke-Collector -Name 'Services'              -ScriptBlock {
 $scheduledTasks  = Invoke-Collector -Name 'MaintenanceTasks'      -ScriptBlock { Get-MaintenanceScheduledTaskHealth }
 $agents          = Invoke-Collector -Name 'ManagementAgents'      -ScriptBlock { Get-ManagementAgentHealth }
 $edge            = Invoke-Collector -Name 'MicrosoftEdge'         -ScriptBlock { Get-EdgeHealth }
+$softwareInventory = Invoke-Collector -Name 'InstalledSoftware'   -ScriptBlock {
+    Get-InstalledSoftwareInventory -PolicyPath $SoftwareInventoryPolicyPath -SnapshotPath $SoftwareInventorySnapshotPath
+}
 
 $summary = Get-HealthSummary
 Write-HealthSnapshotSummary -OperatingSystem $operatingSystem -Performance $performance -Storage $storage `
@@ -3189,6 +4429,18 @@ if ($hardware) {
         $(if ($storage) { $storage.PrimaryDiskModel } else { $null }),
         $(if ($storage) { $storage.PrimaryDiskBusType } else { $null }),
         $(if ($storage) { $storage.PrimaryDiskSizeGB } else { $null }))
+}
+
+if ($softwareInventory) {
+    Write-Log -Message ("Software inventory summary: Current={0}; NewlyDetected={1}; Updated={2}; Unchanged={3}; Removed={4}; Events={5}; Policy={6}; PolicySource={7}." -f `
+        $softwareInventory.Summary.CurrentPackageCount,
+        $softwareInventory.Summary.InstalledCount,
+        $softwareInventory.Summary.UpdatedCount,
+        $softwareInventory.Summary.PresentCount,
+        $softwareInventory.Summary.RemovedCount,
+        $softwareInventory.Summary.EventCount,
+        $softwareInventory.Summary.PolicyVersion,
+        $softwareInventory.Summary.PolicySource)
 }
 
 $endTime = Get-Date
@@ -3258,6 +4510,11 @@ $event = [ordered]@{
         OldDriverCount = if ($drivers) { $drivers.OldDriverCount } else { $null }
         BiosAgeDays = if ($biosCurrency) { $biosCurrency.AgeDays } else { $null }
         BiosBaselineCompliant = if ($biosCurrency) { $biosCurrency.BaselineCompliant } else { $null }
+        WarrantyApplicable = if ($hpWarranty) { $hpWarranty.Applicable } else { $null }
+        WarrantyProvider = if ($hpWarranty) { $hpWarranty.Provider } else { $null }
+        WarrantyLookupStatus = if ($hpWarranty) { $hpWarranty.LookupStatus } else { $null }
+        WarrantyStatus = if ($hpWarranty) { $hpWarranty.Status } else { $null }
+        WarrantyDaysRemaining = if ($hpWarranty) { $hpWarranty.WarrantyDaysRemaining } else { $null }
         WindowsLicensed = if ($activation) { $activation.WindowsLicensed } else { $null }
         OfficeLicensed = if ($activation) { $activation.OfficeLicensed } else { $null }
         HoursSinceLastTimeSync = if ($timeSync) { $timeSync.HoursSinceLastSync } else { $null }
@@ -3282,14 +4539,29 @@ $event = [ordered]@{
         HealthWarningCount = $summary.WarningCount
         HealthCriticalCount = $summary.CriticalCount
         CollectorFailureCount = $failedCollectors
+        InstalledSoftwareCount = if ($softwareInventory) { $softwareInventory.Summary.CurrentPackageCount } else { $null }
+        SoftwareInstalledSincePreviousCount = if ($softwareInventory) { $softwareInventory.Summary.InstalledCount } else { $null }
+        SoftwareUpdatedSincePreviousCount = if ($softwareInventory) { $softwareInventory.Summary.UpdatedCount } else { $null }
+        SoftwareRemovedSincePreviousCount = if ($softwareInventory) { $softwareInventory.Summary.RemovedCount } else { $null }
+        BIOSSettingsCollectionStatus = if ($biosSettings) { $biosSettings.Status } else { $null }
+        BIOSSettingsCount = if ($biosSettings) { $biosSettings.SettingsCount } else { $null }
+        BIOSUpdateAvailable = if ($biosUpdateEvidence) { $biosUpdateEvidence.UpdateAvailable } else { $null }
+        BIOSAvailableVersions = if ($biosUpdateEvidence) { New-StringArrayForJson -InputObject $biosUpdateEvidence.AvailableVersions } else { [object[]]@() }
     }
 
     HealthSummary = $summary
     Identity      = $identity
     Hardware      = $hardware
+    RemoteAccess  = $remoteAccess
+    AutopilotHash = $autopilotHash
+    Lifecycle     = [ordered]@{
+        Warranty = $hpWarranty
+    }
     Battery       = $battery
     Firmware      = [ordered]@{
         BIOSCurrency = $biosCurrency
+        BIOSSettings = $biosSettings
+        VendorUpdateEvidence = $biosUpdateEvidence
     }
     Drivers       = $drivers
     OperatingSystem = $operatingSystem
@@ -3315,6 +4587,7 @@ $event = [ordered]@{
     ManagementAgents = $agents
     Applications   = [ordered]@{
         MicrosoftEdge = $edge
+        SoftwareInventory = if ($softwareInventory) { $softwareInventory.Summary } else { $null }
     }
     Collectors    = New-ObjectArrayForJson -InputObject $script:CollectorResults
     Baseline      = [ordered]@{
@@ -3339,6 +4612,12 @@ try {
         $remediationCandidates.Count)
 
     Write-Telemetry -Event $event
+
+    if ($softwareInventory) {
+        Write-SoftwareInventoryTelemetry -Inventory $softwareInventory -EventTime $endTime -Identity $identity
+        Write-Log -Message ("Published {0} endpoint.software event(s) and updated snapshot '{1}'." -f `
+            $softwareInventory.Summary.EventCount, $SoftwareInventorySnapshotPath)
+    }
 
     $actionableFindings = @($summary.Findings | Where-Object { $_.Severity -in @('Warning','Critical') })
     for ($findingIndex = 0; $findingIndex -lt $actionableFindings.Count; $findingIndex++) {

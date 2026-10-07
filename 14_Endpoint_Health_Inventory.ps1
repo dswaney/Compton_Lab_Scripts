@@ -36,12 +36,39 @@
     C:\ProgramData\Compton\Autopilot\<COMPUTERNAME>-Autopilot.csv
     C:\ProgramData\Compton\Inventory\SoftwareInventory.latest.json
     C:\ProgramData\Compton\Inventory\BIOSSettings.latest.json
+    C:\ProgramData\Compton\Inventory\HPWarranty.latest.json
+    C:\ProgramData\Compton\Inventory\DellWarranty.latest.json
 
 .NOTES
     ScriptName:    14_Endpoint_Health_Inventory.ps1
-    ScriptVersion: 1.8.0
-    LastUpdated:   2026-09-24
-    Changes:       v1.8.0 inventories supported HP and Dell BIOS settings as normalized
+    ScriptVersion: 1.9.0
+    LastUpdated:   2026-10-06
+    Changes:       v1.9.0 adds Dell TechDirect warranty collection with a serial-bound,
+                   persistent local snapshot. HP and Dell now publish the same normalized
+                   warranty fields, while Dell API credentials remain outside logs,
+                   snapshots, and telemetry.
+                   v1.8.5 hardens software-removal tombstones. Snapshot comparison
+                   is reset safely when the snapshot belongs to another computer or
+                   uses a different inventory policy, preventing false uninstall
+                   events. Removed records now include removal time/reason and the
+                   previous inventory RunId needed by current-state transforms.
+                   v1.8.4 safely reads EventData XML without relying on the optional
+                   '#text' adapter property and explicitly separates Edge/Copilot
+                   installer crashpad telemetry from genuine application crashes.
+                   These reports remain searchable as informational evidence but
+                   cannot create automatic repair candidates.
+                   v1.8.3 applies the hostname-derived HP warranty lookup stagger only
+                   on Sunday fleet runs; manual runs Monday through Saturday skip the
+                   delay while retaining the persistent one-time warranty snapshot.
+                   v1.8.2 suppresses the expected Set-PSSessionConfiguration restart
+                   warnings, performs and verifies one consolidated WinRM restart, and
+                   displays collector progress plus HP warranty stagger countdowns so
+                   long inventory operations do not appear to be hung.
+                   v1.8.1 saves the first successful HP warranty lookup as a persistent
+                   local snapshot and skips HP CMSL/WMI/network warranty collection on later
+                   runs unless -ForceHPWarrantyRefresh is explicitly supplied. First-time
+                   fleet lookups are distributed across a hostname-derived 60-minute window.
+                   v1.8.0 inventories supported HP and Dell BIOS settings as normalized
                    name/value rows, redacts password-related values, writes a local BIOS-settings
                    snapshot, and includes the settings and installed BIOS version in Elastic telemetry.
                    v1.7.1 makes scheduled-task action, network-adapter statistics, and driver-baseline
@@ -195,7 +222,7 @@ param(
     [int]$HPWarrantyCacheMaxAgeDays = 30,
 
     [ValidateRange(0, 3600)]
-    [int]$HPWarrantyLookupStaggerMaxSeconds = 900,
+    [int]$HPWarrantyLookupStaggerMaxSeconds = 3600,
 
     [ValidateRange(1, 730)]
     [int]$HPWarrantyExpirationWarningDays = 90,
@@ -206,6 +233,24 @@ param(
 
     [string]$BiosSettingsSnapshotPath = 'C:\ProgramData\Compton\Inventory\BIOSSettings.latest.json',
 
+    [string]$HPWarrantySnapshotPath = 'C:\ProgramData\Compton\Inventory\HPWarranty.latest.json',
+
+    [switch]$ForceHPWarrantyRefresh,
+
+    [string]$DellWarrantySnapshotPath = 'C:\ProgramData\Compton\Inventory\DellWarranty.latest.json',
+
+    [string]$DellTechDirectClientId = [Environment]::GetEnvironmentVariable('DELL_TECHDIRECT_CLIENT_ID', 'Machine'),
+
+    [string]$DellTechDirectClientSecret = [Environment]::GetEnvironmentVariable('DELL_TECHDIRECT_CLIENT_SECRET', 'Machine'),
+
+    [string]$DellTechDirectTokenUri = 'https://apigtwb2c.us.dell.com/auth/oauth/v2/token',
+
+    [string]$DellTechDirectEntitlementsUri = 'https://apigtwb2c.us.dell.com/PROD/sbil/eapi/v5/asset-entitlements',
+
+    [switch]$ForceDellWarrantyRefresh,
+
+    [switch]$ShowCollectorProgress = $true,
+
     [string]$HpBiosConfigShare = '\\filesvr\labscripts\HP_Bios_Config',
 
     [string]$DellCommandConfigureShare = '\\filesvr\labscripts\Dell\Command Configure'
@@ -215,7 +260,7 @@ Set-StrictMode -Version 2.0
 $ErrorActionPreference = 'Stop'
 
 $script:ScriptName       = '14_Endpoint_Health_Inventory.ps1'
-$script:ScriptVersion    = '1.8.0'
+$script:ScriptVersion    = '1.9.0'
 $script:RunId            = [guid]::NewGuid().Guid
 $script:StartTime        = Get-Date
 $script:WarningCount     = 0
@@ -244,7 +289,7 @@ $script:LogSession       = $null
 
 # Load the shared framework from the same directory as this script.
 $MaintenanceFrameworkPath = 'C:\Scripts\Maintenance.Framework.psm1'
-Import-Module -Name $MaintenanceFrameworkPath -Force -ErrorAction Stop
+Import-Module -Name $MaintenanceFrameworkPath -Force -DisableNameChecking -ErrorAction Stop
 $MaintenanceConfig = Initialize-MaintenanceEnvironment -ScriptRoot 'C:\Scripts' -LogRoot $LogDirectory
 
 $requiredFrameworkVersion = [version]'2.4.0'
@@ -305,6 +350,27 @@ function Write-Log {
     }
 
     Write-Verbose $line
+}
+
+function Write-CollectorProgress {
+    param(
+        [Parameter(Mandatory)][string]$Message,
+        [ValidateSet('INFO','SUCCESS','WARNING','ERROR')]
+        [string]$Level = 'INFO'
+    )
+
+    if (-not $ShowCollectorProgress) { return }
+
+    $timestamp = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss')
+    $computerName = if ($env:COMPUTERNAME) { $env:COMPUTERNAME } else { 'UNKNOWN' }
+    $line = '{0} [{1}] [{2}] {3}' -f $timestamp, $computerName, $Level, $Message
+    $color = switch ($Level) {
+        'SUCCESS' { 'Green' }
+        'WARNING' { 'Yellow' }
+        'ERROR'   { 'Red' }
+        default   { 'Cyan' }
+    }
+    Write-Host $line -ForegroundColor $color
 }
 
 
@@ -510,28 +576,33 @@ function Invoke-Collector {
     )
 
     $started = Get-Date
+    Write-CollectorProgress -Level 'INFO' -Message ("Starting collector: {0}" -f $Name)
     try {
         $data = & $ScriptBlock
+        $durationSeconds = [math]::Round(((Get-Date) - $started).TotalSeconds, 3)
         $result = [pscustomobject]@{
             Name            = $Name
             Status          = 'Success'
             StartTime       = $started.ToUniversalTime().ToString('o')
             EndTime         = (Get-Date).ToUniversalTime().ToString('o')
-            DurationSeconds = [math]::Round(((Get-Date) - $started).TotalSeconds, 3)
+            DurationSeconds = $durationSeconds
             Error           = $null
         }
         $script:CollectorResults.Add($result)
+        Write-CollectorProgress -Level 'SUCCESS' -Message ("Completed collector: {0}; DurationSeconds={1}" -f $Name, $durationSeconds)
         return $data
     } catch {
         $message = $_.Exception.Message
+        $durationSeconds = [math]::Round(((Get-Date) - $started).TotalSeconds, 3)
         Write-Log -Level 'ERROR' -Message ("Collector '{0}' failed: {1}" -f $Name, $message)
+        Write-CollectorProgress -Level 'ERROR' -Message ("Collector failed: {0}; DurationSeconds={1}; Error={2}" -f $Name, $durationSeconds, $message)
         Add-Finding -Severity 'Warning' -Category 'Collection' -Check $Name -Message $message
         $script:CollectorResults.Add([pscustomobject]@{
             Name            = $Name
             Status          = 'Failed'
             StartTime       = $started.ToUniversalTime().ToString('o')
             EndTime         = (Get-Date).ToUniversalTime().ToString('o')
-            DurationSeconds = [math]::Round(((Get-Date) - $started).TotalSeconds, 3)
+            DurationSeconds = $durationSeconds
             Error           = $message
         })
         return $null
@@ -926,6 +997,9 @@ function Get-InstalledSoftwareInventory {
                 SoftwareId       = $softwareId
                 Present          = $true
                 ChangeType       = $null
+                RemovalDetectedAt = $null
+                RemovalReason     = $null
+                PreviousInventoryRunId = $null
                 Name             = $displayName
                 CanonicalName    = $classification.CanonicalName
                 Version          = ([string](Get-ObjectPropertyValueSafe -InputObject $entry -Name 'DisplayVersion')).Trim()
@@ -957,15 +1031,41 @@ function Get-InstalledSoftwareInventory {
     [object[]]$currentPackages = @($packageById.Values | Sort-Object CanonicalName, Architecture, Scope)
     $previousPackages = @()
     $previousRunId = $null
+    $previousPolicyVersion = $null
+    $previousComputerName = $null
+    $comparisonStatus = 'NoPreviousSnapshot'
+    $comparisonResetReason = $null
     if (Test-Path -LiteralPath $SnapshotPath) {
         try {
             $previousSnapshot = Get-Content -LiteralPath $SnapshotPath -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
             $previousPackages = @((Get-ObjectPropertyValueSafe -InputObject $previousSnapshot -Name 'Packages'))
             $previousRunId = [string](Get-ObjectPropertyValueSafe -InputObject $previousSnapshot -Name 'InventoryRunId')
+            $previousPolicyVersion = [string](Get-ObjectPropertyValueSafe -InputObject $previousSnapshot -Name 'PolicyVersion')
+            $previousComputerName = [string](Get-ObjectPropertyValueSafe -InputObject $previousSnapshot -Name 'ComputerName')
+            $comparisonStatus = 'Comparable'
+
+            if (-not [string]::IsNullOrWhiteSpace($previousComputerName) -and
+                $previousComputerName -ine [string]$env:COMPUTERNAME) {
+                $comparisonResetReason = "SnapshotComputerMismatch:$previousComputerName"
+            }
+            elseif (-not [string]::IsNullOrWhiteSpace($previousPolicyVersion) -and
+                $previousPolicyVersion -ne [string](Get-ObjectPropertyValueSafe -InputObject $policy -Name 'PolicyVersion')) {
+                $comparisonResetReason = "PolicyVersionChanged:$previousPolicyVersion"
+            }
+
+            if (-not [string]::IsNullOrWhiteSpace($comparisonResetReason)) {
+                Write-Log -Level 'WARN' -Message ("Software comparison baseline was reset to prevent false removal events. Reason={0}; PreviousRunId={1}." -f
+                    $comparisonResetReason, $previousRunId)
+                $previousPackages = @()
+                $previousRunId = $null
+                $comparisonStatus = 'BaselineReset'
+            }
         }
         catch {
             Write-Log -Level 'WARN' -Message ("Previous software inventory snapshot could not be read and will be replaced after this successful run: {0}" -f $_.Exception.Message)
             $previousPackages = @()
+            $comparisonStatus = 'PreviousSnapshotUnreadable'
+            $comparisonResetReason = 'PreviousSnapshotUnreadable'
         }
     }
 
@@ -982,10 +1082,17 @@ function Get-InstalledSoftwareInventory {
         if (-not [string]::IsNullOrWhiteSpace($previousId)) { $previousById[$previousId] = $previous }
     }
 
+    $collectedAt = (Get-Date).ToUniversalTime().ToString('o')
     $events = New-Object System.Collections.Generic.List[object]
     $installedCount = 0; $updatedCount = 0; $presentCount = 0; $removedCount = 0
     foreach ($package in $currentPackages) {
-        if (-not $previousById.ContainsKey($package.SoftwareId)) {
+        if ($comparisonStatus -eq 'Comparable') {
+            $package.PreviousInventoryRunId = $previousRunId
+        }
+        if ($comparisonStatus -in @('BaselineReset','PreviousSnapshotUnreadable')) {
+            $package.ChangeType = 'Present'; $presentCount++
+        }
+        elseif (-not $previousById.ContainsKey($package.SoftwareId)) {
             $package.ChangeType = 'Installed'; $installedCount++
         }
         else {
@@ -1003,6 +1110,9 @@ function Get-InstalledSoftwareInventory {
         if ([string]::IsNullOrWhiteSpace($previousId) -or $packageById.ContainsKey($previousId)) { continue }
         $events.Add([pscustomobject][ordered]@{
             SoftwareId = $previousId; Present = $false; ChangeType = 'Removed'
+            RemovalDetectedAt = $collectedAt
+            RemovalReason = 'MissingFromCompleteCurrentInventory'
+            PreviousInventoryRunId = $previousRunId
             Name = [string](Get-ObjectPropertyValueSafe -InputObject $previous -Name 'Name')
             CanonicalName = [string](Get-ObjectPropertyValueSafe -InputObject $previous -Name 'CanonicalName')
             Version = $null
@@ -1023,13 +1133,15 @@ function Get-InstalledSoftwareInventory {
         $removedCount++
     }
 
-    $collectedAt = (Get-Date).ToUniversalTime().ToString('o')
     $summary = [pscustomobject][ordered]@{
         PolicyVersion = [string](Get-ObjectPropertyValueSafe -InputObject $policy -Name 'PolicyVersion')
         PolicySource = $policyResult.Source
         UsedEmbeddedDefault = $policyResult.UsedEmbeddedDefault
         SnapshotPath = $SnapshotPath
         PreviousInventoryRunId = $previousRunId
+        PreviousPolicyVersion = $previousPolicyVersion
+        ComparisonStatus = $comparisonStatus
+        ComparisonResetReason = $comparisonResetReason
         CurrentPackageCount = $currentPackages.Count
         InstalledCount = $installedCount
         UpdatedCount = $updatedCount
@@ -1046,7 +1158,7 @@ function Get-InstalledSoftwareInventory {
         Summary = $summary
         Events = New-ObjectArrayForJson -InputObject $events
         Snapshot = [ordered]@{
-            SchemaVersion = '1.0'
+            SchemaVersion = '1.1'
             ComputerName = $env:COMPUTERNAME
             InventoryRunId = $script:RunId
             CollectedAt = $collectedAt
@@ -2456,7 +2568,18 @@ function ConvertTo-ApplicationCrashRecord {
         [xml]$xml = $Event.ToXml()
         foreach ($data in @($xml.Event.EventData.Data)) {
             if ($data -and $data.Name) {
-                $eventData[[string]$data.Name] = [string]$data.'#text'
+                # Depending on the event provider and PowerShell XML adapter,
+                # EventData.Data can be exposed as an XmlElement or as a scalar
+                # string. Reading '#text' under StrictMode throws when that
+                # adapted property is absent, so use InnerText when available
+                # and otherwise convert the node itself.
+                $dataValue = if ($data -is [System.Xml.XmlElement]) {
+                    [string]$data.InnerText
+                }
+                else {
+                    [string]$data
+                }
+                $eventData[[string]$data.Name] = $dataValue
             }
         }
     }
@@ -2534,8 +2657,27 @@ function ConvertTo-ApplicationCrashRecord {
     $remediationClass = 'None'
     $remediationEligible = $false
     $remediationReason = $null
+    $telemetryClassification = 'ApplicationFailure'
 
-    if ([int]$Event.Id -eq 1001) {
+    $isEdgeInstallerTelemetry = (
+        [int]$Event.Id -eq 1001 -and
+        (
+            [string]$werEventName -match '(?i)^crashpad_log$' -or
+            [string]$eventData['P3'] -match '(?i)EdgeInstallerError\|msedge|InstallError\|copilot|CopilotUndockedHost' -or
+            [string]$message -match '(?i)EdgeInstallerError\|msedge|CopilotUndockedHost_X64|Microsoft\\Copilot\\Application'
+        )
+    )
+
+    if ($isEdgeInstallerTelemetry) {
+        # Edge setup emits WER/crashpad records for installer diagnostics even
+        # when setup subsequently returns zero. These are retained as evidence,
+        # but are not application crashes and are never automatic repair input.
+        $telemetryClassification = 'EdgeOrCopilotInstallerTelemetry'
+        $remediationClass = 'PolicyExpectedNoAction'
+        $remediationReason = 'Edge/Copilot installer diagnostic telemetry is retained for investigation but is not an application crash.'
+    }
+
+    if (-not $isEdgeInstallerTelemetry -and [int]$Event.Id -eq 1001) {
         if ([string]$werEventName -match '^WindowsWcp') {
             $remediationClass = 'WindowsComponentStoreRepair'
             $remediationEligible = $true
@@ -2563,7 +2705,7 @@ function ConvertTo-ApplicationCrashRecord {
             }
         }
     }
-    elseif ([int]$Event.Id -in 1000,1002) {
+    elseif (-not $isEdgeInstallerTelemetry -and [int]$Event.Id -in 1000,1002) {
         $remediationClass = 'ApplicationRepairCandidate'
         $remediationReason = 'Application crash or hang detected; validate recurrence before automated repair.'
     }
@@ -2624,6 +2766,7 @@ function ConvertTo-ApplicationCrashRecord {
         RemediationClass  = $remediationClass
         RemediationEligible = $remediationEligible
         RemediationReason = $remediationReason
+        TelemetryClassification = $telemetryClassification
         Message           = $message
     }
 }
@@ -2682,6 +2825,7 @@ function Get-EventLogHealth {
     $applicationWerRecords = @()
     $windowsServicingFailures = @()
     $otherWerReports = @()
+    $edgeInstallerTelemetry = @()
     $remediationCandidates = @()
     $rawWerEventCount = 0
     try {
@@ -2721,6 +2865,10 @@ function Get-EventLogHealth {
             }
         ))
 
+        $edgeInstallerTelemetry = @($otherWerReports | Where-Object {
+            [string]$_.TelemetryClassification -eq 'EdgeOrCopilotInstallerTelemetry'
+        })
+
         $applicationCrashes = @($nonWerApplicationEvents + $applicationWerRecords |
             Sort-Object TimeCreated -Descending)
 
@@ -2758,6 +2906,8 @@ function Get-EventLogHealth {
             Write-Log -Level 'WARN' -Message ("Application crash event query failed: {0}" -f $_.Exception.Message)
         }
     }
+
+    if ($null -eq $edgeInstallerTelemetry) { $edgeInstallerTelemetry = @() }
 
     $applicationCrashSummary = @()
     $primaryApplicationCrash = $null
@@ -2897,6 +3047,14 @@ function Get-EventLogHealth {
             -Details $otherWerReports
     }
 
+    if ($edgeInstallerTelemetry.Count -gt 0) {
+        Add-Finding -Severity 'Info' -Category 'EventLogs' -Check 'EdgeInstallerTelemetry' `
+            -Message ("{0} Edge/Copilot installer diagnostic report(s) were excluded from application-crash health." -f
+                $edgeInstallerTelemetry.Count) `
+            -Value $edgeInstallerTelemetry.Count `
+            -Details $edgeInstallerTelemetry
+    }
+
     [pscustomobject]@{
         LookbackHours                = $EventLookbackHours
         ApplicationCrashCount        = $applicationCrashes.Count
@@ -2910,6 +3068,8 @@ function Get-EventLogHealth {
         WindowsServicingFailures      = New-ObjectArrayForJson -InputObject $windowsServicingFailures
         OtherWerReportCount           = $otherWerReports.Count
         OtherWerReports               = New-ObjectArrayForJson -InputObject $otherWerReports
+        EdgeInstallerTelemetryCount   = $edgeInstallerTelemetry.Count
+        EdgeInstallerTelemetry        = New-ObjectArrayForJson -InputObject $edgeInstallerTelemetry
         RemediationCandidateCount     = $remediationCandidates.Count
         RemediationCandidates         = New-ObjectArrayForJson -InputObject $remediationCandidates
         CriticalEventCount           = $criticalEvents.Count
@@ -3755,7 +3915,7 @@ function Write-SoftwareInventoryTelemetry {
         $softwareEvent = [ordered]@{
             '@timestamp' = $EventTime.ToUniversalTime().ToString('o')
             EventType = 'endpoint.software'
-            SchemaVersion = '1.0'
+            SchemaVersion = '1.1'
             RunId = $script:RunId
             InventoryRunId = $script:RunId
             InventoryEventNumber = $eventNumber
@@ -3775,6 +3935,9 @@ function Write-SoftwareInventoryTelemetry {
                 PolicyVersion = [string]$Inventory.Summary.PolicyVersion
                 PolicySource = [string]$Inventory.Summary.PolicySource
                 PreviousInventoryRunId = [string]$Inventory.Summary.PreviousInventoryRunId
+                PreviousPolicyVersion = [string]$Inventory.Summary.PreviousPolicyVersion
+                ComparisonStatus = [string]$Inventory.Summary.ComparisonStatus
+                ComparisonResetReason = [string]$Inventory.Summary.ComparisonResetReason
                 CurrentPackageCount = [int]$Inventory.Summary.CurrentPackageCount
             }
             Software = $software
@@ -3911,7 +4074,7 @@ function Initialize-RestrictedWinRM {
     foreach ($endpoint in $endpoints) {
         if ([string]$endpoint.SecurityDescriptorSddl -ne $sddl) {
             Set-PSSessionConfiguration -Name $endpoint.Name -SecurityDescriptorSddl $sddl `
-                -Force -NoServiceRestart -ErrorAction Stop | Out-Null
+                -Force -NoServiceRestart -WarningAction SilentlyContinue -ErrorAction Stop | Out-Null
             $changes.Add("Restricted WinRM endpoint '$($endpoint.Name)' to SYSTEM, local Administrators, and Domain Admins.") | Out-Null
             $restartRequired = $true
         }
@@ -3943,7 +4106,11 @@ function Initialize-RestrictedWinRM {
     }
 
     if ($restartRequired) {
+        Write-CollectorProgress -Level 'INFO' -Message 'WinRM configuration changed; restarting the WinRM service once to activate all endpoint changes.'
         Restart-Service -Name WinRM -Force -ErrorAction Stop
+        (Get-Service -Name WinRM -ErrorAction Stop).WaitForStatus(
+            [System.ServiceProcess.ServiceControllerStatus]::Running,
+            [TimeSpan]::FromSeconds(30))
         $winrmRestarted = $true
         $changes.Add('Restarted the WinRM service after applying configuration changes.') | Out-Null
         Write-Log -Level 'INFO' -Message ('WinRM configuration updated: {0}' -f ($changes -join ' '))
@@ -4068,6 +4235,9 @@ function Get-HPWarrantyHealth {
         LookupAttempted            = $false
         LookupDelaySeconds         = 0
         LookupError                = $null
+        SnapshotPath               = $HPWarrantySnapshotPath
+        SnapshotLoaded             = $false
+        SnapshotSavedUtc           = $null
         ClientModuleVersion        = $null
         DataSource                 = $null
         CacheFresh                 = $false
@@ -4105,19 +4275,65 @@ function Get-HPWarrantyHealth {
     $result.Applicable = $true
     $result.Provider = 'HP CMSL'
     $namespace = 'root/HP/InstrumentedServices/v1'
-    $availableModule = Get-Module -ListAvailable -Name HPCMSL -ErrorAction SilentlyContinue |
-        Sort-Object Version -Descending |
-        Select-Object -First 1
-    if ($availableModule) { $result.ClientModuleVersion = [string]$availableModule.Version }
+    $warranty = $null
+    $snapshotLoaded = $false
 
-    $warrantyRows = @()
-    try {
-        $warrantyRows = @(Get-CimInstance -Namespace $namespace -ClassName HP_Warranty -ErrorAction Stop)
-    } catch {
-        Write-Log -Level 'INFO' -Message ('No readable HP warranty cache was found: {0}' -f $_.Exception.Message)
+    if ((-not $ForceHPWarrantyRefresh) -and
+        (Test-Path -LiteralPath $HPWarrantySnapshotPath -PathType Leaf)) {
+        try {
+            $savedWarranty = Get-Content -LiteralPath $HPWarrantySnapshotPath -Raw -ErrorAction Stop |
+                ConvertFrom-Json -ErrorAction Stop
+            $savedSerial = [string](Get-ObjectPropertyValueSafe -InputObject $savedWarranty -Name 'SerialNumber')
+            $currentSerial = if ($Identity) { [string]$Identity.SerialNumber } else { $null }
+
+            if ([string]::IsNullOrWhiteSpace($savedSerial)) {
+                throw 'The saved warranty snapshot does not contain a serial number.'
+            }
+            if (-not [string]::IsNullOrWhiteSpace($currentSerial) -and
+                $savedSerial.Trim() -ne $currentSerial.Trim()) {
+                throw ("The saved warranty serial number '{0}' does not match this computer '{1}'." -f
+                    $savedSerial, $currentSerial)
+            }
+
+            $warranty = $savedWarranty
+            $snapshotLoaded = $true
+            $result.SnapshotLoaded = $true
+            $result.SnapshotSavedUtc = Get-ObjectPropertyValueSafe -InputObject $savedWarranty -Name 'SnapshotSavedUtc'
+            $result.LookupStatus = 'LocalSnapshot'
+            $result.DataSource = 'Persistent local warranty snapshot'
+            $result.CacheFresh = $true
+            $result.LastCheckedUtc = Get-ObjectPropertyValueSafe -InputObject $savedWarranty -Name 'LastCheckedUtc'
+            Write-Log -Level 'INFO' -Message ("Loaded saved HP warranty snapshot and skipped HP warranty lookup: {0}" -f
+                $HPWarrantySnapshotPath)
+        }
+        catch {
+            Write-Log -Level 'WARN' -Message ("Saved HP warranty snapshot could not be used; a new lookup will be attempted. Path={0}; Error={1}" -f
+                $HPWarrantySnapshotPath, $_.Exception.Message)
+            $warranty = $null
+            $snapshotLoaded = $false
+        }
     }
 
-    $warranty = $warrantyRows | Select-Object -First 1
+    if ($snapshotLoaded) {
+        $result.ClientModuleVersion = [string](Get-ObjectPropertyValueSafe -InputObject $warranty -Name 'ClientModuleVersion')
+    }
+    else {
+        $availableModule = Get-Module -ListAvailable -Name HPCMSL -ErrorAction SilentlyContinue |
+            Sort-Object Version -Descending |
+            Select-Object -First 1
+        if ($availableModule) { $result.ClientModuleVersion = [string]$availableModule.Version }
+    }
+
+    $warrantyRows = @()
+    if (-not $snapshotLoaded) {
+        try {
+            $warrantyRows = @(Get-CimInstance -Namespace $namespace -ClassName HP_Warranty -ErrorAction Stop)
+        } catch {
+            Write-Log -Level 'INFO' -Message ('No readable HP warranty cache was found: {0}' -f $_.Exception.Message)
+        }
+        $warranty = $warrantyRows | Select-Object -First 1
+    }
+
     $lastCheck = if ($warranty) {
         Convert-HPWarrantyDate -Value (Get-ObjectPropertyValueSafe -InputObject $warranty -Name 'LastCMSLCheck')
     } else { $null }
@@ -4127,11 +4343,16 @@ function Get-HPWarrantyHealth {
         $result.LastCheckedUtc = $lastCheck.ToUniversalTime().ToString('o')
     }
 
-    $cacheFresh = ($null -ne $warranty -and $null -ne $lastCheck -and
+    $cacheFresh = $snapshotLoaded -or ((-not $ForceHPWarrantyRefresh) -and
+        $null -ne $warranty -and $null -ne $lastCheck -and
         $result.CacheAgeDays -le $HPWarrantyCacheMaxAgeDays)
     $result.CacheFresh = [bool]$cacheFresh
 
-    if ($cacheFresh) {
+    if ($snapshotLoaded) {
+        # The durable snapshot is the authoritative warranty source after the first
+        # successful lookup. Dates are recalculated below without contacting HP.
+    }
+    elseif ($cacheFresh) {
         $result.LookupStatus = 'CacheFresh'
         $result.DataSource = 'HP WMI cache'
     }
@@ -4152,7 +4373,8 @@ function Get-HPWarrantyHealth {
         if ($warrantyCommand) {
             $result.LookupAttempted = $true
 
-            if ($HPWarrantyLookupStaggerMaxSeconds -gt 0) {
+            $isSundayFleetWindow = ((Get-Date).DayOfWeek -eq [DayOfWeek]::Sunday)
+            if ($HPWarrantyLookupStaggerMaxSeconds -gt 0 -and $isSundayFleetWindow) {
                 $sha256 = [Security.Cryptography.SHA256]::Create()
                 try {
                     $nameBytes = [Text.Encoding]::UTF8.GetBytes([string]$env:COMPUTERNAME)
@@ -4165,8 +4387,19 @@ function Get-HPWarrantyHealth {
                 $result.LookupDelaySeconds = $delaySeconds
                 if ($delaySeconds -gt 0) {
                     Write-Log -Level 'INFO' -Message ("HP warranty cache is missing or stale; staggering lookup by {0} second(s)." -f $delaySeconds)
-                    Start-Sleep -Seconds $delaySeconds
+                    $delayRemaining = $delaySeconds
+                    while ($delayRemaining -gt 0) {
+                        Write-CollectorProgress -Level 'INFO' -Message ("HP warranty lookup is intentionally staggered to protect HP's service. RemainingDelaySeconds={0}" -f $delayRemaining)
+                        $sleepSeconds = [math]::Min(60, $delayRemaining)
+                        Start-Sleep -Seconds $sleepSeconds
+                        $delayRemaining -= $sleepSeconds
+                    }
                 }
+            }
+            elseif ($HPWarrantyLookupStaggerMaxSeconds -gt 0) {
+                $result.LookupDelaySeconds = 0
+                Write-Log -Level 'INFO' -Message 'HP warranty lookup stagger skipped because today is not Sunday; treating this as an individual manual run.'
+                Write-CollectorProgress -Level 'INFO' -Message 'HP warranty lookup will start immediately because the current day is not Sunday.'
             }
 
             try {
@@ -4247,44 +4480,80 @@ function Get-HPWarrantyHealth {
         ([string]$onSiteValue -match '^(?i:true|1)$')
     }
     $result.Countries = [string](Get-ObjectPropertyValueSafe -InputObject $warranty -Name 'Countries')
-    $result.ServiceLevelJson = [string](Get-ObjectPropertyValueSafe -InputObject $warranty -Name 'ServiceLevel')
-    $result.DeliverablesJson = [string](Get-ObjectPropertyValueSafe -InputObject $warranty -Name 'Deliverables')
-
-    $entitlementRows = @()
-    try {
-        $entitlementRows = @(Get-CimInstance -Namespace $namespace -ClassName HP_Entitlements -ErrorAction Stop)
+    if ($snapshotLoaded) {
+        $result.ServiceLevelJson = [string](Get-ObjectPropertyValueSafe -InputObject $warranty -Name 'ServiceLevelJson')
+        $result.DeliverablesJson = [string](Get-ObjectPropertyValueSafe -InputObject $warranty -Name 'DeliverablesJson')
     }
-    catch {
-        Write-Log -Level 'WARN' -Message ('HP warranty summary was collected, but entitlement details could not be read: {0}' -f $_.Exception.Message)
+    else {
+        $result.ServiceLevelJson = [string](Get-ObjectPropertyValueSafe -InputObject $warranty -Name 'ServiceLevel')
+        $result.DeliverablesJson = [string](Get-ObjectPropertyValueSafe -InputObject $warranty -Name 'Deliverables')
     }
 
-    $entitlements = @(
-        foreach ($entitlement in $entitlementRows) {
-            $entitlementStart = Convert-HPWarrantyDate -Value (
-                Get-ObjectPropertyValueSafe -InputObject $entitlement -Name 'WarrantyStartDate')
-            $entitlementEnd = Convert-HPWarrantyDate -Value (
-                Get-ObjectPropertyValueSafe -InputObject $entitlement -Name 'WarrantyEndDate')
-
-            [pscustomobject][ordered]@{
-                Status                  = [string](Get-ObjectPropertyValueSafe -InputObject $entitlement -Name 'Status')
-                StatusCode              = Get-ObjectPropertyValueSafe -InputObject $entitlement -Name 'StatusCode'
-                Caption                 = [string](Get-ObjectPropertyValueSafe -InputObject $entitlement -Name 'Caption')
-                ServiceType             = [string](Get-ObjectPropertyValueSafe -InputObject $entitlement -Name 'ServiceType')
-                WarrantyType            = Get-ObjectPropertyValueSafe -InputObject $entitlement -Name 'WarrantyType'
-                WarrantyTypeDescription = [string](Get-ObjectPropertyValueSafe -InputObject $entitlement -Name 'WarrantyTypeDescription')
-                WarrantyStartDate       = if ($entitlementStart) { $entitlementStart.ToString('yyyy-MM-dd') } else { $null }
-                WarrantyEndDate         = if ($entitlementEnd) { $entitlementEnd.ToString('yyyy-MM-dd') } else { $null }
-                ServiceLevelJson        = [string](Get-ObjectPropertyValueSafe -InputObject $entitlement -Name 'ServiceLevel')
-                DeliverablesJson        = [string](Get-ObjectPropertyValueSafe -InputObject $entitlement -Name 'Deliverables')
-            }
+    if ($snapshotLoaded) {
+        $entitlements = @(
+            Get-ObjectPropertyValueSafe -InputObject $warranty -Name 'Entitlements' |
+                Where-Object { $null -ne $_ }
+        )
+    }
+    else {
+        $entitlementRows = @()
+        try {
+            $entitlementRows = @(Get-CimInstance -Namespace $namespace -ClassName HP_Entitlements -ErrorAction Stop)
         }
-    )
+        catch {
+            Write-Log -Level 'WARN' -Message ('HP warranty summary was collected, but entitlement details could not be read: {0}' -f $_.Exception.Message)
+        }
+
+        $entitlements = @(
+            foreach ($entitlement in $entitlementRows) {
+                $entitlementStart = Convert-HPWarrantyDate -Value (
+                    Get-ObjectPropertyValueSafe -InputObject $entitlement -Name 'WarrantyStartDate')
+                $entitlementEnd = Convert-HPWarrantyDate -Value (
+                    Get-ObjectPropertyValueSafe -InputObject $entitlement -Name 'WarrantyEndDate')
+
+                [pscustomobject][ordered]@{
+                    Status                  = [string](Get-ObjectPropertyValueSafe -InputObject $entitlement -Name 'Status')
+                    StatusCode              = Get-ObjectPropertyValueSafe -InputObject $entitlement -Name 'StatusCode'
+                    Caption                 = [string](Get-ObjectPropertyValueSafe -InputObject $entitlement -Name 'Caption')
+                    ServiceType             = [string](Get-ObjectPropertyValueSafe -InputObject $entitlement -Name 'ServiceType')
+                    WarrantyType            = Get-ObjectPropertyValueSafe -InputObject $entitlement -Name 'WarrantyType'
+                    WarrantyTypeDescription = [string](Get-ObjectPropertyValueSafe -InputObject $entitlement -Name 'WarrantyTypeDescription')
+                    WarrantyStartDate       = if ($entitlementStart) { $entitlementStart.ToString('yyyy-MM-dd') } else { $null }
+                    WarrantyEndDate         = if ($entitlementEnd) { $entitlementEnd.ToString('yyyy-MM-dd') } else { $null }
+                    ServiceLevelJson        = [string](Get-ObjectPropertyValueSafe -InputObject $entitlement -Name 'ServiceLevel')
+                    DeliverablesJson        = [string](Get-ObjectPropertyValueSafe -InputObject $entitlement -Name 'Deliverables')
+                }
+            }
+        )
+    }
 
     $result.Entitlements = New-ObjectArrayForJson -InputObject $entitlements
     $result.ActiveEntitlementCount = @($entitlements | Where-Object Status -eq 'Active').Count
     $result.ExpiredEntitlementCount = @($entitlements | Where-Object Status -eq 'Expired').Count
     $result.OtherEntitlementCount = $entitlements.Count -
         $result.ActiveEntitlementCount - $result.ExpiredEntitlementCount
+
+    if ((-not $snapshotLoaded) -and $result.LookupStatus -in @('CacheFresh','Refreshed')) {
+        try {
+            $snapshotDirectory = Split-Path -Parent $HPWarrantySnapshotPath
+            Ensure-Directory -Path $snapshotDirectory
+            $result.SnapshotSavedUtc = (Get-Date).ToUniversalTime().ToString('o')
+            $snapshotTempPath = '{0}.{1}.tmp' -f $HPWarrantySnapshotPath, $script:RunId
+            [pscustomobject]$result | ConvertTo-Json -Depth 12 |
+                Set-Content -LiteralPath $snapshotTempPath -Encoding UTF8 -Force
+            Move-Item -LiteralPath $snapshotTempPath -Destination $HPWarrantySnapshotPath -Force
+            Write-Log -Level 'INFO' -Message ("Saved persistent HP warranty snapshot; future runs will skip the HP lookup. Path={0}" -f
+                $HPWarrantySnapshotPath)
+        }
+        catch {
+            Write-Log -Level 'WARN' -Message ("HP warranty data was collected but the persistent snapshot could not be saved: {0}" -f
+                $_.Exception.Message)
+        }
+    }
+    elseif (-not $snapshotLoaded) {
+        Write-Log -Level 'INFO' -Message ("Persistent HP warranty snapshot was not written because the lookup was not successful. LookupStatus={0}" -f
+            $result.LookupStatus)
+    }
 
     $findingDetails = [pscustomobject][ordered]@{
         Provider              = $result.Provider
@@ -4321,6 +4590,317 @@ function Get-HPWarrantyHealth {
     }
 
     return [pscustomobject]$result
+}
+
+function Add-DellWarrantyFinding {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)]$Warranty)
+
+    $findingDetails = [pscustomobject][ordered]@{
+        Provider              = $Warranty.Provider
+        LookupStatus          = $Warranty.LookupStatus
+        Status                = $Warranty.Status
+        StatusDetail          = $Warranty.StatusDetail
+        WarrantyEndDate       = $Warranty.WarrantyEndDate
+        WarrantyDaysRemaining = $Warranty.WarrantyDaysRemaining
+        ServiceType           = $Warranty.ServiceType
+    }
+    if ($Warranty.Status -eq 'Active' -and
+        ($null -eq $Warranty.WarrantyDaysRemaining -or
+         $Warranty.WarrantyDaysRemaining -gt $HPWarrantyExpirationWarningDays)) {
+        Add-Finding -Severity 'Healthy' -Category 'Lifecycle' -Check 'DellWarrantyStatus' `
+            -Message ('Dell warranty is active through {0}.' -f $Warranty.WarrantyEndDate) `
+            -Value $Warranty.Status -Details $findingDetails
+    }
+    elseif ($Warranty.Status -eq 'Active' -and $Warranty.WarrantyDaysRemaining -ge 0) {
+        Add-Finding -Severity 'Warning' -Category 'Lifecycle' -Check 'DellWarrantyExpiring' `
+            -Message ('Dell warranty expires in {0} day(s) on {1}.' -f $Warranty.WarrantyDaysRemaining, $Warranty.WarrantyEndDate) `
+            -Value $Warranty.WarrantyDaysRemaining -Details $findingDetails
+    }
+    elseif ($Warranty.Status -eq 'Expired' -or
+            ($null -ne $Warranty.WarrantyDaysRemaining -and $Warranty.WarrantyDaysRemaining -lt 0)) {
+        Add-Finding -Severity 'Warning' -Category 'Lifecycle' -Check 'DellWarrantyExpired' `
+            -Message ('Dell warranty expired on {0}.' -f $Warranty.WarrantyEndDate) `
+            -Value $Warranty.WarrantyDaysRemaining -Details $findingDetails
+    }
+    else {
+        Add-Finding -Severity 'Info' -Category 'Lifecycle' -Check 'DellWarrantyStatus' `
+            -Message ('Dell warranty status is {0}. {1}' -f $Warranty.Status, $Warranty.StatusDetail) `
+            -Value $Warranty.Status -Details $findingDetails
+    }
+}
+
+function Get-DellWarrantyHealth {
+    [CmdletBinding()]
+    param([AllowNull()]$Identity)
+
+    $manufacturer = if ($Identity) { [string]$Identity.Manufacturer } else {
+        [string](Get-CimInstance -ClassName Win32_ComputerSystem -ErrorAction Stop).Manufacturer
+    }
+    $serialNumber = if ($Identity) { [string]$Identity.SerialNumber } else {
+        [string](Get-CimInstance -ClassName Win32_BIOS -ErrorAction Stop).SerialNumber
+    }
+
+    $result = [ordered]@{
+        Applicable              = $false
+        Provider                = $null
+        Manufacturer            = $manufacturer
+        LookupStatus            = 'NotApplicable'
+        LookupAttempted         = $false
+        LookupError             = $null
+        SnapshotPath            = $DellWarrantySnapshotPath
+        SnapshotLoaded          = $false
+        SnapshotSavedUtc        = $null
+        DataSource              = $null
+        CacheFresh              = $false
+        CacheAgeDays            = $null
+        LastCheckedUtc          = $null
+        SerialNumber            = $serialNumber
+        ProductNumber           = $null
+        ProductLineDescription  = $null
+        ShipDate                = $null
+        Status                  = $null
+        State                   = $null
+        StatusCode              = $null
+        StatusDetail            = $null
+        Caption                 = $null
+        WarrantyType            = $null
+        WarrantyTypeDescription = $null
+        WarrantyStartDate       = $null
+        WarrantyEndDate         = $null
+        WarrantyDaysRemaining   = $null
+        HardwareCarePackEndDate = $null
+        SoftwareCarePackEndDate = $null
+        ServiceType             = $null
+        OnSite                  = $null
+        Countries               = $null
+        ServiceLevelJson        = $null
+        DeliverablesJson        = $null
+        ActiveEntitlementCount  = 0
+        ExpiredEntitlementCount = 0
+        OtherEntitlementCount   = 0
+        Entitlements            = [object[]]@()
+    }
+
+    if ($manufacturer -notmatch '(?i)^Dell') {
+        return [pscustomobject]$result
+    }
+
+    $result.Applicable = $true
+    $result.Provider = 'Dell TechDirect'
+
+    if ([string]::IsNullOrWhiteSpace($serialNumber)) {
+        $result.LookupStatus = 'SerialNumberUnavailable'
+        $result.LookupError = 'The Dell service tag could not be determined.'
+        Add-Finding -Severity 'Info' -Category 'Lifecycle' -Check 'DellWarrantyLookup' `
+            -Message $result.LookupError -Value $result.LookupStatus
+        return [pscustomobject]$result
+    }
+    $serialNumber = $serialNumber.Trim()
+    $result.SerialNumber = $serialNumber
+
+    if ((-not $ForceDellWarrantyRefresh) -and
+        (Test-Path -LiteralPath $DellWarrantySnapshotPath -PathType Leaf)) {
+        try {
+            $savedWarranty = Get-Content -LiteralPath $DellWarrantySnapshotPath -Raw -ErrorAction Stop |
+                ConvertFrom-Json -ErrorAction Stop
+            $savedSerial = [string](Get-ObjectPropertyValueSafe -InputObject $savedWarranty -Name 'SerialNumber')
+            if ([string]::IsNullOrWhiteSpace($savedSerial)) {
+                throw 'The saved Dell warranty snapshot does not contain a service tag.'
+            }
+            if ($savedSerial.Trim() -ne $serialNumber) {
+                throw ("The saved Dell service tag '{0}' does not match this computer '{1}'." -f
+                    $savedSerial, $serialNumber)
+            }
+
+            foreach ($property in @($result.Keys)) {
+                $savedValue = Get-ObjectPropertyValueSafe -InputObject $savedWarranty -Name $property
+                if ($null -ne $savedValue) { $result[$property] = $savedValue }
+            }
+            $result.Applicable = $true
+            $result.Provider = 'Dell TechDirect'
+            $result.LookupStatus = 'LocalSnapshot'
+            $result.SnapshotLoaded = $true
+            $result.CacheFresh = $true
+            $result.DataSource = 'Persistent local warranty snapshot'
+            $savedEndDate = Convert-HPWarrantyDate -Value $result.WarrantyEndDate
+            if ($savedEndDate) {
+                $result.WarrantyDaysRemaining = [int][math]::Floor(
+                    ($savedEndDate.Date - (Get-Date).Date).TotalDays)
+            }
+            $savedCheckDate = Convert-HPWarrantyDate -Value $result.LastCheckedUtc
+            if ($savedCheckDate) {
+                $result.CacheAgeDays = [math]::Round(
+                    [math]::Max(0, ((Get-Date) - $savedCheckDate).TotalDays), 2)
+            }
+            Write-Log -Level 'INFO' -Message ("Loaded saved Dell warranty snapshot and skipped Dell TechDirect lookup: {0}" -f
+                $DellWarrantySnapshotPath)
+            $cachedResult = [pscustomobject]$result
+            Add-DellWarrantyFinding -Warranty $cachedResult
+            return $cachedResult
+        }
+        catch {
+            Write-Log -Level 'WARN' -Message ("Saved Dell warranty snapshot could not be used; a new lookup will be attempted. Path={0}; Error={1}" -f
+                $DellWarrantySnapshotPath, $_.Exception.Message)
+        }
+    }
+
+    if ([string]::IsNullOrWhiteSpace($DellTechDirectClientId) -or
+        [string]::IsNullOrWhiteSpace($DellTechDirectClientSecret)) {
+        $result.LookupStatus = 'CredentialsRequired'
+        $result.LookupError = 'Dell TechDirect API credentials are not configured as machine environment variables.'
+        Write-Log -Level 'INFO' -Message ('Dell warranty lookup was skipped. Configure machine environment variables DELL_TECHDIRECT_CLIENT_ID and DELL_TECHDIRECT_CLIENT_SECRET, or supply the corresponding script parameters.')
+        Add-Finding -Severity 'Info' -Category 'Lifecycle' -Check 'DellWarrantyLookup' `
+            -Message ('Dell warranty information is unavailable. LookupStatus={0}.' -f $result.LookupStatus) `
+            -Value $result.LookupStatus
+        return [pscustomobject]$result
+    }
+
+    $result.LookupAttempted = $true
+    try {
+        $tokenResponse = Invoke-RestMethod -Method Post -Uri $DellTechDirectTokenUri `
+            -ContentType 'application/x-www-form-urlencoded' -Body @{
+                client_id     = $DellTechDirectClientId
+                client_secret = $DellTechDirectClientSecret
+                grant_type    = 'client_credentials'
+            } -UseBasicParsing -ErrorAction Stop
+
+        $accessToken = [string](Get-ObjectPropertyValueSafe -InputObject $tokenResponse -Name 'access_token')
+        if ([string]::IsNullOrWhiteSpace($accessToken)) {
+            throw 'Dell TechDirect authentication succeeded without returning an access token.'
+        }
+
+        $requestUri = '{0}?servicetags={1}' -f $DellTechDirectEntitlementsUri,
+            [uri]::EscapeDataString($serialNumber)
+        $response = Invoke-RestMethod -Method Get -Uri $requestUri -Headers @{
+            Authorization = 'Bearer {0}' -f $accessToken
+            Accept        = 'application/json'
+        } -UseBasicParsing -ErrorAction Stop
+
+        $assets = @($response)
+        $nestedAssets = Get-ObjectPropertyValueSafe -InputObject $response -Name 'assetEntitlementData'
+        if ($null -ne $nestedAssets) { $assets = @($nestedAssets) }
+        $asset = @($assets | Where-Object {
+            ([string](Get-ObjectPropertyValueSafe -InputObject $_ -Name 'serviceTag')).Trim() -eq $serialNumber
+        } | Select-Object -First 1)
+        if ($asset.Count -gt 0) { $asset = $asset[0] } else { $asset = @($assets | Select-Object -First 1)[0] }
+        if ($null -eq $asset) { throw 'Dell TechDirect returned no asset entitlement record.' }
+
+        $entitlementSource = Get-ObjectPropertyValueSafe -InputObject $asset -Name 'entitlements'
+        $entitlementRows = @($entitlementSource | Where-Object { $null -ne $_ })
+        $normalizedEntitlements = @(
+            foreach ($entitlement in $entitlementRows) {
+                $startDate = Convert-HPWarrantyDate -Value (
+                    Get-ObjectPropertyValueSafe -InputObject $entitlement -Name 'startDate')
+                $endDate = Convert-HPWarrantyDate -Value (
+                    Get-ObjectPropertyValueSafe -InputObject $entitlement -Name 'endDate')
+                $serviceLevel = [string](Get-ObjectPropertyValueSafe -InputObject $entitlement -Name 'serviceLevelDescription')
+                $entitlementType = [string](Get-ObjectPropertyValueSafe -InputObject $entitlement -Name 'entitlementType')
+                $entitlementStatus = if ($endDate -and $endDate.Date -ge (Get-Date).Date) { 'Active' } else { 'Expired' }
+
+                [pscustomobject][ordered]@{
+                    Status                  = $entitlementStatus
+                    StatusCode              = $null
+                    Caption                 = $serviceLevel
+                    ServiceType             = $serviceLevel
+                    WarrantyType            = $entitlementType
+                    WarrantyTypeDescription = $entitlementType
+                    WarrantyStartDate       = if ($startDate) { $startDate.ToString('yyyy-MM-dd') } else { $null }
+                    WarrantyEndDate         = if ($endDate) { $endDate.ToString('yyyy-MM-dd') } else { $null }
+                    ServiceLevelJson        = $null
+                    DeliverablesJson        = $null
+                }
+            }
+        )
+
+        $validStartDates = @($normalizedEntitlements | ForEach-Object {
+            Convert-HPWarrantyDate -Value $_.WarrantyStartDate
+        } | Where-Object { $null -ne $_ })
+        $validEndDates = @($normalizedEntitlements | ForEach-Object {
+            Convert-HPWarrantyDate -Value $_.WarrantyEndDate
+        } | Where-Object { $null -ne $_ })
+        $warrantyStart = $validStartDates | Sort-Object | Select-Object -First 1
+        $warrantyEnd = $validEndDates | Sort-Object -Descending | Select-Object -First 1
+        $serviceTypes = @($normalizedEntitlements | ForEach-Object { $_.ServiceType } |
+            Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) } | Sort-Object -Unique)
+        $activeCount = @($normalizedEntitlements | Where-Object Status -eq 'Active').Count
+        $expiredCount = @($normalizedEntitlements | Where-Object Status -eq 'Expired').Count
+
+        $result.ProductNumber = [string](Get-ObjectPropertyValueSafe -InputObject $asset -Name 'localChannel')
+        $result.ProductLineDescription = [string](Get-ObjectPropertyValueSafe -InputObject $asset -Name 'productLineDescription')
+        $shipDate = Convert-HPWarrantyDate -Value (Get-ObjectPropertyValueSafe -InputObject $asset -Name 'shipDate')
+        $result.ShipDate = if ($shipDate) { $shipDate.ToString('yyyy-MM-dd') } else { $null }
+        $result.Status = if ($activeCount -gt 0) { 'Active' } elseif ($normalizedEntitlements.Count -gt 0) { 'Expired' } else { 'Unknown' }
+        $result.State = if ($result.Status -eq 'Active') { 'IW' } elseif ($result.Status -eq 'Expired') { 'OW' } else { $null }
+        $result.StatusDetail = if ($result.Status -eq 'Active') { 'Active Dell entitlement' } elseif ($result.Status -eq 'Expired') { 'Dell entitlement expired' } else { 'No dated Dell entitlement returned' }
+        $result.Caption = $result.ProductLineDescription
+        $result.WarrantyTypeDescription = ($normalizedEntitlements | ForEach-Object { $_.WarrantyTypeDescription } |
+            Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) } | Sort-Object -Unique) -join '; '
+        $result.WarrantyStartDate = if ($warrantyStart) { $warrantyStart.ToString('yyyy-MM-dd') } else { $null }
+        $result.WarrantyEndDate = if ($warrantyEnd) { $warrantyEnd.ToString('yyyy-MM-dd') } else { $null }
+        $result.WarrantyDaysRemaining = if ($warrantyEnd) {
+            [int][math]::Floor(($warrantyEnd.Date - (Get-Date).Date).TotalDays)
+        } else { $null }
+        $result.ServiceType = $serviceTypes -join '; '
+        $result.ActiveEntitlementCount = $activeCount
+        $result.ExpiredEntitlementCount = $expiredCount
+        $result.OtherEntitlementCount = $normalizedEntitlements.Count - $activeCount - $expiredCount
+        $result.Entitlements = New-ObjectArrayForJson -InputObject $normalizedEntitlements
+        $result.LastCheckedUtc = (Get-Date).ToUniversalTime().ToString('o')
+        $result.LookupStatus = 'Refreshed'
+        $result.DataSource = 'Dell TechDirect API'
+        $result.CacheFresh = $true
+
+        $snapshotDirectory = Split-Path -Parent $DellWarrantySnapshotPath
+        Ensure-Directory -Path $snapshotDirectory
+        $result.SnapshotSavedUtc = (Get-Date).ToUniversalTime().ToString('o')
+        $snapshotTempPath = '{0}.{1}.tmp' -f $DellWarrantySnapshotPath, $script:RunId
+        [pscustomobject]$result | ConvertTo-Json -Depth 12 |
+            Set-Content -LiteralPath $snapshotTempPath -Encoding UTF8 -Force
+        Move-Item -LiteralPath $snapshotTempPath -Destination $DellWarrantySnapshotPath -Force
+        Write-Log -Level 'INFO' -Message ("Saved persistent Dell warranty snapshot; future runs will skip Dell TechDirect. Path={0}" -f
+            $DellWarrantySnapshotPath)
+    }
+    catch {
+        $result.LookupStatus = 'LookupFailed'
+        $result.LookupError = $_.Exception.Message
+        Write-Log -Level 'WARN' -Message ('Dell TechDirect warranty lookup failed without stopping endpoint inventory: {0}' -f
+            $result.LookupError)
+        Add-Finding -Severity 'Info' -Category 'Lifecycle' -Check 'DellWarrantyLookup' `
+            -Message ('Dell warranty information is unavailable. LookupStatus={0}.' -f $result.LookupStatus) `
+            -Value $result.LookupStatus
+        return [pscustomobject]$result
+    }
+
+    $completedResult = [pscustomobject]$result
+    Add-DellWarrantyFinding -Warranty $completedResult
+    return $completedResult
+}
+
+function Get-VendorWarrantyHealth {
+    [CmdletBinding()]
+    param([AllowNull()]$Identity)
+
+    $manufacturer = if ($Identity) { [string]$Identity.Manufacturer } else { '' }
+    if ($manufacturer -match '(?i)^(HP|Hewlett-Packard)') {
+        return Get-HPWarrantyHealth -Identity $Identity
+    }
+    if ($manufacturer -match '(?i)^Dell') {
+        return Get-DellWarrantyHealth -Identity $Identity
+    }
+
+    return [pscustomobject][ordered]@{
+        Applicable = $false
+        Provider = $null
+        Manufacturer = $manufacturer
+        LookupStatus = 'NotApplicable'
+        Status = $null
+        WarrantyStartDate = $null
+        WarrantyEndDate = $null
+        WarrantyDaysRemaining = $null
+        ServiceType = $null
+        LastCheckedUtc = $null
+    }
 }
 
 function Write-RemediationCandidateTelemetry {
@@ -4380,7 +4960,7 @@ $autopilotHash   = Invoke-Collector -Name 'LocalAutopilotHardwareHash' -ScriptBl
 $identity        = Invoke-Collector -Name 'ComputerIdentity'       -ScriptBlock { Get-ComputerIdentity }
 $biosSettings    = Invoke-Collector -Name 'BIOSSettingsInventory'  -ScriptBlock { Get-VendorBiosSettingsInventory -Identity $identity }
 $biosUpdateEvidence = Invoke-Collector -Name 'BIOSUpdateEvidence'  -ScriptBlock { Get-VendorBiosUpdateEvidence -Identity $identity }
-$hpWarranty      = Invoke-Collector -Name 'HPWarranty'             -ScriptBlock { Get-HPWarrantyHealth -Identity $identity }
+$warranty        = Invoke-Collector -Name 'VendorWarranty'         -ScriptBlock { Get-VendorWarrantyHealth -Identity $identity }
 $hardware        = Invoke-Collector -Name 'HardwareInventory'      -ScriptBlock { Get-HardwareInventory }
 $battery         = Invoke-Collector -Name 'BatteryHealth'          -ScriptBlock { Get-BatteryHealth }
 $operatingSystem = Invoke-Collector -Name 'OperatingSystem'       -ScriptBlock { Get-OperatingSystemHealth }
@@ -4432,7 +5012,7 @@ if ($hardware) {
 }
 
 if ($softwareInventory) {
-    Write-Log -Message ("Software inventory summary: Current={0}; NewlyDetected={1}; Updated={2}; Unchanged={3}; Removed={4}; Events={5}; Policy={6}; PolicySource={7}." -f `
+    Write-Log -Message ("Software inventory summary: Current={0}; NewlyDetected={1}; Updated={2}; Unchanged={3}; Removed={4}; Events={5}; Policy={6}; PolicySource={7}; Comparison={8}." -f `
         $softwareInventory.Summary.CurrentPackageCount,
         $softwareInventory.Summary.InstalledCount,
         $softwareInventory.Summary.UpdatedCount,
@@ -4440,7 +5020,8 @@ if ($softwareInventory) {
         $softwareInventory.Summary.RemovedCount,
         $softwareInventory.Summary.EventCount,
         $softwareInventory.Summary.PolicyVersion,
-        $softwareInventory.Summary.PolicySource)
+        $softwareInventory.Summary.PolicySource,
+        $softwareInventory.Summary.ComparisonStatus)
 }
 
 $endTime = Get-Date
@@ -4510,11 +5091,11 @@ $event = [ordered]@{
         OldDriverCount = if ($drivers) { $drivers.OldDriverCount } else { $null }
         BiosAgeDays = if ($biosCurrency) { $biosCurrency.AgeDays } else { $null }
         BiosBaselineCompliant = if ($biosCurrency) { $biosCurrency.BaselineCompliant } else { $null }
-        WarrantyApplicable = if ($hpWarranty) { $hpWarranty.Applicable } else { $null }
-        WarrantyProvider = if ($hpWarranty) { $hpWarranty.Provider } else { $null }
-        WarrantyLookupStatus = if ($hpWarranty) { $hpWarranty.LookupStatus } else { $null }
-        WarrantyStatus = if ($hpWarranty) { $hpWarranty.Status } else { $null }
-        WarrantyDaysRemaining = if ($hpWarranty) { $hpWarranty.WarrantyDaysRemaining } else { $null }
+        WarrantyApplicable = if ($warranty) { $warranty.Applicable } else { $null }
+        WarrantyProvider = if ($warranty) { $warranty.Provider } else { $null }
+        WarrantyLookupStatus = if ($warranty) { $warranty.LookupStatus } else { $null }
+        WarrantyStatus = if ($warranty) { $warranty.Status } else { $null }
+        WarrantyDaysRemaining = if ($warranty) { $warranty.WarrantyDaysRemaining } else { $null }
         WindowsLicensed = if ($activation) { $activation.WindowsLicensed } else { $null }
         OfficeLicensed = if ($activation) { $activation.OfficeLicensed } else { $null }
         HoursSinceLastTimeSync = if ($timeSync) { $timeSync.HoursSinceLastSync } else { $null }
@@ -4555,7 +5136,7 @@ $event = [ordered]@{
     RemoteAccess  = $remoteAccess
     AutopilotHash = $autopilotHash
     Lifecycle     = [ordered]@{
-        Warranty = $hpWarranty
+        Warranty = $warranty
     }
     Battery       = $battery
     Firmware      = [ordered]@{

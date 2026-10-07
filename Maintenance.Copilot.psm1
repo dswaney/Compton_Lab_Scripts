@@ -1,6 +1,6 @@
 #requires -version 5.1
-# ModuleVersion: 1.1.0
-# LastUpdated: 2026-09-21
+# ModuleVersion: 1.2.1
+# LastUpdated: 2026-10-06
 <#
 .SYNOPSIS
     Shared Microsoft Copilot removal and disablement for Compton College endpoints.
@@ -10,6 +10,17 @@
     Copilot packages, stops Copilot processes, disables Copilot tasks, applies
     machine and user policies, cleans shortcuts, and verifies the result.
 .NOTES
+    v1.2.1 safely reads optional uninstall-registry properties under StrictMode
+    and uses final registration verification as the authoritative uninstall
+    result when copilot_setup.exe returns a nonstandard exit code.
+    v1.2.0 detects and removes the Microsoft-published, system-level Win32
+    Copilot application registered under Programs and Features. It executes
+    the product's registered copilot_setup.exe uninstall command, adds the
+    Chromium force-uninstall switch, verifies the uninstall registration is
+    gone, removes only verified orphaned Copilot application files, and adds
+    Win32-specific telemetry and final verification.
+    v1.1.1 corrects Windows PowerShell 5.1 parsing of user/profile names
+    immediately followed by a colon in expandable log messages.
     v1.1.0 removes the packaged Microsoft 365 Copilot application
     (Microsoft.MicrosoftOfficeHub) and disables Copilot startup entries in
     machine, existing-user, offline-user, and Default User registry hives.
@@ -17,7 +28,19 @@
 
 Set-StrictMode -Version 2.0
 
-$script:CopilotModuleVersion = '1.1.0'
+$script:CopilotModuleVersion = '1.2.1'
+
+function Get-CopilotPropertyValue {
+    param(
+        [AllowNull()][object]$InputObject,
+        [Parameter(Mandatory)][string]$Name
+    )
+
+    if ($null -eq $InputObject) { return $null }
+    $property = $InputObject.PSObject.Properties[$Name]
+    if ($null -eq $property) { return $null }
+    return $property.Value
+}
 
 function Write-CopilotMessage {
     param(
@@ -88,6 +111,145 @@ function Disable-CopilotStartupEntriesForHive {
     }
 }
 
+function Get-CopilotDesktopRegistrations {
+    [CmdletBinding()]
+    param()
+
+    $uninstallRoots = @(
+        'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*',
+        'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*'
+    )
+
+    return @(Get-ItemProperty -Path $uninstallRoots -ErrorAction SilentlyContinue |
+        Where-Object {
+            $displayName = [string](Get-CopilotPropertyValue -InputObject $_ -Name 'DisplayName')
+            $publisher = [string](Get-CopilotPropertyValue -InputObject $_ -Name 'Publisher')
+            ($displayName -match '^(?i:Microsoft Copilot|Copilot)$') -and
+            ($publisher -match '^(?i:Microsoft Corporation|Microsoft)$')
+        } |
+        Sort-Object PSPath -Unique)
+}
+
+function Split-CopilotUninstallCommand {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][string]$CommandLine)
+
+    $command = $CommandLine.Trim()
+    if ($command -match '^\s*"([^"]+)"\s*(.*)$') {
+        return [pscustomobject]@{ FilePath=$matches[1]; Arguments=$matches[2].Trim() }
+    }
+    if ($command -match '^\s*(\S+)\s*(.*)$') {
+        return [pscustomobject]@{ FilePath=$matches[1]; Arguments=$matches[2].Trim() }
+    }
+    throw 'The registered Copilot uninstall command could not be parsed.'
+}
+
+function Remove-CopilotDesktopApplication {
+    [CmdletBinding(SupportsShouldProcess = $true)]
+    param(
+        [Parameter(Mandatory)][System.Collections.IDictionary]$Result,
+        [scriptblock]$Logger,
+        [ValidateRange(30,900)][int]$TimeoutSeconds = 300
+    )
+
+    $registrations = @(Get-CopilotDesktopRegistrations)
+    $Result.DesktopApplicationsFound = $registrations.Count
+
+    foreach ($registration in $registrations) {
+        $displayName = [string](Get-CopilotPropertyValue -InputObject $registration -Name 'DisplayName')
+        $displayVersion = [string](Get-CopilotPropertyValue -InputObject $registration -Name 'DisplayVersion')
+        $uninstallString = [string](Get-CopilotPropertyValue -InputObject $registration -Name 'QuietUninstallString')
+        if ([string]::IsNullOrWhiteSpace($uninstallString)) {
+            $uninstallString = [string](Get-CopilotPropertyValue -InputObject $registration -Name 'UninstallString')
+        }
+
+        try {
+            if ([string]::IsNullOrWhiteSpace($uninstallString)) {
+                throw 'The Microsoft Copilot uninstall registration does not contain an uninstall command.'
+            }
+
+            $parsed = Split-CopilotUninstallCommand -CommandLine $uninstallString
+            if ([IO.Path]::GetFileName($parsed.FilePath) -notmatch '^(?i:copilot_setup\.exe)$') {
+                throw ("Refusing unexpected Copilot uninstaller '{0}'." -f $parsed.FilePath)
+            }
+            if (-not (Test-Path -LiteralPath $parsed.FilePath -PathType Leaf)) {
+                throw ("The registered Copilot uninstaller does not exist: {0}" -f $parsed.FilePath)
+            }
+
+            $arguments = [string]$parsed.Arguments
+            foreach ($requiredArgument in @('--uninstall','--mscopilot','--system-level','--force-uninstall','--verbose-logging')) {
+                if ($arguments -notmatch ('(?i)(?:^|\s){0}(?:\s|$)' -f [regex]::Escape($requiredArgument))) {
+                    $arguments = ($arguments + ' ' + $requiredArgument).Trim()
+                }
+            }
+
+            if (-not $PSCmdlet.ShouldProcess("$displayName $displayVersion",'Uninstall system-level Microsoft Copilot desktop application')) {
+                continue
+            }
+
+            $Result.DesktopUninstallsAttempted++
+            Write-CopilotMessage -Logger $Logger -Message ("Uninstalling system-level Microsoft Copilot desktop application. Version={0}" -f $displayVersion)
+            $process = Start-Process -FilePath $parsed.FilePath -ArgumentList $arguments -WindowStyle Hidden -PassThru -ErrorAction Stop
+            if (-not $process.WaitForExit($TimeoutSeconds * 1000)) {
+                try { $process.Kill() } catch {}
+                throw ("Microsoft Copilot uninstall timed out after {0} seconds." -f $TimeoutSeconds)
+            }
+
+            $exitCode = [int]$process.ExitCode
+            $Result.DesktopUninstallExitCodes += $exitCode
+            if ($exitCode -in @(1641,3010)) { $Result.RebootRequired = $true }
+
+            $registrationRemoved = $false
+            for ($attempt = 0; $attempt -lt 15; $attempt++) {
+                if (@(Get-CopilotDesktopRegistrations).Count -eq 0) {
+                    $registrationRemoved = $true
+                    break
+                }
+                Start-Sleep -Seconds 2
+            }
+            if (-not $registrationRemoved) {
+                if ($exitCode -notin @(0,1641,3010)) {
+                    throw ("Microsoft Copilot uninstaller returned exit code {0}, and Copilot remained registered in Programs and Features." -f $exitCode)
+                }
+                throw 'Microsoft Copilot remained registered in Programs and Features after its uninstaller completed.'
+            }
+
+            if ($exitCode -notin @(0,1641,3010)) {
+                Write-CopilotMessage -Logger $Logger -Message ("Microsoft Copilot uninstaller returned nonstandard exit code {0}, but post-uninstall verification confirmed that its Programs and Features registration was removed; treating the uninstall as verified successful." -f $exitCode) -Level WARN
+            }
+
+            $Result.DesktopApplicationsRemoved++
+            Write-CopilotMessage -Logger $Logger -Message ("Removed system-level Microsoft Copilot desktop application. Version={0}; ExitCode={1}" -f $displayVersion,$exitCode) -Level OK
+        }
+        catch {
+            $Result.Failures++
+            Write-CopilotMessage -Logger $Logger -Message ("Failed removing system-level Microsoft Copilot desktop application '{0}': {1}" -f $displayName,$_.Exception.Message) -Level ERROR
+        }
+    }
+
+    if (@(Get-CopilotDesktopRegistrations).Count -eq 0) {
+        $programFilesX86 = [string]${env:ProgramFiles(x86)}
+        $copilotRoot = if ([string]::IsNullOrWhiteSpace($programFilesX86)) {
+            $null
+        } else {
+            Join-Path $programFilesX86 'Microsoft\Copilot'
+        }
+        if (-not [string]::IsNullOrWhiteSpace($copilotRoot) -and
+            (Test-Path -LiteralPath $copilotRoot -PathType Container)) {
+            try {
+                if ($PSCmdlet.ShouldProcess($copilotRoot,'Remove orphaned Microsoft Copilot application directory')) {
+                    Remove-Item -LiteralPath $copilotRoot -Recurse -Force -ErrorAction Stop
+                    $Result.DesktopDirectoriesRemoved++
+                }
+            }
+            catch {
+                $Result.Failures++
+                Write-CopilotMessage -Logger $Logger -Message ("Copilot is no longer registered, but its orphaned application directory could not be removed: {0}" -f $_.Exception.Message) -Level WARN
+            }
+        }
+    }
+}
+
 function Invoke-ComprehensiveCopilotRemoval {
     [CmdletBinding(SupportsShouldProcess = $true, ConfirmImpact = 'Low')]
     param(
@@ -100,6 +262,11 @@ function Invoke-ComprehensiveCopilotRemoval {
         ModuleVersion                = $script:CopilotModuleVersion
         ProcessesStopped             = 0
         TasksDisabled                = 0
+        DesktopApplicationsFound     = 0
+        DesktopUninstallsAttempted   = 0
+        DesktopApplicationsRemoved   = 0
+        DesktopUninstallExitCodes    = [object[]]@()
+        DesktopDirectoriesRemoved    = 0
         InstalledPackagesFound       = 0
         InstalledPackagesRemoved     = 0
         ProvisionedPackagesFound     = 0
@@ -110,6 +277,7 @@ function Invoke-ComprehensiveCopilotRemoval {
         StartupEntriesDisabled        = 0
         RemainingInstalledPackages   = 0
         RemainingProvisionedPackages = 0
+        RemainingDesktopApplications = 0
         Failures                      = 0
         RebootRequired                = $false
         Status                        = 'Running'
@@ -176,6 +344,8 @@ function Invoke-ComprehensiveCopilotRemoval {
         }
     }
 
+    Remove-CopilotDesktopApplication -Result $result -Logger $Logger -WhatIf:$WhatIfPreference
+
     $loadedUserSids = @(Get-ChildItem Registry::HKEY_USERS -ErrorAction SilentlyContinue |
         Where-Object { $_.PSChildName -match '^S-1-5-21-(?:\d+-){3}\d+$' } |
         Select-Object -ExpandProperty PSChildName)
@@ -189,7 +359,7 @@ function Invoke-ComprehensiveCopilotRemoval {
         }
         catch {
             $result.Failures++
-            Write-CopilotMessage -Logger $Logger -Message "Failed applying Copilot policies to loaded user $sid: $($_.Exception.Message)" -Level WARN
+            Write-CopilotMessage -Logger $Logger -Message "Failed applying Copilot policies to loaded user ${sid}: $($_.Exception.Message)" -Level WARN
         }
     }
 
@@ -219,7 +389,7 @@ function Invoke-ComprehensiveCopilotRemoval {
             }
             catch {
                 $result.Failures++
-                Write-CopilotMessage -Logger $Logger -Message "Failed applying Copilot policies to offline profile $profilePath: $($_.Exception.Message)" -Level WARN
+                Write-CopilotMessage -Logger $Logger -Message "Failed applying Copilot policies to offline profile ${profilePath}: $($_.Exception.Message)" -Level WARN
             }
         }
 
@@ -325,13 +495,14 @@ function Invoke-ComprehensiveCopilotRemoval {
         $name = [string]$_.DisplayName; $fullName = [string]$_.PackageName
         @($packagePatterns | Where-Object { $name -like $_ -or $fullName -like $_ }).Count -gt 0
     }).Count
+    $result.RemainingDesktopApplications = @(Get-CopilotDesktopRegistrations).Count
 
     if ($WhatIfPreference) {
         $result.Status = 'WhatIf'
     }
-    elseif (($result.RemainingInstalledPackages + $result.RemainingProvisionedPackages) -gt 0) {
+    elseif (($result.RemainingInstalledPackages + $result.RemainingProvisionedPackages + $result.RemainingDesktopApplications) -gt 0) {
         $result.Status = 'FailedVerification'
-        $result.Failures += $result.RemainingInstalledPackages + $result.RemainingProvisionedPackages
+        $result.Failures += $result.RemainingInstalledPackages + $result.RemainingProvisionedPackages + $result.RemainingDesktopApplications
     }
     elseif ($result.Failures -gt 0) {
         $result.Status = 'CompletedWithErrors'
@@ -341,7 +512,7 @@ function Invoke-ComprehensiveCopilotRemoval {
     }
 
     $level = if ($result.Failures -gt 0) { 'ERROR' } else { 'OK' }
-    Write-CopilotMessage -Logger $Logger -Level $level -Message ("Copilot removal completed. Status={0}; InstalledRemoved={1}; ProvisionedRemoved={2}; StartupEntriesDisabled={3}; UserHives={4}; OfflineHives={5}; Failures={6}" -f $result.Status,$result.InstalledPackagesRemoved,$result.ProvisionedPackagesRemoved,$result.StartupEntriesDisabled,$result.UserHivesUpdated,$result.OfflineUserHivesUpdated,$result.Failures)
+    Write-CopilotMessage -Logger $Logger -Level $level -Message ("Copilot removal completed. Status={0}; DesktopRemoved={1}; InstalledRemoved={2}; ProvisionedRemoved={3}; StartupEntriesDisabled={4}; UserHives={5}; OfflineHives={6}; Failures={7}" -f $result.Status,$result.DesktopApplicationsRemoved,$result.InstalledPackagesRemoved,$result.ProvisionedPackagesRemoved,$result.StartupEntriesDisabled,$result.UserHivesUpdated,$result.OfflineUserHivesUpdated,$result.Failures)
     return [pscustomobject]$result
 }
 

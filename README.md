@@ -50,12 +50,13 @@ The active endpoint scripts are designed primarily for 64-bit Windows PowerShell
 | [`05_Weekend_HP_Drivers_Update.ps1`](./05_Weekend_HP_Drivers_Update.ps1) | Vendor-aware HP/Dell maintenance with safe driver filtering, HPIA/DCU workflows, HP BIOS Internet-update policy, AV scheduled power-on, Dell Wake-on-LAN validation, Dell cleanup of orphaned HP software, and hardware/driver telemetry. |
 | [`06_Weekend_Windows_Updates.ps1`](./06_Weekend_Windows_Updates.ps1) | Installs Microsoft/Windows updates with PSWindowsUpdate, optionally resets Windows Update components, compares pre/post compliance, records detailed results, and reports—but does not itself perform—the required reboot. |
 | [`07_Force_Reboot_Install_Updates.ps1`](./07_Force_Reboot_Install_Updates.ps1) | Coordinates a persistent, verified multi-reboot cycle; supports scheduled, startup-resume, maintenance-closeout, and final-verification modes; records the source of persistent reboot flags. |
-| [`08_System_Repair.ps1`](./08_System_Repair.ps1) | Performs DISM/SFC, storage, WMI, RPC, Explorer, Windows Update, management-agent, disk-usage, and cleanup diagnostics/repairs. It is the sole owner of log consolidation, telemetry rotation, `C:\Temp` cleanup, and expired-log retention. |
+| [`08_System_Repair.ps1`](./08_System_Repair.ps1) | Performs DISM/SFC, storage, WMI, RPC, Explorer, Windows Update, management-agent, disk-usage, and cleanup diagnostics/repairs. With explicit authorization it escalates persistent corruption to matching source-WIM repair and an in-place Windows repair that preserves applications, files, profiles, domain membership, and settings. |
 | [`09_Disable_Windows_Update_Services.ps1`](./09_Disable_Windows_Update_Services.ps1) | Applies and verifies the post-maintenance Windows Update service, scheduled-task, and registry-policy state. |
 | [`10_Sync_System_Time.ps1`](./10_Sync_System_Time.ps1) | Detects domain or standalone time mode, configures Windows Time, safely restarts/resynchronizes it, validates offset/source/stratum, and publishes recent time-service evidence. |
 | [`14_Endpoint_Health_Inventory.ps1`](./14_Endpoint_Health_Inventory.ps1) | Produces the authoritative endpoint snapshot: hardware, OS, BIOS settings/version, warranty, security, networking, drivers, health findings, remediation candidates, normalized software records, and uninstall tombstones. |
 | [`16_Check_Deep_Freeze_Status.ps1`](./16_Check_Deep_Freeze_Status.ps1) | Uses the Faronics CLI to report Frozen, Thawed, Unknown, or NotInstalled state and tracks how long the current state has persisted. |
 | [`Repair-MicrosoftEdgeUpdate.ps1`](./Repair-MicrosoftEdgeUpdate.ps1) | Detection-first Edge Update repair for the fixed `MicrosoftEdgeUpdateRepair` remediation class; verifies policy, services, tasks, updater state, and optional signed Enterprise MSI repair. |
+| [`Repair-Windows-ComponentStore.ps1`](./Repair-Windows-ComponentStore.ps1) | Script 08 escalation helper: identifies the matching `install.wim` index, stages a compatible ADK DISM when needed, tries WIM and Windows Update repair sources, verifies DISM/SFC, and can launch a guarded in-place repair while the computer is thawed. |
 
 ### Administrative, framework, and validation files
 
@@ -143,6 +144,17 @@ Uses a durable state file and single-instance lock to prevent repeated or unveri
 ### `08_System_Repair.ps1`
 
 Runs detection-first repairs with disruptive operations controlled by switches. Major areas include DISM component-store detection/repair, SFC and CBS corruption extraction, volume scan/SpotFix/offline repair, SSD/NVMe SMART and reliability data, WMI, DNS/network reset options, RPC root-cause testing, Explorer crash/hang and shell-extension diagnostics, Search/Explorer cache repair, Action1 validation, SoftwareDistribution cleanup, and optional HP driver-only repair when CBS evidence supports it.
+
+Component-store escalation is disabled by default. With both `-AutoRepairOnDetection` and `-AllowComponentStoreEscalation`, Script 08 first completes its ordinary online DISM/SFC workflow and repeats DISM/SFC verification. Persistent corruption then invokes `Repair-Windows-ComponentStore.ps1`, which:
+
+1. Verifies that Deep Freeze is either not installed or explicitly reports `Thawed`.
+2. Matches the installed Windows edition, architecture, and language to the correct `install.wim` index.
+3. Tries `DISM /RestoreHealth` with the matching WIM index and then Windows Update as an additional source.
+4. Runs SFC and a final DISM scan.
+5. If corruption remains, verifies that the expanded setup media is compatible, copies and hashes it locally, suspends BitLocker when necessary, records and disables Compton maintenance tasks, and launches Windows Setup in upgrade mode.
+6. Uses a SYSTEM startup task to verify DISM/SFC after Setup reboots and restores the maintenance tasks that were enabled before the repair.
+
+The in-place repair retains installed applications, user data, profiles, domain membership, and Windows settings. It refuses to launch when Deep Freeze is Frozen, its state cannot be verified, the media is older than the installed build, required setup files are missing, or free disk space is insufficient.
 
 Script 08 is also the sole cleanup owner. It consolidates old maintenance logs, prunes expired archives and Deep Freeze events, rotates oversized `Maintenance-Telemetry.ndjson`, cleans safe contents beneath `C:\Temp`, and removes retired HP BIOS staging. Reparse points and security-blocked targets are intentional skips rather than health warnings. Copilot removal remains an explicit `-AllowCopilotRemoval` fallback.
 

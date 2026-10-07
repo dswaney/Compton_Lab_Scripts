@@ -1,14 +1,14 @@
 {
     "SchemaVersion": 1,
-    "ManifestVersion": "3.0.1",
-    "PackageVersion": "3.0.1",
-    "GeneratedUtc": "2026-10-07T15:15:46Z",
+    "ManifestVersion": "3.0.2",
+    "PackageVersion": "3.0.2",
+    "GeneratedUtc": "2026-10-07T15:38:00Z",
     "Files": [
         {
             "Name": "00_Update-Scripts-FromShare.ps1",
             "Role": "Updater",
-            "Version": "4.11.1",
-            "SHA256": "1E7DAFD86B7220B85F23D59496626BF95C5F9254ABBD5BF0FB8EA65F291B84E2"
+            "Version": "4.11.2",
+            "SHA256": "F51BA87BEB8E04ACF50C9E08292F49D9E17EBE3FC0E6557D9325A2EBF074AAF4"
         },
         {
             "Name": "01_Enable_Windows_Update_Services.ps1",
@@ -55,8 +55,8 @@
         {
             "Name": "08_System_Repair.ps1",
             "Role": "ManagedFile",
-            "Version": "4.6.4",
-            "SHA256": "2DDED688AECAA65BA1D558F7183FC4A43B108C75028FE4E8D051972BED035AB6"
+            "Version": "4.7.0",
+            "SHA256": "22A91E8D2C15D155A2831C0E5527D5FC51A7A8B58C7EEFC4017369DB7A7BC330"
         },
         {
             "Name": "09_Disable_Windows_Update_Services.ps1",
@@ -123,6 +123,12 @@
             "Role": "Remediation",
             "Version": "1.0.0",
             "SHA256": "C2F1DFA0DB889388064A021FDC04D21FE97FDA0C136DD03447C1661B0581B337"
+        },
+        {
+            "Name": "Repair-Windows-ComponentStore.ps1",
+            "Role": "Remediation",
+            "Version": "2.2.0",
+            "SHA256": "35717DF3E1DFD91B890A6C0A5C2DC638A8170F52F6E5F3766D30F910354F7AD6"
         },
         {
             "Name": "Register-Tasks_SYSTEM.ps1",

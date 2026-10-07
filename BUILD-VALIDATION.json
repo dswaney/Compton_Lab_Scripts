@@ -1,5 +1,5 @@
 {
-  "PackageVersion": "3.0.1",
+  "PackageVersion": "3.0.2",
   "PowerShellParserExecuted": false,
   "StructuralChecks": [
     "Manifest hashes generated",
@@ -14,7 +14,9 @@
     "Elastic StartsWith prefixes in script 04 contain no wildcard characters and are documented in README",
     "Script 14 safely handles optional scheduled-task actions, adapter statistics, and single-item baseline collections",
     "Script 14 classifies and deduplicates WER records and separates Windows servicing failures from application crashes",
-    "Script 08 includes .log retention by LastWriteTime, Old Logs pruning, guarded HP BIOS staging removal, and C:\\Temp contents cleanup"
+    "Script 08 includes .log retention by LastWriteTime, Old Logs pruning, guarded HP BIOS staging removal, and C:\\Temp contents cleanup",
+    "Script 08 component-store escalation is opt-in and uses the approved Repair-Windows-ComponentStore helper",
+    "The component-store helper validates Deep Freeze, media compatibility, free space, and post-upgrade DISM/SFC state before restoring maintenance tasks"
   ],
   "RequiresWindowsPowerShellValidation": true
 }

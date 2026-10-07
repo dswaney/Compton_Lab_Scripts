@@ -1,8 +1,10 @@
 #requires -version 5.1
 # =====================================================================
 # ScriptName: 00_Update-Scripts-FromShare.ps1
-# ScriptVersion: 4.11.1
-# LastUpdated: 2026-10-06
+# ScriptVersion: 4.11.2
+# LastUpdated: 2026-10-07
+# Changes: v4.11.2 approves the component-store repair helper used by Script 08
+#          for source-WIM repair and guarded Windows in-place repair escalation.
 # Changes: v4.11.0 approves and supplementally deploys SoftwareInventory.Policy.json
 #          so Script 14 software filtering remains centrally managed even during
 #          a manifest-transition deployment.
@@ -94,6 +96,7 @@ $SoftwareInventoryPolicyName = 'SoftwareInventory.Policy.json'
     'Maintenance.Policy.json',
     'SoftwareInventory.Policy.json',
     'Repair-MicrosoftEdgeUpdate.ps1',
+    'Repair-Windows-ComponentStore.ps1',
     'Register-Tasks_SYSTEM.ps1'
 )
 $LocalRoot = 'C:\Scripts'

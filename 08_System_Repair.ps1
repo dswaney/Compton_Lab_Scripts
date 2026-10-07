@@ -1,8 +1,16 @@
-# =====================================================================
+﻿# =====================================================================
 # ScriptName: 08_System_Repair.ps1
-# ScriptVersion: 4.6.4
-# LastUpdated: 2026-10-06
-# Changes: v4.6.4 records reparse-point/security cleanup exclusions as intentional
+# ScriptVersion: 4.7.0
+# LastUpdated: 2026-10-07
+# Changes: v4.7.0 adds guarded component-store escalation. After the normal
+#          online DISM/SFC workflow, Script 08 verifies the component store and
+#          system files again. If corruption remains and the explicit opt-in is
+#          enabled, it stages and launches Repair-Windows-ComponentStore.ps1.
+#          That helper automatically selects the matching install.wim index,
+#          tries source-WIM repair, and can perform an in-place Windows repair
+#          that preserves applications, files, profiles, domain membership,
+#          and settings. Deep Freeze must report Thawed before escalation.
+# Previous: v4.6.4 records reparse-point/security cleanup exclusions as intentional
 #          safety skips instead of TempCleanup warnings and keeps a healthy RPC
 #          root-cause assessment out of the warning/notes collection.
 # Previous: v4.6.3 permits exact SYSTEM-profile cache targets and treats empty
@@ -58,6 +66,12 @@ param(
     [switch]$AllowHpDriverRepairFromCbs = $false,
     [string]$HpImageAssistantSourcePath = '\\SERVER\DeploymentShare\HPImageAssistant',
     [string]$HpImageAssistantLocalPath = 'C:\ProgramData\SystemRepair\HPImageAssistant',
+    [switch]$AllowComponentStoreEscalation = $false,
+    [string]$ComponentStoreRepairScriptPath = '\\SERVER\DeploymentShare\Repair-Windows-ComponentStore.ps1',
+    [string]$ComponentStoreRepairLocalPath = 'C:\ProgramData\Compton\SystemRepair\Repair-Windows-ComponentStore.ps1',
+    [string]$ComponentStoreImagePath = '\\SERVER\DeploymentShare\Installers\25H2\sources\install.wim',
+    [string]$ComponentStoreSetupMediaPath = '\\SERVER\DeploymentShare\Installers\25H2',
+    [string]$ComponentStoreAdkPath = '\\SERVER\DeploymentShare\Installers\ADK\Deployment Tools',
     [switch]$AllowCopilotRemoval = $false,
     [switch]$AggressiveCleanup = $false,
     [switch]$ClearEventLogs = $false,
@@ -73,7 +87,7 @@ param(
 $ErrorActionPreference = 'Stop'
 
 $script:ScriptName = '08_System_Repair.ps1'
-$script:ScriptVersion = '4.6.4'
+$script:ScriptVersion = '4.7.0'
 $script:RunId = [guid]::NewGuid().Guid
 $script:TelemetryNdjsonPath = Join-Path $LogDirectory 'Maintenance-Telemetry.ndjson'
 $script:LatestTelemetryPath = Join-Path $LogDirectory '08_System_Repair.latest.json'
@@ -123,6 +137,9 @@ $script:Summary = [ordered]@{
     HpDriverRepairAttempted      = $false
     HpDriverRepairSucceeded      = $false
     HpImageAssistantPath         = $null
+    ComponentStoreEscalationAttempted = $false
+    ComponentStoreEscalationExitCode = $null
+    InPlaceRepairAuthorized      = [bool]$AllowComponentStoreEscalation
     WmiRepositoryInconsistent    = $false
     StorageHealthWarnings        = 0
     StorageFailurePredicted      = $false
@@ -286,6 +303,10 @@ function Write-YamlLog {
         $lines.Add("  allow_hp_driver_repair_from_cbs: $(ConvertTo-YamlScalar $AllowHpDriverRepairFromCbs)") | Out-Null
         $lines.Add("  hp_image_assistant_source_path: $(ConvertTo-YamlScalar $HpImageAssistantSourcePath)") | Out-Null
         $lines.Add("  hp_image_assistant_local_path: $(ConvertTo-YamlScalar $HpImageAssistantLocalPath)") | Out-Null
+        $lines.Add("  allow_component_store_escalation: $(ConvertTo-YamlScalar $AllowComponentStoreEscalation)") | Out-Null
+        $lines.Add("  component_store_repair_script_path: $(ConvertTo-YamlScalar $ComponentStoreRepairScriptPath)") | Out-Null
+        $lines.Add("  component_store_image_path: $(ConvertTo-YamlScalar $ComponentStoreImagePath)") | Out-Null
+        $lines.Add("  component_store_setup_media_path: $(ConvertTo-YamlScalar $ComponentStoreSetupMediaPath)") | Out-Null
         $lines.Add("  allow_copilot_removal: $(ConvertTo-YamlScalar $AllowCopilotRemoval)") | Out-Null
         $lines.Add("  aggressive_cleanup: $(ConvertTo-YamlScalar $AggressiveCleanup)") | Out-Null
         $lines.Add("  clear_event_logs: $(ConvertTo-YamlScalar $ClearEventLogs)") | Out-Null
@@ -3125,6 +3146,80 @@ function Invoke-SystemFileRepairWorkflow {
     }
 }
 
+function Invoke-ComponentStoreEscalation {
+    [CmdletBinding()]
+    param()
+
+    $script:Summary.ComponentStoreEscalationAttempted = $true
+
+    if (-not $AllowComponentStoreEscalation) {
+        Write-Log 'COMPONENT_STORE_ESCALATION|Status=Skipped|Reason=AllowComponentStoreEscalationDisabled|NextStep=Run with -AllowComponentStoreEscalation after confirming the maintenance window.' 'WARN'
+        Add-DetailedResult -Step 'ComponentStoreEscalation' -Status 'Skipped' -Message 'Persistent corruption remains, but source-WIM and in-place repair escalation is not authorized.'
+        return
+    }
+
+    if (-not (Test-Path -LiteralPath $ComponentStoreRepairScriptPath -PathType Leaf)) {
+        throw "Component-store escalation helper was not found: $ComponentStoreRepairScriptPath"
+    }
+    if (-not (Test-Path -LiteralPath $ComponentStoreImagePath -PathType Leaf)) {
+        throw "Component-store repair image was not found: $ComponentStoreImagePath"
+    }
+    if (-not (Test-Path -LiteralPath (Join-Path $ComponentStoreSetupMediaPath 'setup.exe') -PathType Leaf)) {
+        throw "Expanded Windows setup media is missing setup.exe: $ComponentStoreSetupMediaPath"
+    }
+
+    $localParent = Split-Path -Path $ComponentStoreRepairLocalPath -Parent
+    if (-not (Test-Path -LiteralPath $localParent -PathType Container)) {
+        New-Item -Path $localParent -ItemType Directory -Force -ErrorAction Stop | Out-Null
+    }
+    Copy-Item -LiteralPath $ComponentStoreRepairScriptPath -Destination $ComponentStoreRepairLocalPath -Force -ErrorAction Stop
+
+    $localHash = (Get-FileHash -LiteralPath $ComponentStoreRepairLocalPath -Algorithm SHA256 -ErrorAction Stop).Hash
+    $sourceHash = (Get-FileHash -LiteralPath $ComponentStoreRepairScriptPath -Algorithm SHA256 -ErrorAction Stop).Hash
+    if ($localHash -ne $sourceHash) {
+        throw 'The locally staged component-store repair helper failed SHA-256 verification.'
+    }
+
+    $powerShell = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+    $arguments = @(
+        '-NoProfile',
+        '-NonInteractive',
+        '-ExecutionPolicy', 'Bypass',
+        '-File', ('"{0}"' -f $ComponentStoreRepairLocalPath),
+        '-ImagePath', ('"{0}"' -f $ComponentStoreImagePath),
+        '-SetupMediaShare', ('"{0}"' -f $ComponentStoreSetupMediaPath),
+        '-AdkSharePath', ('"{0}"' -f $ComponentStoreAdkPath),
+        '-EnableInPlaceRepair:$true'
+    )
+
+    Write-Log 'COMPONENT_STORE_ESCALATION|Status=Starting|Sequence=MatchWimIndex,SourceWimRestoreHealth,WindowsUpdateFallback,InPlaceRepairIfStillCorrupt' 'WARN'
+    Write-Log "Component-store helper staged and verified: $ComponentStoreRepairLocalPath; SHA256=$localHash" 'INFO'
+    Add-RepairAttempt 'Component-store source-WIM/in-place repair escalation'
+
+    $process = Start-Process -FilePath $powerShell -ArgumentList ($arguments -join ' ') -Wait -PassThru -WindowStyle Hidden -ErrorAction Stop
+    $script:Summary.ComponentStoreEscalationExitCode = [int]$process.ExitCode
+
+    if ($process.ExitCode -notin @(0, 1641, 3010)) {
+        throw "Component-store escalation helper failed with exit code $($process.ExitCode). Review its timestamped log under $LogDirectory."
+    }
+
+    if ($process.ExitCode -in @(1641, 3010)) {
+        $script:Summary.RebootRequired = $true
+        Write-Log "COMPONENT_STORE_ESCALATION|Status=RepairInstallAccepted|ExitCode=$($process.ExitCode)|RebootRequired=True|Preserve=Apps,Files,Profiles,DomainMembership,Settings" 'WARN'
+    }
+    else {
+        Write-Log 'COMPONENT_STORE_ESCALATION|Status=Completed|ExitCode=0|RebootRequired=EvaluatePendingReboot' 'OK'
+    }
+
+    Add-DetailedResult -Step 'ComponentStoreEscalation' -Status 'Success' -Message 'Component-store escalation helper completed or handed off to Windows Setup.' -Data @{
+        ExitCode        = [int]$process.ExitCode
+        HelperPath      = $ComponentStoreRepairLocalPath
+        ImagePath       = $ComponentStoreImagePath
+        SetupMediaShare = $ComponentStoreSetupMediaPath
+        HelperSha256    = $localHash
+    }
+}
+
 function Test-IsHpSystem {
     try {
         $cs = Get-CimInstance Win32_ComputerSystem -ErrorAction Stop
@@ -5497,6 +5592,9 @@ function New-SystemRepairTelemetryEvent {
                 CbsCorruptDriverFileNames = @($script:Summary.CbsCorruptDriverFiles | ForEach-Object { [string]$_ } | Select-Object -Unique)
                 HpDriverRepairAttempted = [bool]$script:Summary.HpDriverRepairAttempted
                 HpDriverRepairSucceeded = [bool]$script:Summary.HpDriverRepairSucceeded
+                ComponentStoreEscalationAuthorized = [bool]$script:Summary.InPlaceRepairAuthorized
+                ComponentStoreEscalationAttempted = [bool]$script:Summary.ComponentStoreEscalationAttempted
+                ComponentStoreEscalationExitCode = $script:Summary.ComponentStoreEscalationExitCode
                 WmiRepositoryInconsistent = [bool]$script:Summary.WmiRepositoryInconsistent
                 StorageHealthWarnings = [int]$script:Summary.StorageHealthWarnings
                 StorageFailurePredictionDetected = [bool]$script:Summary.StorageFailurePredicted
@@ -5687,6 +5785,21 @@ try {
         if ($script:Summary.DismCorruptionDetected) { Invoke-Safely -Name 'DISMRepair' -ScriptBlock { Invoke-DismRepair } | Out-Null }
         if ($script:Summary.SfcIntegrityViolations) { Invoke-Safely -Name 'SfcCbsRepairWorkflow' -ScriptBlock { Invoke-SystemFileRepairWorkflow } -WarnOnly | Out-Null }
         if ($script:Summary.CbsDriverCorruptionDetected -and $script:Summary.SfcIntegrityViolations) { Invoke-Safely -Name 'Tier3HpiaDriverRemediationFromCbs' -ScriptBlock { Invoke-HpiaDriverOnlyRepairFromCbs } -WarnOnly | Out-Null }
+
+        if ($script:Summary.DismCorruptionDetected -or $script:Summary.SfcIntegrityViolations) {
+            Write-Log 'COMPONENT_STORE_POST_REPAIR_VERIFY|Status=Starting|Checks=DISMScanHealth,SFCVerifyOnly' 'INFO'
+            Invoke-Safely -Name 'ComponentStorePostRepairVerification' -ScriptBlock {
+                Invoke-DismDetection
+                Invoke-SfcDetection
+            } -WarnOnly | Out-Null
+
+            if ($script:Summary.DismCorruptionDetected -or $script:Summary.SfcIntegrityViolations) {
+                Invoke-Safely -Name 'ComponentStoreEscalation' -ScriptBlock { Invoke-ComponentStoreEscalation } -WarnOnly | Out-Null
+            }
+            else {
+                Write-Log 'COMPONENT_STORE_POST_REPAIR_VERIFY|Status=Clean|EscalationRequired=False' 'OK'
+            }
+        }
         if ($script:Summary.WmiRepositoryInconsistent -and $AllowWmiRepair) { Invoke-Safely -Name 'WMIRepair' -ScriptBlock { Invoke-WmiRepair } -WarnOnly | Out-Null }
 
         if ($script:Summary.DiskCorruptionSuspected) {

@@ -1,8 +1,14 @@
 #requires -version 5.1
 # =====================================================================
 # ScriptName: 00_Update-Scripts-FromShare.ps1
-# ScriptVersion: 4.9.0
-# LastUpdated: 2026-09-21
+# ScriptVersion: 4.11.1
+# LastUpdated: 2026-10-06
+# Changes: v4.11.0 approves and supplementally deploys SoftwareInventory.Policy.json
+#          so Script 14 software filtering remains centrally managed even during
+#          a manifest-transition deployment.
+# Changes: v4.10.0 persists the working production source roots across self-update,
+#          passes them to the relaunched updater, rejects updater downgrades, and
+#          ignores sanitized placeholder fleet-status destinations.
 # Changes: v4.9.0 approves the dedicated Microsoft Edge Update remediation.
 # Changes: v4.8.0 approves the shared Maintenance.Copilot.psm1 module.
 # Changes: v4.7.0 requires, approves, and supplementally deploys script 16 for the Monday Deep Freeze status audit.
@@ -13,7 +19,7 @@
 # Purpose:
 #   Manifest-driven, self-bootstrapping updater for C:\Scripts.
 #   - Uses standardized Elastic-friendly text log format: timestamp, computer, level, message.
-#   - Uses \\SERVER\DeploymentShare with an IP fallback.
+#   - Uses a persisted production source configuration with an optional fallback.
 #   - Downloads Maintenance.Framework.psm1 when missing or changed.
 #   - Validates PowerShell syntax and updater structure before deployment.
 #   - Parses all PowerShell files before installation.
@@ -24,21 +30,25 @@
 
 [CmdletBinding()]
 param(
-    [switch]$Relaunched
+    [switch]$Relaunched,
+    [string]$PreferredSourceRoot,
+    [string]$FallbackSourceRoot
 )
 
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 
 $ScriptName = '00_Update-Scripts-FromShare.ps1'
-$ScriptVersion = '4.9.0'
-$PreferredSourceRoot = '\\SERVER\DeploymentShare'
-$FallbackSourceRoot = '\\FALLBACK-SERVER\DeploymentShare'
+$ScriptVersion = '4.11.0'
+$DefaultPreferredSourceRoot = '\\filesvr\Labscripts'
+$DefaultFallbackSourceRoot = '\\10.2.3.30\Labscripts'
+$SourceConfigurationPath = Join-Path $env:ProgramData 'ComptonMaintenance\Updater.Source.json'
 $ManifestName = 'DeploymentManifest.json'
 $FrameworkName = 'Maintenance.Framework.psm1'
 $RegisterTasksName = 'Register-Tasks_SYSTEM.ps1'
 $CombinedSundayScriptName = '04_Sunday_Lab_Application_Maintenance.ps1'
 $DeepFreezeStatusScriptName = '16_Check_Deep_Freeze_Status.ps1'
+$SoftwareInventoryPolicyName = 'SoftwareInventory.Policy.json'
 
 # These scripts are now embedded in 04_Sunday_Lab_Application_Maintenance.ps1.
 # They are removed from C:\Scripts only after the combined replacement has been
@@ -57,7 +67,8 @@ $DeepFreezeStatusScriptName = '16_Check_Deep_Freeze_Status.ps1'
 # when they are not yet listed in DeploymentManifest.json.
 [string[]]$SupplementalManagedFiles = @(
     $CombinedSundayScriptName,
-    $DeepFreezeStatusScriptName
+    $DeepFreezeStatusScriptName,
+    $SoftwareInventoryPolicyName
 )
 
 # Only these files are permitted to deploy into C:\Scripts.
@@ -81,6 +92,7 @@ $DeepFreezeStatusScriptName = '16_Check_Deep_Freeze_Status.ps1'
     'Maintenance.Copilot.psm1',
     'Maintenance.Framework.psm1',
     'Maintenance.Policy.json',
+    'SoftwareInventory.Policy.json',
     'Repair-MicrosoftEdgeUpdate.ps1',
     'Register-Tasks_SYSTEM.ps1'
 )
@@ -107,6 +119,91 @@ function Ensure-Directory {
     param([Parameter(Mandatory)][string]$Path)
     if (-not (Test-Path -LiteralPath $Path -PathType Container)) {
         New-Item -Path $Path -ItemType Directory -Force -ErrorAction Stop | Out-Null
+    }
+}
+
+function Test-PlaceholderSharePath {
+    [CmdletBinding()]
+    param([AllowNull()][AllowEmptyString()][string]$Path)
+
+    if ([string]::IsNullOrWhiteSpace($Path)) { return $true }
+    return ($Path -match '^\\\\(?:SERVER|FALLBACK-SERVER)(?:\\|$)')
+}
+
+function Resolve-UpdaterSourceConfiguration {
+    [CmdletBinding()]
+    param()
+
+    $savedConfiguration = $null
+    if (Test-Path -LiteralPath $SourceConfigurationPath -PathType Leaf) {
+        try {
+            $savedConfiguration = Get-Content -LiteralPath $SourceConfigurationPath -Raw -ErrorAction Stop |
+                ConvertFrom-Json -ErrorAction Stop
+        }
+        catch {
+            Write-UpdaterStatus -Message "Saved updater source configuration is invalid and will be rebuilt: $($_.Exception.Message)" -Level WARN
+        }
+    }
+
+    if (Test-PlaceholderSharePath -Path $script:PreferredSourceRoot) {
+        $savedPreferred = if ($savedConfiguration) { [string]$savedConfiguration.PreferredSourceRoot } else { $null }
+        $savedLastWorking = if ($savedConfiguration) { [string]$savedConfiguration.LastWorkingSourceRoot } else { $null }
+
+        if (-not (Test-PlaceholderSharePath -Path $savedPreferred)) {
+            $script:PreferredSourceRoot = $savedPreferred
+        }
+        elseif (-not (Test-PlaceholderSharePath -Path $savedLastWorking)) {
+            $script:PreferredSourceRoot = $savedLastWorking
+        }
+        else {
+            $script:PreferredSourceRoot = $DefaultPreferredSourceRoot
+        }
+    }
+
+    if (Test-PlaceholderSharePath -Path $script:FallbackSourceRoot) {
+        $savedFallback = if ($savedConfiguration) { [string]$savedConfiguration.FallbackSourceRoot } else { $null }
+        if (-not (Test-PlaceholderSharePath -Path $savedFallback)) {
+            $script:FallbackSourceRoot = $savedFallback
+        }
+        else {
+            $script:FallbackSourceRoot = $DefaultFallbackSourceRoot
+        }
+    }
+
+    if (Test-PlaceholderSharePath -Path $script:PreferredSourceRoot) {
+        throw 'No usable maintenance source root is configured.'
+    }
+}
+
+function Save-UpdaterSourceConfiguration {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][string]$LastWorkingSourceRoot)
+
+    if (Test-PlaceholderSharePath -Path $LastWorkingSourceRoot) {
+        throw "Refusing to persist an invalid maintenance source root: $LastWorkingSourceRoot"
+    }
+
+    $configurationDirectory = Split-Path -Parent $SourceConfigurationPath
+    Ensure-Directory -Path $configurationDirectory
+
+    $configuration = [ordered]@{
+        SchemaVersion          = 1
+        PreferredSourceRoot    = $script:PreferredSourceRoot
+        FallbackSourceRoot     = $script:FallbackSourceRoot
+        LastWorkingSourceRoot  = $LastWorkingSourceRoot
+        LastUpdatedUtc         = (Get-Date).ToUniversalTime().ToString('o')
+    }
+
+    $temporaryPath = "$SourceConfigurationPath.$RunId.tmp"
+    try {
+        $configuration | ConvertTo-Json -Depth 4 |
+            Set-Content -LiteralPath $temporaryPath -Encoding UTF8 -Force -ErrorAction Stop
+        Move-Item -LiteralPath $temporaryPath -Destination $SourceConfigurationPath -Force -ErrorAction Stop
+    }
+    finally {
+        if (Test-Path -LiteralPath $temporaryPath -PathType Leaf) {
+            Remove-Item -LiteralPath $temporaryPath -Force -ErrorAction SilentlyContinue
+        }
     }
 }
 
@@ -192,6 +289,15 @@ function Get-FileVersionText {
     param([Parameter(Mandatory)][string]$Path)
     if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { return 'Missing' }
     try {
+        if ([IO.Path]::GetExtension($Path) -ieq '.json') {
+            $json = Get-Content -LiteralPath $Path -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
+            foreach ($propertyName in @('Version','ScriptVersion','ModuleVersion','PolicyVersion')) {
+                $property = $json.PSObject.Properties[$propertyName]
+                if ($null -ne $property -and -not [string]::IsNullOrWhiteSpace([string]$property.Value)) {
+                    return ([string]$property.Value).Trim()
+                }
+            }
+        }
         $header = Select-String -LiteralPath $Path -Pattern '^\s*#\s*ScriptVersion\s*:\s*(.+?)\s*$' -ErrorAction Stop | Select-Object -First 1
         if ($header) { return $header.Matches[0].Groups[1].Value.Trim() }
         $moduleVersion = Select-String -LiteralPath $Path -Pattern '^\s*\$script:FrameworkVersion\s*=\s*["'']([^"'']+)["'']' -ErrorAction Stop | Select-Object -First 1
@@ -202,6 +308,7 @@ function Get-FileVersionText {
 
 function Get-ActiveSourceRoot {
     foreach ($candidate in @($PreferredSourceRoot,$FallbackSourceRoot)) {
+        if (Test-PlaceholderSharePath -Path $candidate) { continue }
         try {
             if (Test-Path -LiteralPath $candidate -PathType Container -ErrorAction Stop) {
                 $script:SourceRootUsed = $candidate
@@ -209,7 +316,8 @@ function Get-ActiveSourceRoot {
             }
         } catch { }
     }
-    throw "Neither source share is available. Preferred: $PreferredSourceRoot | Fallback: $FallbackSourceRoot"
+    $fallbackDisplay = if ([string]::IsNullOrWhiteSpace($FallbackSourceRoot)) { '<not configured>' } else { $FallbackSourceRoot }
+    throw "No configured source share is available. Preferred: $PreferredSourceRoot | Fallback: $fallbackDisplay"
 }
 
 function Read-DeploymentManifest {
@@ -255,6 +363,9 @@ function Test-UpdaterSourceStructure {
 
     $requiredFunctions = @(
         'Ensure-Directory',
+        'Test-PlaceholderSharePath',
+        'Resolve-UpdaterSourceConfiguration',
+        'Save-UpdaterSourceConfiguration',
         'Write-UpdaterStatus',
         'Get-Sha256',
         'Test-PowerShellFile',
@@ -328,6 +439,7 @@ function Install-ManifestEntry {
     # directly with the local file instead of using the manifest SHA as the
     # update decision. This prevents stale manifest hashes from blocking updates.
     $sourceHash = Get-Sha256 -Path $sourcePath
+    $sourceFileVersion = Get-FileVersionText -Path $sourcePath
 
     if ($localExists -and $localHash -eq $sourceHash) {
         Write-UpdaterStatus "$name is current." 'OK'
@@ -336,6 +448,24 @@ function Install-ManifestEntry {
     }
 
     if ($name -ieq $ScriptName) {
+        if ($localExists) {
+            try {
+                $installedUpdaterVersion = [version]$localVersion
+                $sourceUpdaterVersion = [version]$sourceFileVersion
+                if ($sourceUpdaterVersion -lt $installedUpdaterVersion) {
+                    $message = "Skipped updater downgrade. Installed=$installedUpdaterVersion; Source=$sourceUpdaterVersion"
+                    Write-UpdaterStatus -Message $message -Level WARN
+                    Add-Result -Name $name -Role $role -Status 'SkippedOlderUpdaterSource' `
+                        -LocalVersion $localVersion -ShareVersion $sourceFileVersion `
+                        -LocalHash $localHash -ShareHash $sourceHash -BackupPath $null -Message $message
+                    return [pscustomobject]@{ Changed=$false; SelfUpdated=$false }
+                }
+            }
+            catch {
+                Write-UpdaterStatus -Message "Updater version comparison was unavailable; structural validation will continue. Local=$localVersion; Source=$sourceFileVersion" -Level WARN
+            }
+        }
+
         $selfValidation = Test-UpdaterSourceStructure -Path $sourcePath
 
         if (-not $selfValidation.Valid) {
@@ -508,7 +638,11 @@ function Write-ExecutionRecord {
             if (Test-Path -LiteralPath $policyPath -PathType Leaf) {
                 $policy = Get-MaintenancePolicy -Path $policyPath
                 $fleetRecord = [ordered]@{ SchemaVersion=1;ComputerName=$env:COMPUTERNAME;ScriptName=$ScriptName;RunId=$RunId;CorrelationId=$RunId;Status=$Status;ExitCode=$ExitCode;LastCheckIn=$ended.ToUniversalTime().ToString('o');FrameworkVersion=(Get-MaintenanceConfiguration).FrameworkVersion;PolicyVersion=[string]$policy.PolicyVersion;FailureMessage=$FailureMessage }
-                Publish-MaintenanceFleetStatus -Record $fleetRecord -StatusRoots @($policy.FleetStatusRoots) | Out-Null
+                $statusRoots = @(
+                    $policy.FleetStatusRoots |
+                    Where-Object { -not (Test-PlaceholderSharePath -Path ([string]$_)) }
+                )
+                Publish-MaintenanceFleetStatus -Record $fleetRecord -StatusRoots $statusRoots | Out-Null
                 Write-MaintenanceEvent -EventId $(if($ExitCode -eq 0){1001}else{1900}) -EntryType $(if($ExitCode -eq 0){'Information'}else{'Error'}) -Message "$ScriptName completed. Status=$Status ExitCode=$ExitCode RunId=$RunId" | Out-Null
             }
         }
@@ -534,7 +668,9 @@ try {
     Ensure-Directory -Path $StagingRunRoot
     Write-UpdaterStatus "Starting manifest-driven update. RunId: $RunId" 'INFO'
 
+    Resolve-UpdaterSourceConfiguration
     $sourceRoot = Get-ActiveSourceRoot
+    Save-UpdaterSourceConfiguration -LastWorkingSourceRoot $sourceRoot
     Write-UpdaterStatus "Using source share: $sourceRoot" 'OK'
     $manifest = Read-DeploymentManifest -SourceRoot $sourceRoot
     Write-UpdaterStatus "Loaded manifest version $($manifest.ManifestVersion), package version $($manifest.PackageVersion), containing $(@($manifest.Files).Count) file(s)." 'INFO'
@@ -575,7 +711,17 @@ try {
     if ($selfResult.SelfUpdated -and -not $Relaunched) {
         Write-UpdaterStatus 'Updater was replaced successfully. Relaunching the new version.' 'ACTION'
         Write-ExecutionRecord -Status 'Relaunching' -ExitCode 0 -FailureMessage $null
-        & $PowerShellExe -NoProfile -ExecutionPolicy Bypass -File (Join-Path $LocalRoot $ScriptName) -Relaunched
+        $relaunchArguments = @(
+            '-NoProfile',
+            '-ExecutionPolicy', 'Bypass',
+            '-File', (Join-Path $LocalRoot $ScriptName),
+            '-PreferredSourceRoot', $PreferredSourceRoot
+        )
+        if (-not [string]::IsNullOrWhiteSpace($FallbackSourceRoot)) {
+            $relaunchArguments += @('-FallbackSourceRoot', $FallbackSourceRoot)
+        }
+        $relaunchArguments += '-Relaunched'
+        & $PowerShellExe @relaunchArguments
         $childExit = if ($null -eq $LASTEXITCODE) { 1 } else { [int]$LASTEXITCODE }
         exit $childExit
     }

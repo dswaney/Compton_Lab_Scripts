@@ -1,6 +1,6 @@
 # ScriptName: 05_Weekend_HP_Drivers_Update.ps1
-# ScriptVersion: 3.3.0
-# LastUpdated: 2026-09-24
+# ScriptVersion: 3.4.3
+# LastUpdated: 2026-10-06
 # Purpose: Weekend vendor driver update script with clean HP + Dell support,
 #          HP-only HPCMSL maintenance after vendor detection,
 #          YAML logging, colored output,
@@ -10,6 +10,21 @@
 #          Dell wired Wake-on-LAN BIOS and Ethernet-adapter verification,
 #          and staged per-run text logs that are published to C:\Logs only after completion,
 #          with automatic archival of prior script 05 logs.
+# ChangeLog: v3.3.1 supports both combined and separate HP BIOS scheduled-power-on
+#            time fields, including HP ProOne models that expose writable integer
+#            settings named BIOS Power-On Hour and BIOS Power-On Minute.
+#            v3.3.2 safely removes the orphaned HP SFU service/driver package from
+#            Dell systems before Dell Command Update runs.
+#            v3.4.0 expands Dell-only cleanup to remove orphaned HP management and
+#            support applications, services, tasks, and inactive component drivers
+#            while preserving printer/scanner and active peripheral support.
+#            v3.4.1 hardens optional-property access, fixes Windows PowerShell 5.1
+#            collection conversion in Dell Wake-on-LAN, and correctly handles the
+#            Dell Command Update report as a directory containing an XML report.
+#            v3.4.2 prevents collision with PowerShell's automatic $Matches variable
+#            and preserves array semantics when a Dell report contains one update.
+#            v3.4.3 fixes HP BCU AV scheduled-power-on configuration formatting by
+#            indenting option/integer values and validating the generated REPSET file.
 
 [CmdletBinding()]
 param([string]$WorkingRoot = 'C:\Temp\DriverUpdates',
@@ -37,7 +52,7 @@ $ErrorActionPreference = 'Stop'
 # Script metadata
 # -----------------------------
 $script:ScriptName        = '05_Weekend_HP_Drivers_Update.ps1'
-$script:ScriptVersion     = '3.3.0'
+$script:ScriptVersion     = '3.4.3'
 $script:StartTime         = Get-Date
 $script:RunFailures       = New-Object System.Collections.Generic.List[string]
 $script:InstalledList     = New-Object System.Collections.Generic.List[string]
@@ -93,6 +108,18 @@ $script:DellWakeOnLan = [pscustomobject]@{
     EthernetAdapterCount = 0
     AdapterResults       = @()
     Message              = $null
+}
+$script:DellHpCleanup = [pscustomobject]@{
+    Status            = 'NotRun'
+    ApplicationsRemoved = @()
+    AppxPackagesRemoved = @()
+    ServicesRemoved     = @()
+    TasksRemoved        = @()
+    DriverPackagesRemoved = @()
+    DriverPackagesSkipped = @()
+    BackupRoot         = $null
+    RebootRequired    = $false
+    Message           = $null
 }
 
 # -----------------------------
@@ -2134,6 +2161,250 @@ function Invoke-HPDriverUpdates {
 # -----------------------------
 # Dell support
 # -----------------------------
+function Get-HpManagementDriverPackages {
+    [CmdletBinding()]
+    param()
+
+    $output = @(& pnputil.exe /enum-drivers 2>&1 | ForEach-Object { [string]$_ })
+    if ($LASTEXITCODE -ne 0) {
+        throw "pnputil /enum-drivers failed with exit code $LASTEXITCODE."
+    }
+
+    $publishedName = $null
+    $originalName = $null
+    $providerName = $null
+    $className = $null
+    # Do not name this variable $matches. PowerShell variable names are
+    # case-insensitive and every -match operation replaces automatic $Matches.
+    $packageMatches = New-Object System.Collections.Generic.List[object]
+
+    foreach ($line in @($output + '')) {
+        if ([string]::IsNullOrWhiteSpace($line)) {
+            if ($originalName -and $originalName -match '^(?i:hp(?:analytics|customcap|sfu|svcsscan).*\.inf|hpsfuservice\.inf)$') {
+                $packageMatches.Add([pscustomobject]@{
+                    PublishedName = $publishedName
+                    OriginalName  = $originalName
+                    ProviderName  = $providerName
+                    ClassName     = $className
+                }) | Out-Null
+            }
+            $publishedName = $null
+            $originalName = $null
+            $providerName = $null
+            $className = $null
+            continue
+        }
+
+        if ($line -match '^\s*Published Name\s*:\s*(.+?)\s*$') { $publishedName = $Matches[1].Trim() }
+        elseif ($line -match '^\s*Original Name\s*:\s*(.+?)\s*$') { $originalName = $Matches[1].Trim() }
+        elseif ($line -match '^\s*Provider Name\s*:\s*(.+?)\s*$') { $providerName = $Matches[1].Trim() }
+        elseif ($line -match '^\s*Class Name\s*:\s*(.+?)\s*$') { $className = $Matches[1].Trim() }
+    }
+
+    return @($packageMatches | Where-Object {
+        $_.PublishedName -match '^oem\d+\.inf$' -and $_.ProviderName -match '^(?i:HP|Hewlett-Packard)'
+    })
+}
+
+function Invoke-DellHpSoftwareCleanup {
+    [CmdletBinding()]
+    param()
+
+    Write-Section 'Dell Vendor-Mismatch Cleanup'
+
+    try {
+        $manufacturer = Get-SystemManufacturer
+        if ($manufacturer -notmatch '(?i)Dell') {
+            $script:DellHpCleanup.Status = 'SkippedNotDell'
+            $script:DellHpCleanup.Message = "Cleanup skipped because manufacturer is '$manufacturer'."
+            Write-Log $script:DellHpCleanup.Message 'INFO'
+            return
+        }
+
+        $cleanupErrors = New-Object System.Collections.Generic.List[string]
+        $appNames = '(?i)^HP\s+(Support Assistant|Support Solutions Framework|Notifications|Documentation|Privacy Settings|Connection Optimizer|Analytics|Insights|Touchpoint Analytics|PC Hardware Diagnostics|Image Assistant|Wolf Security)|^HP SFU'
+        $peripheralExclusion = '(?i)print|printer|scan|scanner|imaging|plotter|monitor|display|keyboard|mouse|webcam|camera'
+
+        Write-Log 'Checking installed applications for HP management/support software.' 'INFO'
+        $uninstallRoots = @(
+            'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*',
+            'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*'
+        )
+        $apps = @(Get-ItemProperty -Path $uninstallRoots -ErrorAction SilentlyContinue | Where-Object {
+            $displayName = if ($_.PSObject.Properties.Name -contains 'DisplayName') { [string]$_.DisplayName } else { '' }
+            -not [string]::IsNullOrWhiteSpace($displayName) -and
+            $displayName -match $appNames -and
+            $displayName -notmatch $peripheralExclusion
+        } | Sort-Object @{ Expression = {
+            if ($_.PSObject.Properties.Name -contains 'DisplayName') { [string]$_.DisplayName } else { '' }
+        } } -Unique)
+
+        foreach ($app in $apps) {
+            try {
+                $displayName = if ($app.PSObject.Properties.Name -contains 'DisplayName') { [string]$app.DisplayName } else { '(unnamed HP application)' }
+                $uninstall = $null
+                if ($app.PSObject.Properties.Name -contains 'QuietUninstallString') {
+                    $uninstall = [string]$app.QuietUninstallString
+                }
+                if ([string]::IsNullOrWhiteSpace($uninstall) -and $app.PSObject.Properties.Name -contains 'UninstallString') {
+                    $uninstall = [string]$app.UninstallString
+                }
+                if ([string]::IsNullOrWhiteSpace($uninstall)) { throw 'No uninstall command is registered.' }
+
+                Write-Log ("Uninstalling HP application: {0}" -f $displayName) 'INFO'
+                if ($uninstall -match '(?i)msiexec(?:\.exe)?\s+.*?(\{[0-9A-F-]+\})') {
+                    $process = Start-Process msiexec.exe -ArgumentList @('/x', $Matches[1], '/qn', '/norestart') -Wait -PassThru -WindowStyle Hidden
+                }
+                else {
+                    $match = [regex]::Match($uninstall, '^\s*"([^"]+)"\s*(.*)$')
+                    if ($match.Success) { $exe = $match.Groups[1].Value; $arguments = $match.Groups[2].Value }
+                    else { $parts = $uninstall -split '\s+', 2; $exe = $parts[0]; $arguments = if ($parts.Count -gt 1) { $parts[1] } else { '' } }
+                    if ($arguments -notmatch '(?i)(/quiet|/qn|/silent|/s\b)') { $arguments = ($arguments + ' /quiet /norestart').Trim() }
+                    $process = Start-Process -FilePath $exe -ArgumentList $arguments -Wait -PassThru -WindowStyle Hidden
+                }
+                if ($process.ExitCode -notin @(0, 1605, 1614, 1641, 3010)) { throw "Uninstaller exit code=$($process.ExitCode)." }
+                $script:DellHpCleanup.ApplicationsRemoved += $displayName
+                if ($process.ExitCode -in @(1641,3010)) { $script:DellHpCleanup.RebootRequired = $true }
+            }
+            catch {
+                $cleanupErrors.Add(("Application {0}: {1}" -f $displayName, $_.Exception.Message)) | Out-Null
+            }
+        }
+
+        Write-Log 'Checking installed and provisioned Microsoft Store packages for HP management/support software.' 'INFO'
+        $appxNamePattern = '(?i)HP.*(Support|Privacy|Analytics|Insights|Touchpoint|ConnectionOptimizer|WolfSecurity|HardwareDiagnostics|SystemInformation)'
+        $appxPackages = @(Get-AppxPackage -AllUsers -ErrorAction SilentlyContinue | Where-Object {
+            (($_.Name + ' ' + $_.PackageFullName) -match $appxNamePattern) -and
+            (($_.Name + ' ' + $_.PackageFullName) -notmatch $peripheralExclusion)
+        } | Sort-Object PackageFullName -Unique)
+        foreach ($appx in $appxPackages) {
+            try {
+                Remove-AppxPackage -Package $appx.PackageFullName -AllUsers -ErrorAction Stop
+                $script:DellHpCleanup.AppxPackagesRemoved += [string]$appx.Name
+            }
+            catch { $cleanupErrors.Add(("Appx {0}: {1}" -f $appx.Name, $_.Exception.Message)) | Out-Null }
+        }
+
+        $provisionedPackages = @(Get-AppxProvisionedPackage -Online -ErrorAction SilentlyContinue | Where-Object {
+            (($_.DisplayName + ' ' + $_.PackageName) -match $appxNamePattern) -and
+            (($_.DisplayName + ' ' + $_.PackageName) -notmatch $peripheralExclusion)
+        })
+        foreach ($package in $provisionedPackages) {
+            try {
+                Remove-AppxProvisionedPackage -Online -PackageName $package.PackageName -AllUsers -ErrorAction Stop | Out-Null
+                if ($script:DellHpCleanup.AppxPackagesRemoved -notcontains [string]$package.DisplayName) {
+                    $script:DellHpCleanup.AppxPackagesRemoved += [string]$package.DisplayName
+                }
+            }
+            catch { $cleanupErrors.Add(("Provisioned Appx {0}: {1}" -f $package.DisplayName, $_.Exception.Message)) | Out-Null }
+        }
+
+        Write-Log 'Checking HP management scheduled tasks.' 'INFO'
+        $tasks = @(Get-ScheduledTask -ErrorAction SilentlyContinue | Where-Object {
+            $author = if ($_.PSObject.Properties.Name -contains 'Author') { [string]$_.Author } else { '' }
+            $taskText = ([string]$_.TaskName + ' ' + [string]$_.TaskPath + ' ' + $author)
+            ($taskText -match '(?i)\bHP\b|Hewlett-Packard') -and ($taskText -notmatch $peripheralExclusion)
+        })
+        foreach ($task in $tasks) {
+            try {
+                Unregister-ScheduledTask -TaskName $task.TaskName -TaskPath $task.TaskPath -Confirm:$false -ErrorAction Stop
+                $script:DellHpCleanup.TasksRemoved += ($task.TaskPath + $task.TaskName)
+            }
+            catch { $cleanupErrors.Add(("Task {0}{1}: {2}" -f $task.TaskPath, $task.TaskName, $_.Exception.Message)) | Out-Null }
+        }
+
+        Write-Log 'Checking HP management services.' 'INFO'
+        $services = @(Get-CimInstance Win32_Service -ErrorAction SilentlyContinue | Where-Object {
+            (($_.Name + ' ' + $_.DisplayName + ' ' + $_.PathName) -match '(?i)HpSfu|HP Support|HP Analytics|HP Insights|HP Touchpoint|HP Connection Optimizer|HPSupportSolutions|HP Wolf') -and
+            (($_.Name + ' ' + $_.DisplayName + ' ' + $_.PathName) -notmatch $peripheralExclusion)
+        })
+        foreach ($service in $services) {
+            try {
+                Set-Service -Name $service.Name -StartupType Disabled -ErrorAction SilentlyContinue
+                Stop-Service -Name $service.Name -Force -ErrorAction SilentlyContinue
+                & sc.exe delete $service.Name | Out-Null
+                if ($LASTEXITCODE -notin @(0,1060,1072)) { throw "sc.exe exit code=$LASTEXITCODE." }
+                $script:DellHpCleanup.ServicesRemoved += [string]$service.Name
+                $script:DellHpCleanup.RebootRequired = $true
+            }
+            catch { $cleanupErrors.Add(("Service {0}: {1}" -f $service.Name, $_.Exception.Message)) | Out-Null }
+        }
+
+        $packages = @(Get-HpManagementDriverPackages)
+        $activeInfNames = @(Get-CimInstance Win32_PnPSignedDriver -ErrorAction SilentlyContinue | Where-Object {
+            $_.InfName
+        } | ForEach-Object { ([string]$_.InfName).ToLowerInvariant() } | Sort-Object -Unique)
+
+        $backupBase = Join-Path 'C:\ProgramData\Compton\DriverBackups\HP-Management' (Get-Date -Format 'yyyyMMdd-HHmmss')
+        $script:DellHpCleanup.BackupRoot = $backupBase
+        foreach ($package in $packages) {
+            if ($activeInfNames -contains $package.PublishedName.ToLowerInvariant()) {
+                $script:DellHpCleanup.DriverPackagesSkipped += ("{0} (active device association)" -f $package.PublishedName)
+                Write-Log ("Preserving HP driver package {0}; Windows reports an active device association." -f $package.PublishedName) 'INFO'
+                continue
+            }
+
+            $backupRoot = Join-Path $backupBase $package.PublishedName
+            Ensure-Folder -Path $backupRoot
+
+            Write-Log ("Exporting {0} to {1} before removal." -f $package.PublishedName, $backupRoot) 'INFO'
+            & pnputil.exe /export-driver $package.PublishedName $backupRoot | ForEach-Object {
+                if (-not [string]::IsNullOrWhiteSpace([string]$_)) { Write-Log ([string]$_) 'INFO' }
+            }
+            if ($LASTEXITCODE -ne 0) {
+                $cleanupErrors.Add(("Driver {0}: export failed with pnputil exit code {1}; removal skipped." -f $package.PublishedName, $LASTEXITCODE)) | Out-Null
+                continue
+            }
+
+            Write-Log ("Removing orphaned HP management package {0} ({1}) from this Dell system." -f $package.PublishedName, $package.OriginalName) 'INFO'
+            & pnputil.exe /delete-driver $package.PublishedName /uninstall | ForEach-Object {
+                if (-not [string]::IsNullOrWhiteSpace([string]$_)) { Write-Log ([string]$_) 'INFO' }
+            }
+            $removeExitCode = $LASTEXITCODE
+
+            if ($removeExitCode -ne 0) {
+                Write-Log ("Normal removal returned exit code {0}; retrying with /force after vendor and device safety checks." -f $removeExitCode) 'WARN'
+                & pnputil.exe /delete-driver $package.PublishedName /uninstall /force | ForEach-Object {
+                    if (-not [string]::IsNullOrWhiteSpace([string]$_)) { Write-Log ([string]$_) 'INFO' }
+                }
+                $removeExitCode = $LASTEXITCODE
+            }
+
+            if ($removeExitCode -ne 0) {
+                $cleanupErrors.Add(("Driver {0}: pnputil removal exit code {1}." -f $package.PublishedName, $removeExitCode)) | Out-Null
+                continue
+            }
+            $script:DellHpCleanup.DriverPackagesRemoved += [string]$package.PublishedName
+            $script:DellHpCleanup.RebootRequired = $true
+        }
+
+        $removedCount = @($script:DellHpCleanup.ApplicationsRemoved).Count + @($script:DellHpCleanup.AppxPackagesRemoved).Count + @($script:DellHpCleanup.ServicesRemoved).Count + @($script:DellHpCleanup.TasksRemoved).Count + @($script:DellHpCleanup.DriverPackagesRemoved).Count
+        if ($cleanupErrors.Count -gt 0) {
+            $script:DellHpCleanup.Status = 'CompletedWithWarnings'
+            $script:DellHpCleanup.Message = "Removed $removedCount HP management item(s); $($cleanupErrors.Count) item(s) require review. Dell maintenance will continue."
+            foreach ($cleanupError in $cleanupErrors) { Write-Log $cleanupError 'WARN'; Add-YamlAction $cleanupError }
+            Add-RunFailure ("Dell HP software cleanup completed with {0} warning(s)." -f $cleanupErrors.Count)
+        }
+        elseif ($removedCount -eq 0) {
+            $script:DellHpCleanup.Status = 'AlreadyClean'
+            $script:DellHpCleanup.Message = 'No removable HP management/support software was found on this Dell system.'
+        }
+        else {
+            $script:DellHpCleanup.Status = 'Removed'
+            $script:DellHpCleanup.Message = "Removed $removedCount HP management item(s) from this Dell system."
+        }
+        Write-Log $script:DellHpCleanup.Message $(if ($cleanupErrors.Count -gt 0) { 'WARN' } else { 'OK' })
+        Add-YamlAction $script:DellHpCleanup.Message
+    }
+    catch {
+        $script:DellHpCleanup.Status = 'Failed'
+        $script:DellHpCleanup.Message = $_.Exception.Message
+        Write-Log ("Dell HP software cleanup failed and remaining maintenance will continue: {0}" -f $_.Exception.Message) 'WARN'
+        Add-YamlAction ("Dell HP software cleanup failed: {0}" -f $_.Exception.Message)
+        Add-RunFailure ("Dell HP software cleanup: {0}" -f $_.Exception.Message)
+    }
+}
+
 function Wait-ForFile {
     param(
         [Parameter(Mandatory)][string]$Path,
@@ -2163,9 +2434,26 @@ function Get-DcuReportXmlSafely {
 
     Start-Sleep -Seconds 3
 
+    $resolvedReportPath = $Path
+    if (Test-Path -LiteralPath $Path -PathType Container) {
+        $reportFile = $null
+        for ($reportAttempt = 1; $reportAttempt -le $RetryCount; $reportAttempt++) {
+            $reportFile = Get-ChildItem -LiteralPath $Path -Filter '*.xml' -File -Recurse -ErrorAction SilentlyContinue |
+                Sort-Object LastWriteTime -Descending |
+                Select-Object -First 1
+            if ($reportFile) { break }
+            Start-Sleep -Seconds $RetryDelaySeconds
+        }
+        if (-not $reportFile) {
+            throw "Dell DCU did not create an XML report inside: $Path"
+        }
+        $resolvedReportPath = $reportFile.FullName
+        Write-Log ("Dell DCU XML report detected: {0}" -f $resolvedReportPath) 'INFO'
+    }
+
     for ($i = 1; $i -le $RetryCount; $i++) {
         try {
-            $fs = [System.IO.File]::Open($Path, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite)
+            $fs = [System.IO.File]::Open($resolvedReportPath, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite)
             try {
                 $sr = New-Object System.IO.StreamReader($fs)
                 try {
@@ -2459,7 +2747,8 @@ function Invoke-DellDriverUpdates {
 
     $dcuScanLog  = Join-Path $WorkingRoot 'Dell-DCU-Scan.log'
     $dcuApplyLog = Join-Path $WorkingRoot 'Dell-DCU-Apply.log'
-    $dcuReport   = Join-Path $WorkingRoot 'Dell-DCU-ApplicableUpdates.xml'
+    $dcuReport   = Join-Path $WorkingRoot 'Dell-DCU-Report'
+    Ensure-Folder -Path $dcuReport
 
     Write-Log 'Dell DCU Configure...' 'INFO'
     Write-Progress -Activity 'Dell Driver Update Workflow' -Status 'Configuring Dell Command Update' -PercentComplete 10
@@ -2480,7 +2769,9 @@ function Invoke-DellDriverUpdates {
 
     try {
         $xml = Get-DcuReportXmlSafely -Path $dcuReport
-        $items = Get-DellReportItems -Xml $xml
+        # Force Object[] semantics because PowerShell unwraps a one-item function
+        # result, and strict mode then rejects the scalar object's missing Count.
+        $items = @(Get-DellReportItems -Xml $xml)
 
         if ($items.Count -gt 0) {
             Add-YamlAction ("Dell DCU report parsed successfully. Updates detected: {0}" -f $items.Count)
@@ -2520,7 +2811,7 @@ function Invoke-DellDriverUpdates {
     $dellApplyProc = Invoke-DellDCUCommandWithRetry -DcuCli $dcuCli -Arguments $applyArgs -OperationName 'ApplyUpdates' -MaxAttempts 2
     $script:DellApplyExitCode = [int]$dellApplyProc.ExitCode
 
-    Write-Log (("Dell DCU logs: {0} ; {1} ; {2}") -f $dcuScanLog, $dcuApplyLog, $dcuReport) 'OK'
+    Write-Log (("Dell DCU logs/report: {0} ; {1} ; {2}") -f $dcuScanLog, $dcuApplyLog, $dcuReport) 'OK'
 
     Write-Log 'Running Dell BIOS settings script from the central share...' 'INFO'
     $dellBiosScript='\\filesvr\Labscripts\Set-Dell-BIOS-Settings.ps1'
@@ -3038,6 +3329,7 @@ function Write-MaintenanceTelemetry {
             IncludeBIOS                = [bool]$script:InstallBiosFirmware
             HpNetworkBiosUpdate        = $script:HpNetworkBiosUpdate
             DellWakeOnLan              = $script:DellWakeOnLan
+            DellHpSoftwareCleanup      = $script:DellHpCleanup
             AvAutoPowerOn              = $script:AvAutoPowerOn
             AllUpdatesOverride         = [bool]$script:InstallAllUpdates
             Hardware                   = $script:HardwareInventory
@@ -3351,41 +3643,110 @@ function Set-HpAvAutoPowerOn {
         throw "HP BIOS read failed (exit $LASTEXITCODE): $($output -join ' ')"
     }
     $lines = @(Get-Content -LiteralPath $before -ErrorAction Stop)
-    $desired = [ordered]@{
+    $desiredDays = [ordered]@{
         'Sunday' = 'Enable'; 'Monday' = 'Enable'; 'Tuesday' = 'Enable';
         'Wednesday' = 'Enable'; 'Thursday' = 'Enable'; 'Friday' = 'Enable';
-        'Saturday' = 'Disable'; 'BIOS Power-On Time (hh:mm)' = '00:00'
+        'Saturday' = 'Disable'
     }
-    foreach ($name in $desired.Keys) {
+    foreach ($name in $desiredDays.Keys) {
         if ($null -eq (Get-HpBcuSetting -Lines $lines -Name $name)) {
             throw "HP BIOS does not expose required setting '$name'; no schedule was changed."
         }
     }
+
+    $combinedTimeName = 'BIOS Power-On Time (hh:mm)'
+    $hourTimeName = 'BIOS Power-On Hour'
+    $minuteTimeName = 'BIOS Power-On Minute'
+    $combinedTimeValue = Get-HpBcuSetting -Lines $lines -Name $combinedTimeName
+    $hourTimeValue = Get-HpBcuSetting -Lines $lines -Name $hourTimeName
+    $minuteTimeValue = Get-HpBcuSetting -Lines $lines -Name $minuteTimeName
+
+    $timeLayout = if ($null -ne $combinedTimeValue) {
+        'Combined'
+    }
+    elseif ($null -ne $hourTimeValue -and $null -ne $minuteTimeValue) {
+        'SeparateInteger'
+    }
+    else {
+        throw "HP BIOS does not expose a supported scheduled power-on time layout; no schedule was changed. Expected '$combinedTimeName' or both '$hourTimeName' and '$minuteTimeName'."
+    }
+
+    $hourInteger = 0
+    $minuteInteger = 0
+    if ($timeLayout -eq 'SeparateInteger') {
+        if (-not [int]::TryParse([string]$hourTimeValue, [ref]$hourInteger) -or
+            -not [int]::TryParse([string]$minuteTimeValue, [ref]$minuteInteger)) {
+            throw "HP BIOS returned invalid scheduled power-on integer values. Hour='$hourTimeValue'; Minute='$minuteTimeValue'."
+        }
+    }
+
     $needsChange = $false
-    foreach ($name in $desired.Keys) {
-        if ((Get-HpBcuSetting -Lines $lines -Name $name) -ne $desired[$name]) { $needsChange = $true }
+    foreach ($name in $desiredDays.Keys) {
+        if ((Get-HpBcuSetting -Lines $lines -Name $name) -ne $desiredDays[$name]) { $needsChange = $true }
+    }
+    if ($timeLayout -eq 'Combined') {
+        if ($combinedTimeValue -ne '00:00') { $needsChange = $true }
+    }
+    elseif ($hourInteger -ne 0 -or $minuteInteger -ne 0) {
+        $needsChange = $true
     }
     if (-not $needsChange) { return 'AlreadyCompliant' }
 
     $configLines = New-Object System.Collections.Generic.List[string]
     $configLines.Add('BIOSConfig 1.0') | Out-Null
-    foreach ($name in $desired.Keys) {
+    $configLines.Add('') | Out-Null
+    foreach ($name in $desiredDays.Keys) {
         $configLines.Add($name) | Out-Null
-        if ($name -eq 'BIOS Power-On Time (hh:mm)') { $configLines.Add('00:00') | Out-Null }
-        else {
-            $configLines.Add($(if ($desired[$name] -eq 'Enable') { '*Enable' } else { '*Disable' })) | Out-Null
-            $configLines.Add($(if ($desired[$name] -eq 'Enable') { 'Disable' } else { 'Enable' })) | Out-Null
-        }
+        $configLines.Add($(if ($desiredDays[$name] -eq 'Enable') { "`t*Enable" } else { "`t*Disable" })) | Out-Null
+        $configLines.Add($(if ($desiredDays[$name] -eq 'Enable') { "`tDisable" } else { "`tEnable" })) | Out-Null
+    }
+    if ($timeLayout -eq 'Combined') {
+        $configLines.Add($combinedTimeName) | Out-Null
+        $configLines.Add("`t00:00") | Out-Null
+    }
+    else {
+        $configLines.Add($hourTimeName) | Out-Null
+        $configLines.Add("`t0") | Out-Null
+        $configLines.Add($minuteTimeName) | Out-Null
+        $configLines.Add("`t0") | Out-Null
     }
     Set-Content -LiteralPath $settings -Value $configLines -Encoding ASCII -ErrorAction Stop
+
+    # Refuse to call BCU if any generated value lost its required indentation.
+    # Without this guard BCU treats values such as *Enable, Disable, and 0 as
+    # independent setting names and returns code 13 with per-setting code 21.
+    $generatedLines = @(Get-Content -LiteralPath $settings -ErrorAction Stop)
+    foreach ($valueLine in @($generatedLines | Where-Object {
+        $_ -match '^\*?(?:Enable|Disable|00:00|0)$'
+    })) {
+        throw "Generated HP BCU configuration contains an unindented value '$valueLine'; no BIOS change was attempted."
+    }
+
     $output = @(& $bcu "/Set:$settings" "/cpwdfile:$password" '/WarningAsErr' 2>&1)
     if ($LASTEXITCODE -ne 0) { throw "HP BIOS setting failed (exit $LASTEXITCODE): $($output -join ' ')" }
     $output = @(& $bcu "/Get:$after" 2>&1)
     if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $after)) { throw 'HP BIOS write completed but readback failed.' }
     $verified = @(Get-Content -LiteralPath $after -ErrorAction Stop)
-    foreach ($name in $desired.Keys) {
-        if ((Get-HpBcuSetting -Lines $verified -Name $name) -ne $desired[$name]) {
+    foreach ($name in $desiredDays.Keys) {
+        if ((Get-HpBcuSetting -Lines $verified -Name $name) -ne $desiredDays[$name]) {
             throw "HP BIOS readback mismatch for '$name'."
+        }
+    }
+    if ($timeLayout -eq 'Combined') {
+        $verifiedCombined = Get-HpBcuSetting -Lines $verified -Name $combinedTimeName
+        if ($verifiedCombined -ne '00:00') {
+            throw "HP BIOS readback mismatch for '$combinedTimeName'. Expected 00:00; found '$verifiedCombined'."
+        }
+    }
+    else {
+        $verifiedHourText = Get-HpBcuSetting -Lines $verified -Name $hourTimeName
+        $verifiedMinuteText = Get-HpBcuSetting -Lines $verified -Name $minuteTimeName
+        $verifiedHour = -1
+        $verifiedMinute = -1
+        if (-not [int]::TryParse([string]$verifiedHourText, [ref]$verifiedHour) -or
+            -not [int]::TryParse([string]$verifiedMinuteText, [ref]$verifiedMinute) -or
+            $verifiedHour -ne 0 -or $verifiedMinute -ne 0) {
+            throw "HP BIOS readback mismatch for separate scheduled power-on time. Expected 0:0; found '${verifiedHourText}:$verifiedMinuteText'."
         }
     }
     return 'Configured'
@@ -3569,7 +3930,10 @@ function Invoke-DellWakeOnLanPolicy {
                 Message = $message
             }) | Out-Null
         }
-        $script:DellWakeOnLan.AdapterResults = @($adapterResults)
+        # Windows PowerShell 5.1 can throw "Argument types do not match" when a
+        # generic List[object] is wrapped directly in @(). Force pipeline
+        # enumeration to produce a normal Object[] for telemetry.
+        $script:DellWakeOnLan.AdapterResults = @($adapterResults | ForEach-Object { $_ })
         $failedAdapters = @($adapterResults | Where-Object { -not $_.Verified })
         if ($failedAdapters.Count -gt 0) {
             throw ("Wake-on-magic-packet verification failed for {0} physical Ethernet adapter(s)." -f $failedAdapters.Count)
@@ -3671,6 +4035,7 @@ try {
         Invoke-HPDriverUpdates
     }
     elseif ($script:DetectedVendor -eq 'Dell') {
+        Invoke-DellHpSoftwareCleanup
         Invoke-DellWakeOnLanPolicy
         Invoke-DellDriverUpdates
     }

@@ -1,8 +1,12 @@
 # =====================================================================
 # ScriptName: 07_Force_Reboot_Install_Updates.ps1
-# ScriptVersion: 2.0.6
-# LastUpdated: 2026-09-03
-# ChangeLog: v2.0.6 permits an empty pending-reboot flag collection and treats a clean flag evaluation as a normal state.
+# ScriptVersion: 2.1.1
+# LastUpdated: 2026-09-25
+# ChangeLog: v2.1.1 safely resets an abandoned non-startup reboot cycle after a configurable age,
+#            while preserving startup-resume protection against consuming an unverified reboot stage.
+#            v2.1.0 adds late-Sunday maintenance closeout/final-verification modes, never reboots a clean
+#            system, and requires proof that the prior reboot occurred before consuming another reboot stage.
+#            v2.0.6 permits an empty pending-reboot flag collection and treats a clean flag evaluation as a normal state.
 #            v2.0.5 adds -StartupResume support. Startup-triggered executions exit immediately when no reboot cycle is active.
 #            v2.0.4 extends the cycle to a maximum of three reboots, then performs a final no-more-reboots verification pass.
 #            Adds structured persistent-reboot cause telemetry including likely source and affected file/change details.
@@ -14,18 +18,24 @@
 param(
     [ValidateRange(0,86400)]
     [int]$RebootDelaySeconds = 30,
+    [ValidateRange(0,900)]
+    [int]$StartupSettlingSeconds = 120,
+    [ValidateRange(1,1440)]
+    [int]$AbandonedCycleMinutes = 10,
     [string]$LogDirectory = 'C:\Logs',
     [string]$StateDirectory = 'C:\ProgramData\MISMaintenance\State',
     [string]$StateFileName = '07_Force_Reboot_Install_Updates_State.json',
     [switch]$AllowUnsafeRebootFlagCleanup,
-    [switch]$StartupResume
+    [switch]$StartupResume,
+    [switch]$MaintenanceCloseout,
+    [switch]$FinalVerification
 )
 
 $ErrorActionPreference = 'Stop'
 
 $script:RunStart         = Get-Date
 $script:ScriptName       = '07_Force_Reboot_Install_Updates.ps1'
-$script:ScriptVersion    = '2.0.6'
+$script:ScriptVersion    = '2.1.1'
 $script:RunId            = [guid]::NewGuid().ToString()
 $script:Domain           = if ($env:USERDNSDOMAIN) { $env:USERDNSDOMAIN } else { $env:USERDOMAIN }
 $script:TelemetryPath    = Join-Path $LogDirectory 'Maintenance-Telemetry.ndjson'
@@ -41,6 +51,8 @@ $script:LoggedOnUsers    = @()
 $script:RebootVerified   = $false
 $script:PreviousBootTime = $null
 $script:StateRecovered   = $false
+$script:AbandonedCycleRecovered = $false
+$script:AbandonedCycleAgeMinutes = $null
 $script:ComputerName     = $env:COMPUTERNAME
 $script:StateFilePath    = Join-Path $StateDirectory $StateFileName
 $script:YamlLogPath      = $null
@@ -58,6 +70,23 @@ $script:RebootReason     = $null
 $script:MutexName        = 'Global\MIS_07_Force_Reboot_Install_Updates'
 $script:Mutex            = $null
 $script:MutexAcquired    = $false
+$script:InvocationMode   = if ($StartupResume) {
+    'StartupResume'
+}
+elseif ($FinalVerification) {
+    'FinalVerification'
+}
+elseif ($MaintenanceCloseout) {
+    'MaintenanceCloseout'
+}
+else {
+    'ScheduledMaintenance'
+}
+
+$modeSwitchCount = [int][bool]$StartupResume + [int][bool]$MaintenanceCloseout + [int][bool]$FinalVerification
+if ($modeSwitchCount -gt 1) {
+    throw 'StartupResume, MaintenanceCloseout, and FinalVerification are mutually exclusive.'
+}
 
 # Load the shared framework from the same directory as this script.
 $MaintenanceFrameworkPath = 'C:\Scripts\Maintenance.Framework.psm1'
@@ -441,6 +470,9 @@ function Write-ExecutionTelemetry {
             WindowsUpdate                = $script:UpdateSnapshot
             StateFilePath                = $script:StateFilePath
             StateRecovered               = $script:StateRecovered
+            AbandonedCycleRecovered      = $script:AbandonedCycleRecovered
+            AbandonedCycleAgeMinutes     = $script:AbandonedCycleAgeMinutes
+            AbandonedCycleThresholdMinutes = $AbandonedCycleMinutes
             TextLogPath                  = $script:PublishedLogPath
         }
 
@@ -1179,6 +1211,10 @@ function Write-YamlLog {
         $lines.Add("failure_message: $(ConvertTo-YamlScalar $script:FailureMessage)") | Out-Null
         $lines.Add("final_verification_after_third_reboot: $(ConvertTo-YamlScalar $script:FinalVerificationAfterThirdReboot)") | Out-Null
         $lines.Add("persistent_after_third_reboot: $(ConvertTo-YamlScalar $script:PersistentAfterThirdReboot)") | Out-Null
+        $lines.Add("state_recovered: $(ConvertTo-YamlScalar $script:StateRecovered)") | Out-Null
+        $lines.Add("abandoned_cycle_recovered: $(ConvertTo-YamlScalar $script:AbandonedCycleRecovered)") | Out-Null
+        $lines.Add("abandoned_cycle_age_minutes: $(ConvertTo-YamlScalar $script:AbandonedCycleAgeMinutes)") | Out-Null
+        $lines.Add("abandoned_cycle_threshold_minutes: $AbandonedCycleMinutes") | Out-Null
         $lines.Add('') | Out-Null
 
         $lines.Add('flags_detected:') | Out-Null
@@ -1280,9 +1316,14 @@ if ($StartupResume -and -not (Test-RebootCycleActive)) {
 
 Initialize-Paths
 Write-Status "Starting $($script:ScriptName) version $($script:ScriptVersion)." 'INFO'
+Write-Status "Invocation mode: $($script:InvocationMode)." 'INFO'
 Write-Status "Active staged text log path: $($script:TextLogPath)" 'INFO'
 Write-Status "Completed text log publish path: $($script:PublishedLogPath)" 'INFO'
 Initialize-SingleInstanceLock
+if ($StartupResume -and $StartupSettlingSeconds -gt 0) {
+    Write-Status "Waiting $StartupSettlingSeconds seconds after startup so Windows servicing can settle before reboot-flag evaluation." 'INFO'
+    Start-Sleep -Seconds $StartupSettlingSeconds
+}
 
 try {
     if (-not (Test-IsAdministrator)) {
@@ -1321,17 +1362,74 @@ try {
             $stage = 0
         }
 
+        # A shutdown, interrupted task, or failed reboot request can leave a stage file behind even
+        # though no reboot occurred. A normal maintenance invocation may safely abandon that old
+        # cycle and evaluate the current flags from stage 0. StartupResume must never do this because
+        # it is the guard that proves the reboot actually happened before another stage is consumed.
+        if (($stage -gt 0) -and (-not $script:RebootVerified) -and (-not $StartupResume)) {
+            $stateAgeMinutes = $null
+            $stateTimestampValid = $false
+
+            if ($state.LastRun) {
+                try {
+                    $stateLastRun = [datetime]::Parse(
+                        [string]$state.LastRun,
+                        [System.Globalization.CultureInfo]::InvariantCulture,
+                        [System.Globalization.DateTimeStyles]::RoundtripKind
+                    )
+                    $stateAgeMinutes = [math]::Round(((Get-Date) - $stateLastRun).TotalMinutes, 2)
+                    $stateTimestampValid = $true
+                }
+                catch {
+                    $stateTimestampValid = $false
+                }
+            }
+
+            $script:AbandonedCycleAgeMinutes = $stateAgeMinutes
+            if ((-not $stateTimestampValid) -or ($stateAgeMinutes -ge $AbandonedCycleMinutes)) {
+                $ageText = if ($stateTimestampValid) { "$stateAgeMinutes minute(s)" } else { 'unknown (missing or invalid LastRun)' }
+                Write-Status "Recovering abandoned reboot cycle at stage $stage. State age=$ageText; threshold=$AbandonedCycleMinutes minute(s); invocation=$($script:InvocationMode). Current reboot flags will be evaluated as a new cycle." 'WARN'
+                Reset-State
+                $state = New-DefaultState
+                $stage = 0
+                $script:PreviousBootTime = $null
+                $script:RebootVerified = $false
+                $script:StateRecovered = $true
+                $script:AbandonedCycleRecovered = $true
+            }
+        }
+
         $script:CurrentStage = $stage
 
         switch ($stage) {
             0 {
-                Write-Status "First pass detected. Forcing reboot regardless of flag state." 'WARN'
+                if ($flags.Count -eq 0) {
+                    Write-Status 'No pending-reboot flags were detected. No reboot is required.' 'OK'
+                    Reset-State
+                    $script:OverallResult = if ($FinalVerification) { 'FinalVerificationClean' } else { 'NoRebootRequired' }
+                    $script:ExitCode = 0
+                    Write-YamlLog
+                    exit 0
+                }
+
+                Write-Status 'Pending-reboot flags detected on the first pass. Starting a verified reboot cycle.' 'WARN'
+                foreach ($flag in $flags) {
+                    Write-Status "Flag detected: $($flag.Name) | $($flag.Path) | $($flag.Details)" 'WARN'
+                }
                 Save-State -Stage 1 -FirstSeen ((Get-Date).ToString('o')) -LastRun ((Get-Date).ToString('o')) -LastBootTime $script:BootSnapshot.LastBootTime -LastFlags $flags
-                $script:OverallResult = 'ForcedInitialReboot'
-                Invoke-ForcedReboot -Reason 'Initial forced reboot for update cycle.'
+                $script:OverallResult = 'PendingFlagsInitialReboot'
+                Invoke-ForcedReboot -Reason 'Pending reboot flags detected during maintenance closeout.'
             }
 
             1 {
+                if (-not $script:RebootVerified) {
+                    Write-Status 'The stage-1 reboot has not been verified by a newer Windows boot time. Refusing to consume another reboot stage.' 'ERROR'
+                    $script:OverallResult = 'Stage1RebootNotVerified'
+                    $script:ExitCode = 2
+                    Write-YamlLog
+                    exit 2
+                }
+
                 if ($flags.Count -gt 0) {
                     Write-Status "Second pass: reboot flags still detected. Issuing second reboot." 'WARN'
                     foreach ($flag in $flags) {
@@ -1352,6 +1450,14 @@ try {
             }
 
             2 {
+                if (-not $script:RebootVerified) {
+                    Write-Status 'The stage-2 reboot has not been verified by a newer Windows boot time. Refusing to consume another reboot stage.' 'ERROR'
+                    $script:OverallResult = 'Stage2RebootNotVerified'
+                    $script:ExitCode = 2
+                    Write-YamlLog
+                    exit 2
+                }
+
                 if ($flags.Count -gt 0) {
                     Write-Status "Third pass: reboot flags still detected after two reboots. Issuing the third and final automatic reboot." 'WARN'
                     foreach ($flag in $flags) {
@@ -1375,6 +1481,14 @@ try {
                 # This is the important safety gate before the workstation can be
                 # considered ready to re-freeze. No fourth automatic reboot occurs.
                 $script:FinalVerificationAfterThirdReboot = $true
+
+                if (-not $script:RebootVerified) {
+                    Write-Status 'The stage-3 reboot has not been verified by a newer Windows boot time. Final readiness cannot be confirmed.' 'ERROR'
+                    $script:OverallResult = 'Stage3RebootNotVerified'
+                    $script:ExitCode = 2
+                    Write-YamlLog
+                    exit 2
+                }
 
                 if ($flags.Count -gt 0) {
                     $script:PersistentAfterThirdReboot = $true

@@ -1,14 +1,14 @@
 {
     "SchemaVersion":  1,
-    "ManifestVersion":  "2.9.1",
-    "PackageVersion":  "2.9.1",
-    "GeneratedUtc":  "2026-09-21T17:43:48Z",
+    "ManifestVersion":  "3.0.0",
+    "PackageVersion":  "3.0.0",
+    "GeneratedUtc":  "2026-10-07T14:58:02Z",
     "Files":  [
                   {
                       "Name":  "00_Update-Scripts-FromShare.ps1",
                       "Role":  "Updater",
-                      "Version":  "4.9.0",
-                      "SHA256":  "5E1FDA9E129887F9CF240D9C2A29CBDE8F6E526803B071C8AF8DCC40EB85603E"
+                      "Version":  "4.11.1",
+                      "SHA256":  "E2DE3BBA2279D2DCE7462C5AB32891935C13F56DC9C6CD41F83E10AC84F8E199"
                   },
                   {
                       "Name":  "01_Enable_Windows_Update_Services.ps1",
@@ -19,26 +19,26 @@
                   {
                       "Name":  "02_Remove_User_Profiles.ps1",
                       "Role":  "ManagedFile",
-                      "Version":  "2.4.2",
-                      "SHA256":  "2BCF1F3ED71B7875461175E4D24D46242080C6CF400353C0C510CB94DD869AE5"
+                      "Version":  "2.5.0",
+                      "SHA256":  "899CD918DB20299C2B99BB73AAAB6460A8122B7DAF75EE2F46FC9A91C4755A32"
                   },
                   {
                       "Name":  "03_Weekend_Apps_Update.ps1",
                       "Role":  "ManagedFile",
-                      "Version":  "2.1.8",
-                      "SHA256":  "AC150B8CA55C60E10477CFFF7F2F7BCE145B8DED3CC98FB05CB1C6BC66EC2F67"
+                      "Version":  "2.2.0",
+                      "SHA256":  "186842A1BAB55E97E23014FAF9BA0CFE6BDE2E9F2532391BDF8F70995F9DCA25"
                   },
                   {
                       "Name":  "04_Sunday_Lab_Application_Maintenance.ps1",
                       "Role":  "MaintenanceScript",
-                      "Version":  "1.7.0",
-                      "SHA256":  "66BE093DCBD0D9B7D1538D5A7739CB200817025DCE2F06A7107FBBB4C539AE6E"
+                      "Version":  "1.17.0",
+                      "SHA256":  "DDF0366CD944ADD2244459D47D17A563AC26CA908408AE9DC20B5C8612D9C60F"
                   },
                   {
                       "Name":  "05_Weekend_HP_Drivers_Update.ps1",
                       "Role":  "ManagedFile",
-                      "Version":  "3.0.4",
-                      "SHA256":  "43287096D522CB4F62A36F1B6C940D3E2F8A7CCEAF3C63293787FF5C66700CF0"
+                      "Version":  "3.4.3",
+                      "SHA256":  "4788532514F43408EFE79B3FB51B51ED9E0BD743D7AEB08D1F69A3453F7ECD96"
                   },
                   {
                       "Name":  "06_Weekend_Windows_Updates.ps1",
@@ -49,14 +49,14 @@
                   {
                       "Name":  "07_Force_Reboot_Install_Updates.ps1",
                       "Role":  "ManagedFile",
-                      "Version":  "2.0.6",
-                      "SHA256":  "B4F49B5A1E95A3CBB05134615B39742682C78ABAE6FBDE0D32D2B92EFBF2617E"
+                      "Version":  "2.1.1",
+                      "SHA256":  "D09EF58E9335E5CBCA25A8187AEDCDD142B6626BDE91CD9A9C34255CE7B04352"
                   },
                   {
                       "Name":  "08_System_Repair.ps1",
                       "Role":  "ManagedFile",
-                      "Version":  "4.6.1",
-                      "SHA256":  "45A9BBC761A4D97031474E0E2306E5A69B6731C642CDD1DBFB7D80DB42E6357B"
+                      "Version":  "4.6.4",
+                      "SHA256":  "89437C56634EAD4D415AD21AE2F242AA5BCFD03C0E481044E501BFE6C2389416"
                   },
                   {
                       "Name":  "09_Disable_Windows_Update_Services.ps1",
@@ -73,8 +73,8 @@
                   {
                       "Name":  "14_Endpoint_Health_Inventory.ps1",
                       "Role":  "ManagedFile",
-                      "Version":  "1.6.1",
-                      "SHA256":  "93E2243C13DE1B6FE3088C00930414FD7B51F617E633929980DAF32F94060807"
+                      "Version":  "1.9.0",
+                      "SHA256":  "4406084F46991096AB3AC8121930DF4FCF1177A6BFA6FD3645F399CA823B1CAF"
                   },
                   {
                       "Name":  "16_Check_Deep_Freeze_Status.ps1",
@@ -97,8 +97,8 @@
                   {
                       "Name":  "Maintenance.Copilot.psm1",
                       "Role":  "Framework",
-                      "Version":  "1.1.0",
-                      "SHA256":  "D2704064B8929E7C6C850521335801AA93536D0C201F6467782E64EAC281D2AE"
+                      "Version":  "1.2.1",
+                      "SHA256":  "0731E2E56553A297160500CDFC078BE903C85CC5063CA4F3C7B2F87751DD812B"
                   },
                   {
                       "Name":  "Maintenance.Framework.psm1",
@@ -109,20 +109,26 @@
                   {
                       "Name":  "Maintenance.Policy.json",
                       "Role":  "Policy",
-                      "Version":  "1.0.3",
-                      "SHA256":  "D17559FA2B86E57215CD0C5ABEF77CF00669B60780BBE6BC24E1A1D99B32A143"
+                      "Version":  "1.0.0",
+                      "SHA256":  "3D44DB4ACA1EDF5C9B9CAA34FECF238A686CDA5FCF1F383B25B80F4725B6C316"
+                  },
+                  {
+                      "Name":  "SoftwareInventory.Policy.json",
+                      "Role":  "Policy",
+                      "Version":  "1.0.0",
+                      "SHA256":  "473AB10A960C5F7799739635383ACE4A72B1C06E7C7D16D52BACCBCFBCBDF806"
                   },
                   {
                       "Name":  "Repair-MicrosoftEdgeUpdate.ps1",
                       "Role":  "Remediation",
                       "Version":  "1.0.0",
-                      "SHA256":  "C2F1DFA0DB889388064A021FDC04D21FE97FDA0C136DD03447C1661B0581B337"
+                      "SHA256":  "7559F82A40BAB15604CACE1173483595A4CC2F8DDD14319B648533939B964AEA"
                   },
                   {
                       "Name":  "Register-Tasks_SYSTEM.ps1",
                       "Role":  "TaskRegistration",
-                      "Version":  "4.11.0",
-                      "SHA256":  "5442431A90788B201D29D4FCE3241479CA122FC55600978E95027C9829E1C660"
+                      "Version":  "1.5",
+                      "SHA256":  "1A1F252E2750918B4D0380202B95B7A9A8C6137E435F46C904F1DD91D0D43B12"
                   }
               ]
 }

@@ -1,6 +1,7 @@
-# ScriptVersion: 2.1.8
-# LastUpdated: 2026-08-18
-# Changes: v2.1.8 fixes Windows PowerShell 5.1 generic-list array conversion in telemetry.
+# ScriptVersion: 2.2.0
+# LastUpdated: 2026-09-23
+# Changes: v2.2.0 adds application inventory for maintenance planning.
+#          v2.1.8 fixes Windows PowerShell 5.1 generic-list array conversion in telemetry.
 #          v2.1.7 fixes telemetry parameter binding for ordered dictionaries and
 #          routes NDJSON writes through Maintenance.Framework to avoid file-lock issues.
 #          v2.1.6 adds Elastic-ready per-application update telemetry: updated count,
@@ -28,7 +29,7 @@ $SpecialHandlingPackageIds = @(
 
 $ErrorActionPreference = 'Stop'
 
-$ScriptVersion = '2.1.8'
+$ScriptVersion = '2.2.0'
 $ScriptName = '03_Weekend_Apps_Update.ps1'
 $ComputerName = $env:COMPUTERNAME
 $ExecutionStart = Get-Date
@@ -39,6 +40,7 @@ $ApplicationResults = New-Object System.Collections.Generic.List[object]
 $TelemetryDirectory = Join-Path $env:SystemDrive 'Logs'
 $TelemetryNdjsonPath = Join-Path $TelemetryDirectory 'Maintenance-Telemetry.ndjson'
 $TelemetryLatestPath = Join-Path $TelemetryDirectory '03_Weekend_Apps_Update.latest.json'
+$ApplicationInventoryPath = Join-Path $TelemetryDirectory '03_Weekend_Apps_Update.app-inventory.latest.json'
 
 $MaintenanceFrameworkPath = 'C:\Scripts\Maintenance.Framework.psm1'
 Import-Module -Name $MaintenanceFrameworkPath -Force -ErrorAction Stop
@@ -707,6 +709,82 @@ function Get-WingetVersion {
     return $null
 }
 
+# Read-only inventory of installed desktop applications. A WinGet list match is
+# evidence of catalog recognition, not a promise of an available update.
+function Get-ApplicationMaintenanceInventory {
+    $recognized = @{}
+    $wingetStatus = 'Unavailable'
+    try {
+        $result = Invoke-Winget -Arguments @('list', '--source', 'winget', '--disable-interactivity') -IgnoreExitCode
+        if ($result.ExitCode -eq 0) {
+            $columns = $null
+            foreach ($line in $result.Output) {
+                $raw = [string]$line
+                if ($raw -match '^Name\s+Id\s+Version(?:\s+Available)?(?:\s+Source)?\s*$') {
+                    $idAt = $raw.IndexOf('Id', 4)
+                    $versionAt = $raw.IndexOf('Version', $idAt + 2)
+                    $sourceAt = $raw.IndexOf('Source', $versionAt + 7)
+                    $columns = @($idAt, $versionAt, $sourceAt)
+                    continue
+                }
+                if (-not $columns -or $raw.Length -le $columns[1] -or $raw.Trim() -match '^-{3,}') { continue }
+                $id = $raw.Substring($columns[0], $columns[1] - $columns[0]).Trim()
+                $name = $raw.Substring(0, $columns[0]).Trim()
+                $source = if ($columns[2] -ge 0 -and $raw.Length -gt $columns[2]) { $raw.Substring($columns[2]).Trim() } else { '' }
+                if ($name -and $id -and $source -eq 'winget') {
+                    $key = $name.ToLowerInvariant()
+                    if (-not $recognized.ContainsKey($key)) { $recognized[$key] = @() }
+                    $recognized[$key] += $id
+                }
+            }
+            $wingetStatus = 'Completed'
+        }
+        else { $wingetStatus = "ExitCode:$($result.ExitCode)" }
+    }
+    catch { $wingetStatus = "Error:$($_.Exception.Message)" }
+
+    $entries = New-Object System.Collections.Generic.List[object]
+    $registryStatus = 'Completed'
+    $roots = @('HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*',
+               'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*',
+               'Registry::HKEY_USERS\*\Software\Microsoft\Windows\CurrentVersion\Uninstall\*')
+    foreach ($root in $roots) {
+        try {
+            # Registry reads do not invoke MSI repair (unlike Win32_Product).
+            foreach ($key in @(Get-Item -Path $root -ErrorAction Stop)) {
+                try {
+                    $app = Get-ItemProperty -LiteralPath $key.PSPath -ErrorAction Stop
+                    $name = [string]$app.DisplayName
+                    if ([string]::IsNullOrWhiteSpace($name) -or $app.SystemComponent -eq 1 -or
+                        [string]$app.ReleaseType -match '^(Update|Hotfix|Security Update)$') { continue }
+                    $matchIds = if ($recognized.ContainsKey($name.ToLowerInvariant())) { @($recognized[$name.ToLowerInvariant()]) } else { @() }
+                    $entries.Add([PSCustomObject]@{
+                        Name = $name
+                        Version = [string]$app.DisplayVersion
+                        Publisher = [string]$app.Publisher
+                        RegistryKey = [string]$key.Name
+                        WingetId = if ($matchIds.Count -eq 1) { $matchIds[0] } else { $null }
+                        MaintenanceStatus = if ($matchIds.Count -eq 1) { 'WinGetNameMatched' } else { 'ReviewUpdateMethod' }
+                    }) | Out-Null
+                }
+                catch { Write-Log "Unable to inspect registry key $($key.Name): $($_.Exception.Message)" 'WARN' }
+            }
+        }
+        catch {
+            $registryStatus = 'Partial'
+            Write-Log "Unable to enumerate application inventory path ${root}: $($_.Exception.Message)" 'WARN'
+        }
+    }
+    return [PSCustomObject]@{
+        RunId = $RunId
+        ComputerName = $ComputerName
+        CollectedAt = (Get-Date).ToUniversalTime().ToString('o')
+        RegistryStatus = $registryStatus
+        WingetListStatus = $wingetStatus
+        Applications = [object[]]@(foreach ($entry in $entries) { $entry })
+    }
+}
+
 function Write-TelemetryEvent {
     param(
         [Parameter(Mandatory)][int]$ExitCode,
@@ -755,6 +833,8 @@ $preMain = @()
 $preExplicit = @()
 $finalMain = @()
 $finalExplicit = @()
+$effectiveFinalMain = @()
+$deferredFinalMain = @()
 $pinnedBefore = @()
 $pinnedAfter = @()
 $updatedPackageDetails = @()
@@ -764,6 +844,7 @@ $sourceRefreshExitCode = $null
 $officeResult = [PSCustomObject]@{ Installed = $false; Attempted = $false; Status = 'NotRun'; ExitCode = $null; TimedOut = $false }
 $rebootRequiredBefore = Test-RebootRequired
 $rebootRequiredAfter = $false
+$applicationInventory = $null
 
 try {
     if (-not (Test-IsAdministrator)) {
@@ -772,7 +853,7 @@ try {
 
     Initialize-NetworkDefaults
     Write-Log "Initializing application update script..." 'INFO'
-    Write-Log "Script version: $ScriptVersion | Last updated: 2026-08-18" 'INFO'
+    Write-Log "Script version: $ScriptVersion | Last updated: 2026-09-23" 'INFO'
     Write-Log "Active staged text log path: $LogPath" 'INFO'
     Write-Log "Completed text log publish path: $PublishedLogPath" 'INFO'
 
@@ -898,6 +979,13 @@ catch {
     $finalStatus = 'Failed'
 }
 finally {
+    try {
+        $applicationInventory = Get-ApplicationMaintenanceInventory
+        $applicationInventory | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $ApplicationInventoryPath -Encoding UTF8
+        $reviewCount = @($applicationInventory.Applications | Where-Object MaintenanceStatus -eq 'ReviewUpdateMethod').Count
+        Write-Log "Application inventory: $($applicationInventory.Applications.Count) registry entries; $reviewCount require update-method review. Saved to $ApplicationInventoryPath" 'INFO'
+    }
+    catch { Write-Log "Application inventory failed: $($_.Exception.Message)" 'WARN' }
     $initialPackages = @($preMain + $preExplicit)
     $remainingPackages = @($finalMain + $finalExplicit)
     $remainingIds = @{}
@@ -1015,6 +1103,11 @@ finally {
     $details = [ordered]@{
         WingetAvailable           = [bool](Get-WingetPath)
         WingetVersion             = $(Get-WingetVersion)
+        ApplicationInventoryPath  = if ($applicationInventory) { $ApplicationInventoryPath } else { $null }
+        ApplicationInventoryCount = if ($applicationInventory) { $applicationInventory.Applications.Count } else { 0 }
+        ApplicationsToReviewCount = if ($applicationInventory) { @($applicationInventory.Applications | Where-Object MaintenanceStatus -eq 'ReviewUpdateMethod').Count } else { 0 }
+        ApplicationInventoryRegistryStatus = if ($applicationInventory) { $applicationInventory.RegistryStatus } else { 'Failed' }
+        ApplicationInventoryWingetStatus = if ($applicationInventory) { $applicationInventory.WingetListStatus } else { 'Failed' }
         SourceRefreshExitCode     = $sourceRefreshExitCode
         BulkUpgradeExitCode       = $bulkExitCode
         IncludeUnknown            = [bool]$IncludeUnknown

@@ -1,8 +1,12 @@
 # =====================================================================
 # ScriptName: 02_Remove_User_Profiles.ps1
-# ScriptVersion: 2.4.2
-# LastUpdated: 2026-09-18
-# Changes: v2.4.2 removes the superseded in-file Copilot implementation; the
+# ScriptVersion: 2.5.0
+# LastUpdated: 2026-10-07
+# Changes: v2.5.0 removes Copilot removal/policies and Edge InPrivate startup
+#          configuration from Script 02. Those functions are now owned by
+#          04_Sunday_Lab_Application_Maintenance.ps1; Script 02 is limited to
+#          profile cleanup and standard user-environment preferences.
+#          v2.4.2 removes the superseded in-file Copilot implementation; the
 #          shared Maintenance.Copilot module is now the sole implementation.
 #          v2.4.1 introduced the shared Copilot module.
 #          v2.4.0 completely removes the Microsoft Copilot Appx package from
@@ -43,18 +47,7 @@ param(
 
     [int]$ProfileFolderJobTimeoutMinutes = 15,
 
-    [string]$ProfileCleanupStatePath = 'C:\ProgramData\Compton\ProfileCleanupState.json',
-
-    # Add additional computer name patterns here as needed.
-    # Examples:
-    #   'SSB-114*' matches any computer name that begins with SSB-114.
-    #   'LAB-205-01' matches one exact computer name.
-    [string[]]$EdgeInPrivateComputerNamePatterns = @(
-        'SSB-114*',
-        'SSB-122*'
-    ),
-
-    [string]$EdgeInPrivateUrl = 'https://www.compton.edu'
+    [string]$ProfileCleanupStatePath = 'C:\ProgramData\Compton\ProfileCleanupState.json'
 )
 
 $ErrorActionPreference = 'Stop'
@@ -66,7 +59,7 @@ $script:BaseFileName = "{0}-RemoveUserProfiles-{1}" -f $script:ComputerName, $sc
 $script:YamlLogPath = Join-Path $LogDirectory ($script:BaseFileName + '.yaml')
 $script:RunId = [guid]::NewGuid().ToString('N')
 $script:ScriptName = '02_Remove_User_Profiles.ps1'
-$script:ScriptVersion = '2.4.1'
+$script:ScriptVersion = '2.5.0'
 $script:Domain = $env:USERDNSDOMAIN
 $script:TextLogPath = $null
 $script:PublishedTextLogPath = $null
@@ -76,8 +69,6 @@ $script:LatestTelemetryPath = Join-Path $LogDirectory '02_Remove_User_Profiles.l
 $script:WarningCount = 0
 $script:ErrorCount = 0
 $script:Finalized = $false
-$script:EdgeInPrivateMatched = $false
-$script:EdgeInPrivateConfigured = $false
 $script:DiskBefore = $null
 $script:DiskAfter = $null
 
@@ -93,14 +84,6 @@ $script:Summary = [ordered]@{
     QueuedProfiles     = 0
     DeletedProfiles    = 0
     OneDriveTasksRemoved = 0
-    CopilotInstalledPackagesFound = 0
-    CopilotInstalledPackagesRemoved = 0
-    CopilotProvisionedPackagesFound = 0
-    CopilotProvisionedPackagesRemoved = 0
-    CopilotProcessesStopped = 0
-    CopilotTasksDisabled = 0
-    CopilotRemovalFailures = 0
-    CopilotRemovalStatus = 'NotStarted'
     FailedProfiles     = 0
     TimedOutProfiles   = 0
     DeferredProfiles   = 0
@@ -129,7 +112,6 @@ $script:Windows11UIPreferences = @(
     [pscustomobject]@{ Enabled = $true; SubKey = 'Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced'; Name = 'TaskbarAl';          Type = 'REG_DWORD'; Value = 0; Description = 'taskbar/start alignment left' },
     [pscustomobject]@{ Enabled = $true; SubKey = 'Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced'; Name = 'TaskbarDa';          Type = 'REG_DWORD'; Value = 0; Description = 'hide Widgets button' },
     [pscustomobject]@{ Enabled = $true; SubKey = 'Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced'; Name = 'ShowTaskViewButton'; Type = 'REG_DWORD'; Value = 0; Description = 'hide Task View button' },
-    [pscustomobject]@{ Enabled = $true; SubKey = 'Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced'; Name = 'ShowCopilotButton';  Type = 'REG_DWORD'; Value = 0; Description = 'hide Copilot button' },
 
     # Display the full taskbar search box instead of only the search icon.
     [pscustomobject]@{ Enabled = $true; SubKey = 'Software\Microsoft\Windows\CurrentVersion\Search'; Name = 'SearchboxTaskbarMode'; Type = 'REG_DWORD'; Value = 2; Description = 'show the full taskbar search box' },
@@ -138,10 +120,8 @@ $script:Windows11UIPreferences = @(
     # This setting uses the unnamed/default registry value under InprocServer32.
     [pscustomobject]@{ Enabled = $true; SubKey = 'Software\Classes\CLSID\{86ca1aa0-34aa-4e8b-a509-50c905bae2a2}\InprocServer32'; Name = $null; Type = 'REG_SZ'; Value = ''; Description = 'enable the classic Windows 10-style context menu' },
 
-    # Search and Copilot preferences.
+    # Search preferences.
     [pscustomobject]@{ Enabled = $true; SubKey = 'Software\Microsoft\Windows\CurrentVersion\SearchSettings'; Name = 'IsDynamicSearchBoxEnabled'; Type = 'REG_DWORD'; Value = 0; Description = 'disable Search Highlights' },
-    [pscustomobject]@{ Enabled = $true; SubKey = 'Software\Policies\Microsoft\Windows\WindowsCopilot'; Name = 'TurnOffWindowsCopilot'; Type = 'REG_DWORD'; Value = 1; Description = 'disable Windows Copilot for this user' },
-    [pscustomobject]@{ Enabled = $true; SubKey = 'Software\Policies\Microsoft\Windows\WindowsAI'; Name = 'RemoveMicrosoftCopilotApp'; Type = 'REG_DWORD'; Value = 1; Description = 'request Microsoft Copilot app removal and prevent it for this user' },
 
     # File Explorer preferences.
     [pscustomobject]@{ Enabled = $true; SubKey = 'Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced'; Name = 'LaunchTo';    Type = 'REG_DWORD'; Value = 1; Description = 'open File Explorer to This PC' },
@@ -152,8 +132,6 @@ $script:Windows11UIPreferences = @(
 # Load the shared framework from the same directory as this script.
 $MaintenanceFrameworkPath = 'C:\Scripts\Maintenance.Framework.psm1'
 Import-Module -Name $MaintenanceFrameworkPath -Force -ErrorAction Stop
-$CopilotModulePath = 'C:\Scripts\Maintenance.Copilot.psm1'
-Import-Module -Name $CopilotModulePath -Force -ErrorAction Stop
 $MaintenanceConfig = Initialize-MaintenanceEnvironment -ScriptRoot 'C:\Scripts' -LogRoot 'C:\Logs'
 
 $requiredFrameworkVersion = [version]'2.4.0'
@@ -262,17 +240,6 @@ function Write-ExecutionTelemetry {
             SpaceReclaimedGB             = if ($null -eq $script:Summary.SpaceReclaimedGB) { 0.0 } else { [double]$script:Summary.SpaceReclaimedGB }
 
             OneDriveTasksRemoved         = $script:Summary.OneDriveTasksRemoved
-            CopilotInstalledPackagesFound = [int]$script:Summary.CopilotInstalledPackagesFound
-            CopilotInstalledPackagesRemoved = [int]$script:Summary.CopilotInstalledPackagesRemoved
-            CopilotProvisionedPackagesFound = [int]$script:Summary.CopilotProvisionedPackagesFound
-            CopilotProvisionedPackagesRemoved = [int]$script:Summary.CopilotProvisionedPackagesRemoved
-            CopilotProcessesStopped      = [int]$script:Summary.CopilotProcessesStopped
-            CopilotTasksDisabled         = [int]$script:Summary.CopilotTasksDisabled
-            CopilotRemovalFailures       = [int]$script:Summary.CopilotRemovalFailures
-            CopilotRemovalStatus         = [string]$script:Summary.CopilotRemovalStatus
-            EdgeInPrivateMatched         = $script:EdgeInPrivateMatched
-            EdgeInPrivateConfigured      = $script:EdgeInPrivateConfigured
-
             DeletedProfileNames          = @($script:DeletedProfileDetails | ForEach-Object { $_.ProfileName })
 
             # Use a new detail field name so it can remain an object/array field
@@ -431,12 +398,6 @@ function Write-YamlLog {
         $lines.Add("  profile_cleanup_time_limit_minutes: $(ConvertTo-YamlScalar $ProfileCleanupTimeLimitMinutes)") | Out-Null
         $lines.Add("  profile_folder_job_timeout_minutes: $(ConvertTo-YamlScalar $ProfileFolderJobTimeoutMinutes)") | Out-Null
         $lines.Add("  profile_cleanup_state_path: $(ConvertTo-YamlScalar $ProfileCleanupStatePath)") | Out-Null
-        $lines.Add("  edge_inprivate_url: $(ConvertTo-YamlScalar $EdgeInPrivateUrl)") | Out-Null
-        $lines.Add('  edge_inprivate_computer_name_patterns:') | Out-Null
-        if ($EdgeInPrivateComputerNamePatterns.Count -gt 0) {
-            foreach ($pattern in $EdgeInPrivateComputerNamePatterns) { $lines.Add("    - $(ConvertTo-YamlScalar $pattern)") | Out-Null }
-        }
-        else { $lines.Add('    []') | Out-Null }
         $lines.Add('  excluded_profiles:') | Out-Null
         if ($ExcludedProfiles.Count -gt 0) {
             foreach ($name in $ExcludedProfiles) { $lines.Add("    - $(ConvertTo-YamlScalar $name)") | Out-Null }
@@ -502,66 +463,6 @@ function Write-Log {
         'SUCCESS' { Write-Host $line -ForegroundColor Green }
         'WARNING' { Write-Host $line -ForegroundColor Yellow }
         'ERROR'   { Write-Host $line -ForegroundColor Red }
-    }
-}
-
-function Test-ComputerNamePatternMatch {
-    param(
-        [Parameter(Mandatory)][string]$ComputerName,
-        [Parameter(Mandatory)][string[]]$Patterns
-    )
-
-    foreach ($pattern in $Patterns) {
-        if ([string]::IsNullOrWhiteSpace($pattern)) {
-            continue
-        }
-
-        if ($ComputerName -like $pattern) {
-            return $true
-        }
-    }
-
-    return $false
-}
-
-function Set-EdgeInPrivateAutoLaunch {
-    param(
-        [Parameter(Mandatory)][string]$Url
-    )
-
-    $edgePaths = @(
-        (Join-Path ${env:ProgramFiles(x86)} 'Microsoft\Edge\Application\msedge.exe'),
-        (Join-Path ${env:ProgramFiles} 'Microsoft\Edge\Application\msedge.exe')
-    )
-
-    $edgePath = $edgePaths | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
-
-    if (-not $edgePath) {
-        Write-Log 'Microsoft Edge was not found. Edge InPrivate auto-launch was not configured.' 'ERROR'
-        return $false
-    }
-
-    $runKey = 'HKLM:\Software\Microsoft\Windows\CurrentVersion\Run'
-    $runValueName = 'LaunchComptonEdge'
-    $command = '"{0}" --inprivate --new-window --start-maximized "{1}"' -f $edgePath, $Url
-
-    try {
-        New-Item -Path $runKey -Force | Out-Null
-
-        New-ItemProperty `
-            -Path $runKey `
-            -Name $runValueName `
-            -Value $command `
-            -PropertyType String `
-            -Force | Out-Null
-
-        Write-Log "Configured Edge InPrivate auto-launch for every user at logon: $Url" 'OK'
-        Write-Log "Run key value: $runValueName = $command" 'INFO'
-        return $true
-    }
-    catch {
-        Write-Log "Failed to configure Edge InPrivate auto-launch: $($_.Exception.Message)" 'ERROR'
-        return $false
     }
 }
 
@@ -1499,26 +1400,6 @@ function Set-Windows11UIPreferencesForAllUsers {
     Write-Log "Completed Windows 11 UI preference application for all available users." 'OK'
 }
 
-# Compatibility wrapper retained for this script. All Copilot removal logic is
-# implemented by Maintenance.Copilot.psm1.
-function Remove-MicrosoftCopilot {
-    [CmdletBinding(SupportsShouldProcess = $true)]
-    param()
-
-    $copilotResult = Invoke-ComprehensiveCopilotRemoval `
-        -Logger { param($Message,$Level) Write-Log $Message $Level } `
-        -WhatIf:$WhatIfPreference
-
-    $script:Summary.CopilotInstalledPackagesFound = [int]$copilotResult.InstalledPackagesFound
-    $script:Summary.CopilotInstalledPackagesRemoved = [int]$copilotResult.InstalledPackagesRemoved
-    $script:Summary.CopilotProvisionedPackagesFound = [int]$copilotResult.ProvisionedPackagesFound
-    $script:Summary.CopilotProvisionedPackagesRemoved = [int]$copilotResult.ProvisionedPackagesRemoved
-    $script:Summary.CopilotProcessesStopped = [int]$copilotResult.ProcessesStopped
-    $script:Summary.CopilotTasksDisabled = [int]$copilotResult.TasksDisabled
-    $script:Summary.CopilotRemovalFailures = [int]$copilotResult.Failures
-    $script:Summary.CopilotRemovalStatus = [string]$copilotResult.Status
-}
-
 if (-not (Test-IsAdministrator)) {
     Write-Error 'Please run this script as Administrator.'
     $script:ErrorCount++
@@ -1529,15 +1410,6 @@ Ensure-LogDirectory
 $script:DiskBefore = Get-SystemDriveSpace
 if ($script:DiskBefore) { $script:Summary.DiskFreeGBBefore = $script:DiskBefore.FreeGB }
 Write-YamlLog
-
-if (Test-ComputerNamePatternMatch -ComputerName $script:ComputerName -Patterns $EdgeInPrivateComputerNamePatterns) {
-    $script:EdgeInPrivateMatched = $true
-    Write-Log "Computer name '$($script:ComputerName)' matches Edge InPrivate auto-launch list." 'INFO'
-    $script:EdgeInPrivateConfigured = [bool](Set-EdgeInPrivateAutoLaunch -Url $EdgeInPrivateUrl)
-}
-else {
-    Write-Log "Computer name '$($script:ComputerName)' does not match Edge InPrivate auto-launch list. Skipping Edge configuration." 'INFO'
-}
 
 Write-Log 'Starting profile cleanup.' 'INFO'
 Write-Log "Users root: $UsersRoot" 'INFO'
@@ -1701,23 +1573,10 @@ Write-Log 'Profile removal stage complete. Applying Windows 11 UI and classic co
 Set-Windows11UIPreferencesForAllUsers
 Write-YamlLog
 
-# Remove Microsoft Copilot after the per-user policy pass. Package failures do
-# not prevent the script from writing its final YAML, text, and Elastic logs.
-try {
-    Remove-MicrosoftCopilot -WhatIf:$WhatIfPreference
-}
-catch {
-    $script:Summary.CopilotRemovalFailures++
-    $script:Summary.CopilotRemovalStatus = 'Failed'
-    Write-Log "Unexpected Microsoft Copilot removal failure: $($_.Exception.Message)" 'ERROR'
-}
-Write-YamlLog
-
 $script:Summary.EndTime = Get-Date
 
 Write-Log 'Profile cleanup complete.' 'INFO'
 Write-Log "Summary: Found=$($script:Summary.FoundProfiles), Excluded=$($script:Summary.ExcludedProfiles), LoadedSkipped=$($script:Summary.SkippedLoaded), SpecialSkipped=$($script:Summary.SkippedSpecial), AgeSkipped=$($script:Summary.SkippedByAge), Queued=$($script:Summary.QueuedProfiles), QueuedSizeGB=$($script:Summary.TotalQueuedProfileSizeGB), Deleted=$($script:Summary.DeletedProfiles), DeletedMeasuredSizeGB=$($script:Summary.TotalDeletedProfileSizeGB), OneDriveTasksRemoved=$($script:Summary.OneDriveTasksRemoved), Failed=$($script:Summary.FailedProfiles), TimedOut=$($script:Summary.TimedOutProfiles), Deferred=$($script:Summary.DeferredProfiles)" 'INFO'
-Write-Log "Copilot summary: Status=$($script:Summary.CopilotRemovalStatus), InstalledFound=$($script:Summary.CopilotInstalledPackagesFound), InstalledRemoved=$($script:Summary.CopilotInstalledPackagesRemoved), ProvisionedFound=$($script:Summary.CopilotProvisionedPackagesFound), ProvisionedRemoved=$($script:Summary.CopilotProvisionedPackagesRemoved), ProcessesStopped=$($script:Summary.CopilotProcessesStopped), TasksDisabled=$($script:Summary.CopilotTasksDisabled), Failures=$($script:Summary.CopilotRemovalFailures)" 'INFO'
 Write-Log ("Elastic profile-cleanup summary: DeletedProfileCount={0}; TotalDeletedProfileSizeGB={1}; SpaceReclaimedGB={2}" -f `
     $script:Summary.DeletedProfiles,
     $script:Summary.TotalDeletedProfileSizeGB,
@@ -1725,5 +1584,5 @@ Write-Log ("Elastic profile-cleanup summary: DeletedProfileCount={0}; TotalDelet
 
 Write-YamlLog
 
-if ($script:Summary.FailedProfiles -gt 0 -or $script:Summary.CopilotRemovalFailures -gt 0) { Complete-ScriptExecution -ExitCode 2 }
+if ($script:Summary.FailedProfiles -gt 0) { Complete-ScriptExecution -ExitCode 2 }
 Complete-ScriptExecution -ExitCode 0

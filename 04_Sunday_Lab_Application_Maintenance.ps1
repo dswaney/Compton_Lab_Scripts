@@ -1,16 +1,17 @@
 #requires -Version 5.1
 #requires -RunAsAdministrator
 # ScriptName:    04_Sunday_Lab_Application_Maintenance.ps1
-# ScriptVersion: 1.7.0
-# LastUpdated:   2026-09-21
+# ScriptVersion: 1.17.0
+# LastUpdated:   2026-10-06
 <#
 .SYNOPSIS
     Runs the Sunday lab application and configuration maintenance in one script.
 
 .DESCRIPTION
     Consolidates the former scripts 11, 12, 13, 15, 17, 18, and 19 and includes
-    native Office LTSC migration, Office 2024 installation, and activation
-    maintenance. Microsoft 365 Apps installations are intentionally skipped.
+    native Office migration, Office 2024 installation, and activation
+    maintenance. Microsoft 365 Apps and supported older perpetual/LTSC suites
+    are migrated to Office LTSC 2024.
     The System Restore and Stellarium
     Location Services code is fully bundled in this file; separately deployed
     scripts 12 and 19 are not needed.
@@ -25,11 +26,82 @@
 
 .NOTES
     ScriptName:    04_Sunday_Lab_Application_Maintenance.ps1
-    ScriptVersion: 1.7.0
-    LastUpdated:   2026-09-21
+    ScriptVersion: 1.17.0
+    LastUpdated:   2026-10-06
     Requires:      64-bit Windows PowerShell 5.1, Administrator or SYSTEM
 
-    Changes:       v1.7.0 enforces a five-item startup-app allowlist for all
+    Changes:       v1.17.0 makes Script 04 the sole numbered-script owner of
+                   Copilot cleanup and Edge InPrivate startup. Edge InPrivate
+                   now has its own enabled runner switch and targeting list;
+                   the embedded configuration explicitly leaves autologon off.
+                   v1.16.0 sets Google Chrome as the Windows default handler
+                   for HTTP, HTTPS, .htm, and .html through the supported
+                   default-associations XML policy. The browser section uses
+                   Chrome's registered ProgIDs, stores the managed XML locally,
+                   verifies the policy, and continues enforcing the Compton
+                   College homepage for Chrome, Edge, and Firefox.
+                   v1.15.0 extends the final Copilot cleanup telemetry for the
+                   Microsoft-published, system-level Win32 Copilot application
+                   shown in Programs and Features. The shared module performs
+                   the uninstall and Script 04 records found, attempted,
+                   removed, remaining, exit-code, and residual-directory data.
+                   v1.14.0 adds a final post-maintenance Copilot cleanup section.
+                   It imports the centrally managed Maintenance.Copilot module
+                   from C:\Scripts (or the lab share as a fallback), removes any
+                   Copilot package re-provisioned by Edge Update, reapplies the
+                   existing policies, and records structured telemetry.
+                   v1.13.0 expands the Task Manager startup allowlist to retain
+                   teacher.exe and suppresses the HP Notifications/HP System Tray
+                   consumer popup experience. Targeted HP notification processes
+                   are stopped and narrowly matching scheduled tasks are disabled;
+                   HP drivers, audio services, HPIA, HPCMSL, BIOS tools, and other
+                   hardware-support components are not modified.
+                   v1.12.1 requires Deep Freeze to be installed before Microsoft
+                   365 Apps can be replaced with Office LTSC 2024. Microsoft 365
+                   is left unchanged on non-Deep-Freeze systems and the skip is
+                   recorded in Office maintenance telemetry.
+                   v1.12.0 migrates Microsoft 365 Apps on lab computers to Office
+                   LTSC 2024: detected Click-to-Run Microsoft 365 products are
+                   removed with targeted Office Deployment Tool XML, Office 2024
+                   is installed from the existing share, machine-wide activation
+                   is verified, and migration telemetry is recorded.
+                   v1.10.0 adds numbered, color-coded section banners before every
+                   maintenance function so console output and the combined log
+                   clearly identify section boundaries and enabled/skipped state.
+                   v1.9.1 disables Adobe account sign-in, Document Cloud, cloud
+                   connectors, and first-run online experiences while retaining
+                   local PDF viewing, printing, forms, and digital signatures.
+                   v1.9.0 enforces Adobe Reader/Acrobat machine policy to suppress
+                   Pro trial and paid-feature upsell prompts for every user, with
+                   idempotent verification and structured maintenance telemetry.
+                   v1.8.4 stages the System Restore payload beginning exactly at
+                   [CmdletBinding()], eliminating any hidden/preamble content that
+                   Windows PowerShell could interpret before the param block.
+                   v1.8.3 strips all invisible leading BOM/zero-width characters
+                   and stages embedded scripts as UTF-8 without BOM; it also adds
+                   retry-safe shared writes to the browser and Stellarium sections.
+                   v1.8.2 attaches embedded section processes to the existing
+                   console so their detailed output and errors are visible without
+                   opening another PowerShell window.
+                   v1.8.1 normalizes embedded source text before staging so a
+                   duplicate Unicode BOM cannot prevent the System Restore child
+                   script from parsing and publishing verification telemetry.
+                   v1.8.0 suppresses Chrome's startup profile picker and legacy
+                   forced sign-in behavior, disables the retired Honorlock section
+                   because deployment is now owned by GPO, and keeps fleet-wide
+                   log consolidation centrally owned by 08_System_Repair.ps1.
+                   v1.7.4 makes runner logging tolerant of transient file locks so
+                   log collection cannot terminate the maintenance workflow.
+                   v1.7.3 corrects the embedded Elastic configuration declarations
+                   and propagates Elastic child telemetry into the combined log.
+                   v1.7.2 enables the Elastic Agent section for the configured
+                   IB1, IB2, SSC-216, and AHB-146 prefixes; restores the production
+                   file-server and PaperCut paths
+                   that were replaced by public-repository placeholders, reads
+                   Script 11 status from maintenance.execution, rejects stale
+                   child telemetry, and reports the actual child failure detail
+                   for System Restore and printer/PaperCut sections.
+                   v1.7.0 enforces a five-item startup-app allowlist for all
                    existing user profiles and the Default User profile. All
                    other discovered Task Manager startup entries are disabled,
                    not deleted, and the result is logged for fleet reporting.
@@ -86,7 +158,7 @@ $ErrorActionPreference = 'Stop'
 # ============================================================================
 # EASY-TO-EDIT COMPUTER TARGETING
 # ============================================================================
-# Use PowerShell wildcard patterns for Autologon, Honorlock, and Stellarium.
+# Use PowerShell wildcard patterns for Edge InPrivate, Honorlock, and Stellarium.
 # Examples: 'SSB-122-*', 'SSC-216*', or '*' for every computer.
 #
 # Elastic Agent uses computer-name PREFIXES, not wildcard patterns.
@@ -95,19 +167,23 @@ $ErrorActionPreference = 'Stop'
 # Add or remove quoted entries in the appropriate list. Keep the @(...)
 # structure and separate entries with commas.
 
-# --- Autologon and Edge startup targets (former script 13) ------------------
-[string[]]$AutologonComputerPatterns = @(
+# --- Edge InPrivate startup targets (former script 13) ----------------------
+[string[]]$EdgeInPrivateComputerPatterns = @(
     'SSB-122-*',
     'SSB-114*',
     'SSB-171*'
 )
 
 # --- Elastic Agent installation targets (former script 15) -----------------
+# Does not require the * in the prefix to include all the computers in the lab
 [string[]]$ElasticAgentComputerPrefixes = @(
     'IB1',
     'IB2',
-    'SSC-216',
-    'AHB-146'
+    'SSC',
+    'AHB',
+	'SSB',
+	'MS',
+	'VT'
 )
 
 # --- Honorlock Chrome extension targets (former script 18) -----------------
@@ -139,6 +215,7 @@ $ErrorActionPreference = 'Stop'
     'initialise.bat',
     'OneDrive.exe',
     'student.exe',
+    'teacher.exe',
     'RtkAudUService64.exe'
 )
 
@@ -148,23 +225,29 @@ $ErrorActionPreference = 'Stop'
 # Set a value to $false to retain the section in this combined file but skip it.
 [bool]$RunPrinterAndPaperCut = $true
 [bool]$RunSystemRestore     = $true
-[bool]$RunAutologonAndEdge   = $false
-[bool]$RunElasticAgent      = $false
+[bool]$RunEdgeInPrivate     = $true
+[bool]$RunElasticAgent      = $true
 [bool]$RunBrowserHomepage   = $true
-[bool]$RunHonorlock         = $true
+# Honorlock is deployed by Group Policy. Keep the embedded section available for
+# rollback/reference, but do not execute it from Script 04.
+[bool]$RunHonorlock         = $false
 [bool]$RunStellariumLocation = $true
 [bool]$RunOffice2024Maintenance = $true
 [bool]$RunStartupAppAllowlist = $true
+[bool]$RunAdobeReaderPolicy = $true
+[bool]$RunPostMaintenanceCopilotCleanup = $true
 
 # ============================================================================
 # GENERAL SETTINGS
 # ============================================================================
 [string]$HomepageUrl = 'https://www.compton.edu'
-[string]$Office2024SourcePath = '\\SERVER\DeploymentShare\Installers\Office2024'
+[string]$Office2024SourcePath = '\\filesvr\Labscripts\Installers\Office2024'
 [string]$Office2024ConfigurationFile = 'office2024config.xml'
 [string]$LogDirectory = 'C:\Logs'
 [string]$RunnerScriptName = '04_Sunday_Lab_Application_Maintenance.ps1'
-[string]$RunnerVersion = '1.7.0'
+[string]$RunnerVersion = '1.17.0'
+[string]$CopilotModuleLocalPath = 'C:\Scripts\Maintenance.Copilot.psm1'
+[string]$CopilotModuleSharePath = '\\filesvr\Labscripts\Maintenance.Copilot.psm1'
 [string]$RunnerLogPath = Join-Path $LogDirectory '04_Sunday_Lab_Application_Maintenance.log'
 [string]$RunnerLatestPath = Join-Path $LogDirectory '04_Sunday_Lab_Application_Maintenance.latest.json'
 [string]$RunnerTelemetryPath = Join-Path $LogDirectory 'Maintenance-Telemetry.ndjson'
@@ -284,6 +367,39 @@ function Ensure-Directory {
     }
 }
 
+function Add-SharedTextLine {
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)][string]$Line,
+        [int]$MaximumAttempts = 10
+    )
+
+    for ($attempt = 1; $attempt -le $MaximumAttempts; $attempt++) {
+        $stream = $null
+        $writer = $null
+        try {
+            $stream = [System.IO.File]::Open(
+                $Path,
+                [System.IO.FileMode]::Append,
+                [System.IO.FileAccess]::Write,
+                [System.IO.FileShare]::ReadWrite
+            )
+            $writer = [System.IO.StreamWriter]::new($stream, [System.Text.UTF8Encoding]::new($false))
+            $writer.WriteLine($Line)
+            $writer.Flush()
+            return
+        }
+        catch [System.IO.IOException] {
+            if ($attempt -ge $MaximumAttempts) { throw }
+            Start-Sleep -Milliseconds (150 * $attempt)
+        }
+        finally {
+            if ($null -ne $writer) { $writer.Dispose() }
+            elseif ($null -ne $stream) { $stream.Dispose() }
+        }
+    }
+}
+
 function Write-Log {
     param(
         [Parameter(Mandatory)][string]$Message,
@@ -312,7 +428,7 @@ function Write-Log {
     try {
         $activeLogDirectory = Split-Path -Parent $LogPath
         Ensure-Directory -Path $activeLogDirectory
-        Add-Content -LiteralPath $LogPath -Value $line -Encoding UTF8
+        Add-SharedTextLine -Path $LogPath -Line $line
     }
     catch {
         Write-Warning ('Unable to write to the log file: {0}' -f $_.Exception.Message)
@@ -1342,10 +1458,10 @@ $ErrorActionPreference = 'Stop'
 # =========================
 $ScriptName = '11_Install_SharpDriver_And_PaperCut.ps1'
 $ScriptVersion = '1.2.8'
-$DriverSourcePath = '\\PRINT-SERVER\Printer Drivers\MFP\win\SH_D31_PCL6_PS_2410a_EnglishUS_64bit'
+$DriverSourcePath = '\\papercut\Printer Drivers\MFP\win\SH_D31_PCL6_PS_2410a_EnglishUS_64bit'
 $PrinterDriverName = 'Sharp BP-70C31 PCL6'
-$PaperCutMsiPath = '\\PRINT-SERVER\Print Deploy Clients\win\pc-print-deploy-client.msi'
-$PrinterSharePath = '\\PRINT-SERVER\StudentSecurePrint'
+$PaperCutMsiPath = '\\papercut\Print Deploy Clients\win\pc-print-deploy-client[10.2.3.44].msi'
+$PrinterSharePath = '\\papercut\StudentSecurePrint'
 $LocalDriverStage = 'C:\ProgramData\Compton\Drivers\Sharp'
 $StateDirectory = 'C:\ProgramData\Compton\State'
 $StatePath = Join-Path $StateDirectory 'SharpDriver-PaperCut-State.json'
@@ -2278,15 +2394,18 @@ finally {
 exit $finalExitCode
 '@
     }
-    AutologonAndEdge = [ordered]@{
-        FileName = '13_Configure_Autologon_And_Edge.ps1'
+    EdgeInPrivate = [ordered]@{
+        FileName = 'Embedded_Configure_Edge_InPrivate.ps1'
         # Plain-text source is intentionally embedded for maintainability.
         Source = @'
 # =====================================================================
-# ScriptName: 13_Configure_Autologon_And_Edge.ps1
-# ScriptVersion: 2.2.0
-# LastUpdated: 2026-08-27
-# Changes: v2.2.0 removes ForceAutoLogon so Log off and Switch user remain available for administrator sign-in,
+# ScriptName: 04_Configure_Edge_InPrivate.ps1
+# ScriptVersion: 2.3.0
+# LastUpdated: 2026-10-07
+# Changes: v2.3.0 separates Edge InPrivate startup from autologon. Script 04
+#          invokes this payload with Edge enabled and autologon explicitly
+#          disabled, so no credential or Winlogon change is made.
+#          v2.2.0 removes ForceAutoLogon so Log off and Switch user remain available for administrator sign-in,
 #          while preserving normal CC-Student automatic sign-in at computer startup.
 #          v2.1.3 normalizes Windows 11 product naming, makes telemetry collections explicitly JSON-array safe,
 #          and adds a concise Elastic configuration summary while preserving password redaction.
@@ -2316,14 +2435,18 @@ param(
 
     [string]$LogDirectory = 'C:\Logs',
 
+    [bool]$ConfigureEdgeInPrivate = $true,
+
+    [bool]$ConfigureAutologon = $false,
+
     [switch]$AllowHttpEdgeUrl
 )
 
 Set-StrictMode -Version 2.0
 $ErrorActionPreference = 'Stop'
 
-$ScriptName = '13_Configure_Autologon_And_Edge.ps1'
-$ScriptVersion = '2.2.0'
+$ScriptName = '04_Configure_Edge_InPrivate.ps1'
+$ScriptVersion = '2.3.0'
 $RunId = [guid]::NewGuid().Guid
 $StartTime = Get-Date
 $ComputerName = $env:COMPUTERNAME
@@ -2333,7 +2456,7 @@ $LogPath = $null
 $PublishedLogPath = $null
 $LogSession = $null
 $TelemetryPath = Join-Path $LogDirectory 'Maintenance-Telemetry.ndjson'
-$LatestTelemetryPath = Join-Path $LogDirectory '13_Configure_Autologon_And_Edge.latest.json'
+$LatestTelemetryPath = Join-Path $LogDirectory '04_Configure_Edge_InPrivate.latest.json'
 $WinlogonPath = 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon'
 $RunKeyPath = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Run'
 $EdgeRunValueName = 'LaunchComptonEdge'
@@ -2376,6 +2499,8 @@ Archive-MaintenanceLogs `
     -ScriptName $ScriptName `
     -LogRoot $LogDirectory `
     -AdditionalPatterns @(
+        '04_Configure_Edge_InPrivate.log',
+        '*-04_Configure_Edge_InPrivate-*.log',
         '13_Configure_Autologon_And_Edge.log',
         '*-13_Configure_Autologon_And_Edge-*.log'
     ) | Out-Null
@@ -2612,38 +2737,46 @@ function Test-ConfigurationInput {
     if (-not $ComputerNamePatterns -or @($ComputerNamePatterns | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }).Count -eq 0) {
         throw 'At least one nonblank computer-name pattern is required.'
     }
-    if ([string]::IsNullOrWhiteSpace($DefaultUserName)) {
-        throw 'DefaultUserName cannot be blank.'
-    }
-    if ([string]::IsNullOrWhiteSpace($DefaultPasswordBase64)) {
-        throw 'DefaultPasswordBase64 cannot be blank when autologon is enabled.'
+    if (-not $ConfigureEdgeInPrivate -and -not $ConfigureAutologon) {
+        throw 'At least one configuration action must be enabled.'
     }
 
-    try {
-        $decodedBytes = [Convert]::FromBase64String($DefaultPasswordBase64)
-        if ($decodedBytes.Length -eq 0) {
-            throw 'The decoded password is empty.'
+    if ($ConfigureAutologon) {
+        if ([string]::IsNullOrWhiteSpace($DefaultUserName)) {
+            throw 'DefaultUserName cannot be blank.'
+        }
+        if ([string]::IsNullOrWhiteSpace($DefaultPasswordBase64)) {
+            throw 'DefaultPasswordBase64 cannot be blank when autologon is enabled.'
+        }
+
+        try {
+            $decodedBytes = [Convert]::FromBase64String($DefaultPasswordBase64)
+            if ($decodedBytes.Length -eq 0) {
+                throw 'The decoded password is empty.'
+            }
+        }
+        catch {
+            throw 'DefaultPasswordBase64 is not valid Base64 or decodes to an empty value.'
+        }
+        finally {
+            $decodedBytes = $null
+        }
+        if ([string]::IsNullOrWhiteSpace($DefaultDomainName)) {
+            throw 'DefaultDomainName cannot be blank.'
         }
     }
-    catch {
-        throw 'DefaultPasswordBase64 is not valid Base64 or decodes to an empty value.'
-    }
-    finally {
-        $decodedBytes = $null
-    }
-    if ([string]::IsNullOrWhiteSpace($DefaultDomainName)) {
-        throw 'DefaultDomainName cannot be blank.'
-    }
 
-    $uri = $null
-    if (-not [uri]::TryCreate($EdgeUrl, [UriKind]::Absolute, [ref]$uri)) {
-        throw "EdgeUrl is not a valid absolute URL: $EdgeUrl"
-    }
-    if ($uri.Scheme -notin @('https','http')) {
-        throw "EdgeUrl must use HTTP or HTTPS: $EdgeUrl"
-    }
-    if ($uri.Scheme -eq 'http' -and -not $AllowHttpEdgeUrl) {
-        throw 'EdgeUrl uses HTTP. Use HTTPS or explicitly supply -AllowHttpEdgeUrl.'
+    if ($ConfigureEdgeInPrivate) {
+        $uri = $null
+        if (-not [uri]::TryCreate($EdgeUrl, [UriKind]::Absolute, [ref]$uri)) {
+            throw "EdgeUrl is not a valid absolute URL: $EdgeUrl"
+        }
+        if ($uri.Scheme -notin @('https','http')) {
+            throw "EdgeUrl must use HTTP or HTTPS: $EdgeUrl"
+        }
+        if ($uri.Scheme -eq 'http' -and -not $AllowHttpEdgeUrl) {
+            throw 'EdgeUrl uses HTTP. Use HTTPS or explicitly supply -AllowHttpEdgeUrl.'
+        }
     }
 }
 
@@ -2854,9 +2987,11 @@ function Write-Telemetry {
             VerificationFailures     = New-StringArrayForJson -InputObject $script:VerificationFailures
             Windows                  = $WindowsInfo
             Configuration            = [ordered]@{
+                ConfigureEdgeInPrivate = [bool]$ConfigureEdgeInPrivate
+                ConfigureAutologon     = [bool]$ConfigureAutologon
                 DefaultUserName   = $DefaultUserName
                 DefaultDomainName = $DefaultDomainName
-                PasswordProvided  = (-not [string]::IsNullOrWhiteSpace($DefaultPasswordBase64))
+                PasswordProvided  = ($ConfigureAutologon -and -not [string]::IsNullOrWhiteSpace($DefaultPasswordBase64))
                 PasswordStorage   = 'Base64ObfuscatedInScript'
                 PasswordValueLogged = $false
                 ForceAutoLogonDesired = $false
@@ -2915,7 +3050,7 @@ $windowsInfo = Get-WindowsInformation
 
 try {
     Initialize-LogDirectory
-    Write-Log "===== Autologon and Edge configuration v$ScriptVersion started ====="
+    Write-Log "===== Edge InPrivate and optional autologon configuration v$ScriptVersion started ====="
     Write-Log "Text log: $LogPath"
     Write-Log "Computer name: $ComputerName"
     Write-Log "Configured computer-name patterns: $($ComputerNamePatterns -join ', ')"
@@ -2944,17 +3079,27 @@ try {
     else {
         Write-Log "Computer '$ComputerName' matches pattern '$($script:MatchedPattern)'." 'OK'
 
-        $script:DecodedPassword = Get-DecodedAutologonPassword
-
         $script:BeforeState = [pscustomobject]@{
             Autologon = Get-AutologonState
             Edge      = Get-EdgeRunState
         }
         Write-ConfigurationStateSummary -Label 'before' -State $script:BeforeState
 
-        Set-AutologonConfiguration
-        Remove-LegacyChromeStartupShortcut
-        Set-EdgeAutoLaunch
+        if ($ConfigureAutologon) {
+            $script:DecodedPassword = Get-DecodedAutologonPassword
+            Set-AutologonConfiguration
+        }
+        else {
+            Write-Log 'Autologon configuration is disabled for this run; existing Winlogon settings will not be modified.'
+        }
+
+        if ($ConfigureEdgeInPrivate) {
+            Remove-LegacyChromeStartupShortcut
+            Set-EdgeAutoLaunch
+        }
+        else {
+            Write-Log 'Edge InPrivate startup configuration is disabled for this run.'
+        }
 
         $script:AfterState = [pscustomobject]@{
             Autologon = Get-AutologonState
@@ -2964,13 +3109,13 @@ try {
         Write-Log ("Legacy Chrome startup shortcut: PresentBefore={0}; Removed={1}; PresentAfter={2}." -f `
             $script:LegacyShortcutPresentBefore, $script:LegacyShortcutRemoved, $script:LegacyShortcutPresentAfter)
 
-        if (-not $script:AfterState.Autologon.ConfigurationMatches) {
+        if ($ConfigureAutologon -and -not $script:AfterState.Autologon.ConfigurationMatches) {
             $script:VerificationFailures.Add('Final autologon configuration does not match the requested values.')
         }
-        if (-not $script:AfterState.Edge.CommandMatches) {
+        if ($ConfigureEdgeInPrivate -and -not $script:AfterState.Edge.CommandMatches) {
             $script:VerificationFailures.Add('Final Edge Run value does not match the requested command.')
         }
-        if ($script:LegacyShortcutPresentAfter) {
+        if ($ConfigureEdgeInPrivate -and $script:LegacyShortcutPresentAfter) {
             $script:VerificationFailures.Add('Legacy Chrome startup shortcut remains present.')
         }
 
@@ -2985,7 +3130,7 @@ try {
             $script:OverallResult = 'ConfiguredAndVerified'
         }
         $script:FinalStatus = 'Success'
-        Write-Log 'Autologon, legacy Chrome cleanup, and Edge startup settings were verified successfully.' 'OK'
+        Write-Log ("Requested configuration was verified successfully. EdgeInPrivate={0}; Autologon={1}." -f $ConfigureEdgeInPrivate,$ConfigureAutologon) 'OK'
         Write-Log '===== Script completed successfully =====' 'OK'
     }
 }
@@ -3104,16 +3249,16 @@ $ScriptVersion = '2.1.5'
 
 # Fleet enrollment settings copied from the current Install.ps1.
 # NOTE: The enrollment token is sensitive. Restrict read access to this script/share.
-[string]$FleetServerUrl   = 'https://ELASTIC-SERVER:8220'
-[string]$EnrollmentToken  = ''
+[string]$FleetServerUrl = 'https://10.2.12.4:8220'
+[string]$EnrollmentToken = 'X2lseThaOEJ2UFRmNGxFS0k1aEg6dUI2VVFOVGRnWHhmeHI5S05uWDd2dw=='
 
 # Fleet Server is currently using the Quick Start self-signed TLS certificate.
 # Keep this $true until Fleet Server is moved to a certificate trusted by the lab PCs.
 [bool]$UseInsecureFleetTls = $true
 
 # Preferred and fallback ZIP locations.
-[string]$PreferredInstallerPath = "\\SERVER\DeploymentShare\ElasticAgent\elastic-agent-$ElasticAgentVersion-windows-x86_64.zip"
-[string]$FallbackInstallerPath  = "\\FALLBACK-SERVER\DeploymentShare\ElasticAgent\elastic-agent-$ElasticAgentVersion-windows-x86_64.zip"
+[string]$PreferredInstallerPath = "\\filesvr\Labscripts\ElasticAgent\elastic-agent-$ElasticAgentVersion-windows-x86_64.zip"
+[string]$FallbackInstallerPath = "\\10.2.3.30\Labscripts\ElasticAgent\elastic-agent-$ElasticAgentVersion-windows-x86_64.zip"
 
 # Official Elastic download fallback. Used automatically when both internal shares are unavailable.
 [string]$DownloadUri = "https://artifacts.elastic.co/downloads/beats/elastic-agent/elastic-agent-$ElasticAgentVersion-windows-x86_64.zip"
@@ -3913,9 +4058,14 @@ exit $exitCode
         # Plain-text source is intentionally embedded for maintainability.
         Source = @'
 # ScriptName: 17_Set_Browser_Homepage.ps1
-# ScriptVersion: 1.1.0
+# ScriptVersion: 1.3.0
 # LastUpdated: 2026-08-27
-# Changes: v1.1.0 adds machine-wide Chrome onboarding/default-browser suppression
+# Changes: v1.3.0 configures Google Chrome as the Windows default handler for
+#          HTTP, HTTPS, .htm, and .html through a verified machine-wide
+#          default-associations XML policy applied at user sign-in.
+#          v1.2.0 suppresses Chrome's startup profile picker and explicitly
+#          disables the deprecated ForceBrowserSignin policy for compatibility.
+#          v1.1.0 adds machine-wide Chrome onboarding/default-browser suppression
 #          for shared lab computers while retaining browser sign-in disablement.
 #          v1.0.1 updates the internal script identity, log names, and telemetry
 #          dataset after renaming the file from script 19 to script 17.
@@ -3937,7 +4087,7 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
 $script:ScriptName = '17_Set_Browser_Homepage.ps1'
-$script:ScriptVersion = '1.1.0'
+$script:ScriptVersion = '1.3.0'
 $script:ComputerName = $env:COMPUTERNAME
 $script:StartTime = Get-Date
 $script:RunId = [guid]::NewGuid().Guid
@@ -3948,6 +4098,9 @@ $script:ExitCode = 1
 $script:LogPath = Join-Path $LogFolder '17_Set_Browser_Homepage.log'
 $script:LatestTelemetryPath = Join-Path $LogFolder '17_Set_Browser_Homepage.latest.json'
 $script:TelemetryPath = Join-Path $LogFolder 'Maintenance-Telemetry.ndjson'
+$script:DefaultAssociationsPath = Join-Path $env:ProgramData 'Compton\Browser\DefaultAppAssociations.xml'
+$script:DefaultBrowserConfigured = $false
+$script:DefaultBrowserProgIds = $null
 
 function Write-Log {
     [CmdletBinding()]
@@ -3968,7 +4121,7 @@ function Write-Log {
         'ERROR'   { 'Red' }
         default   { 'Cyan' }
     })
-    Add-Content -LiteralPath $script:LogPath -Value $line -Encoding UTF8
+    Add-SharedTextLine -Path $script:LogPath -Line $line
 }
 
 function Assert-Administrator {
@@ -4050,6 +4203,135 @@ function Remove-UnwantedPolicyValues {
     }
 }
 
+function Get-OptionalRegistryValue {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)][string]$Name
+    )
+
+    try {
+        return Get-ItemPropertyValue -LiteralPath $Path -Name $Name -ErrorAction Stop
+    }
+    catch {
+        return $null
+    }
+}
+
+function Get-ChromeDefaultAssociationRegistration {
+    [CmdletBinding()]
+    param()
+
+    $clientRoots = @(
+        'HKLM:\SOFTWARE\Clients\StartMenuInternet',
+        'HKLM:\SOFTWARE\WOW6432Node\Clients\StartMenuInternet'
+    )
+
+    foreach ($clientRoot in $clientRoots) {
+        if (-not (Test-Path -LiteralPath $clientRoot)) { continue }
+
+        foreach ($client in @(Get-ChildItem -LiteralPath $clientRoot -ErrorAction SilentlyContinue)) {
+            $capabilitiesPath = Join-Path $client.PSPath 'Capabilities'
+            if (-not (Test-Path -LiteralPath $capabilitiesPath)) { continue }
+
+            $applicationName = [string](Get-OptionalRegistryValue -Path $capabilitiesPath -Name 'ApplicationName')
+            if ($client.PSChildName -notmatch '(?i)chrome' -and $applicationName -notmatch '(?i)google chrome') {
+                continue
+            }
+
+            $urlPath = Join-Path $capabilitiesPath 'URLAssociations'
+            $filePath = Join-Path $capabilitiesPath 'FileAssociations'
+            $httpProgId = [string](Get-OptionalRegistryValue -Path $urlPath -Name 'http')
+            $httpsProgId = [string](Get-OptionalRegistryValue -Path $urlPath -Name 'https')
+            $htmProgId = [string](Get-OptionalRegistryValue -Path $filePath -Name '.htm')
+            $htmlProgId = [string](Get-OptionalRegistryValue -Path $filePath -Name '.html')
+
+            $missingProgIds = @(
+                @($httpProgId,$httpsProgId,$htmProgId,$htmlProgId) |
+                    Where-Object { [string]::IsNullOrWhiteSpace($_) }
+            )
+            if ($missingProgIds.Count -gt 0) {
+                continue
+            }
+
+            return [pscustomobject][ordered]@{
+                ApplicationName = if ([string]::IsNullOrWhiteSpace($applicationName)) { 'Google Chrome' } else { $applicationName }
+                HttpProgId      = $httpProgId
+                HttpsProgId     = $httpsProgId
+                HtmProgId       = $htmProgId
+                HtmlProgId      = $htmlProgId
+                RegistryPath    = $capabilitiesPath
+            }
+        }
+    }
+
+    return $null
+}
+
+function Set-ChromeDefaultBrowserPolicy {
+    [CmdletBinding()]
+    param()
+
+    $registration = Get-ChromeDefaultAssociationRegistration
+    if ($null -eq $registration) {
+        throw 'Google Chrome is not installed with complete HTTP, HTTPS, .htm, and .html application registrations; Windows default-browser policy cannot be configured safely.'
+    }
+
+    $xmlDirectory = Split-Path -Parent $script:DefaultAssociationsPath
+    if (-not (Test-Path -LiteralPath $xmlDirectory -PathType Container)) {
+        New-Item -Path $xmlDirectory -ItemType Directory -Force | Out-Null
+    }
+
+    $applicationName = [Security.SecurityElement]::Escape([string]$registration.ApplicationName)
+    $httpProgId = [Security.SecurityElement]::Escape([string]$registration.HttpProgId)
+    $httpsProgId = [Security.SecurityElement]::Escape([string]$registration.HttpsProgId)
+    $htmProgId = [Security.SecurityElement]::Escape([string]$registration.HtmProgId)
+    $htmlProgId = [Security.SecurityElement]::Escape([string]$registration.HtmlProgId)
+    $xml = @"
+<?xml version="1.0" encoding="UTF-8"?>
+<DefaultAssociations Version="1">
+  <Association Identifier=".htm" ProgId="$htmProgId" ApplicationName="$applicationName" Suggested="false" />
+  <Association Identifier=".html" ProgId="$htmlProgId" ApplicationName="$applicationName" Suggested="false" />
+  <Association Identifier="http" ProgId="$httpProgId" ApplicationName="$applicationName" Suggested="false" />
+  <Association Identifier="https" ProgId="$httpsProgId" ApplicationName="$applicationName" Suggested="false" />
+</DefaultAssociations>
+"@
+
+    $existingXml = if (Test-Path -LiteralPath $script:DefaultAssociationsPath -PathType Leaf) {
+        [IO.File]::ReadAllText($script:DefaultAssociationsPath)
+    }
+    else { $null }
+
+    if ($existingXml -cne $xml) {
+        [IO.File]::WriteAllText($script:DefaultAssociationsPath, $xml, (New-Object Text.UTF8Encoding($false)))
+        $script:ChangedCount++
+        Write-Log ("Windows: Wrote Chrome default-browser associations to {0}." -f $script:DefaultAssociationsPath) 'INFO'
+    }
+    else {
+        Write-Log 'Windows: Chrome default-browser associations XML is already current.' 'INFO'
+    }
+
+    [xml]$verifiedXml = Get-Content -LiteralPath $script:DefaultAssociationsPath -Raw -ErrorAction Stop
+    $verifiedAssociations = @($verifiedXml.DefaultAssociations.Association)
+    foreach ($identifier in @('.htm','.html','http','https')) {
+        if (@($verifiedAssociations | Where-Object { [string]$_.Identifier -eq $identifier }).Count -ne 1) {
+            throw "Default-browser association verification failed for '$identifier'."
+        }
+    }
+
+    $windowsPolicyPath = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\System'
+    Set-PolicyValue -Browser 'Windows' -Path $windowsPolicyPath -Name 'DefaultAssociationsConfiguration' -Value $script:DefaultAssociationsPath -Type String
+
+    $script:DefaultBrowserConfigured = $true
+    $script:DefaultBrowserProgIds = [pscustomobject][ordered]@{
+        Http  = [string]$registration.HttpProgId
+        Https = [string]$registration.HttpsProgId
+        Htm   = [string]$registration.HtmProgId
+        Html  = [string]$registration.HtmlProgId
+    }
+    Write-Log 'Windows: Verified Google Chrome default-browser policy. It will be applied for users at sign-in.' 'SUCCESS'
+}
+
 function Add-SharedTextLine {
     [CmdletBinding()]
     param(
@@ -4105,9 +4387,15 @@ function Write-Telemetry {
         ChromeSignin                 = 'disabled'
         ChromeSync                   = 'disabled'
         ChromeSigninInterception     = 'disabled'
+        ChromeProfilePicker          = 'disabled'
         ChromePromotionalTabs        = 'disabled'
         ChromeDefaultBrowserPrompt   = 'disabled'
         ChromePolicyScope            = 'HKLM-AllUsers'
+        DefaultBrowser               = 'Google Chrome'
+        DefaultBrowserConfigured     = $script:DefaultBrowserConfigured
+        DefaultAssociationsPath      = $script:DefaultAssociationsPath
+        DefaultBrowserProgIds        = $script:DefaultBrowserProgIds
+        DefaultBrowserApplyTiming    = 'UserSignIn'
         LogPath                      = $script:LogPath
     }
 
@@ -4139,14 +4427,20 @@ try {
     # Disable Chrome browser/profile sign-in and sync prompts. This does not
     # block users from signing in to websites in Chrome.
     Set-PolicyValue -Browser 'Chrome' -Path $chromePath -Name 'BrowserSignin' -Value 0 -Type DWord
+    Set-PolicyValue -Browser 'Chrome' -Path $chromePath -Name 'ForceBrowserSignin' -Value 0 -Type DWord
     Set-PolicyValue -Browser 'Chrome' -Path $chromePath -Name 'SyncDisabled' -Value 1 -Type DWord
     Set-PolicyValue -Browser 'Chrome' -Path $chromePath -Name 'SigninInterceptionEnabled' -Value 0 -Type DWord
+    Set-PolicyValue -Browser 'Chrome' -Path $chromePath -Name 'ProfilePickerOnStartupAvailability' -Value 1 -Type DWord
 
     # Suppress Chrome's full-tab onboarding/promotional content (including the
     # sign-in / "stay signed out" first-run experience) and stop Chrome from
     # asking users to make it the Windows default browser.
     Set-PolicyValue -Browser 'Chrome' -Path $chromePath -Name 'PromotionalTabsEnabled' -Value 0 -Type DWord
     Set-PolicyValue -Browser 'Chrome' -Path $chromePath -Name 'DefaultBrowserSettingEnabled' -Value 0 -Type DWord
+
+    # Use the supported Windows default-associations policy rather than writing
+    # protected per-user UserChoice hashes. This applies Chrome at user sign-in.
+    Set-ChromeDefaultBrowserPolicy
 
     # Microsoft Edge machine policies.
     $edgePath = 'HKLM:\SOFTWARE\Policies\Microsoft\Edge'
@@ -4595,6 +4889,39 @@ function Ensure-Directory {
     }
 }
 
+function Add-SharedTextLine {
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)][string]$Line,
+        [int]$MaximumAttempts = 10
+    )
+
+    for ($attempt = 1; $attempt -le $MaximumAttempts; $attempt++) {
+        $stream = $null
+        $writer = $null
+        try {
+            $stream = [System.IO.File]::Open(
+                $Path,
+                [System.IO.FileMode]::Append,
+                [System.IO.FileAccess]::Write,
+                [System.IO.FileShare]::ReadWrite
+            )
+            $writer = [System.IO.StreamWriter]::new($stream, [System.Text.UTF8Encoding]::new($false))
+            $writer.WriteLine($Line)
+            $writer.Flush()
+            return
+        }
+        catch [System.IO.IOException] {
+            if ($attempt -ge $MaximumAttempts) { throw }
+            Start-Sleep -Milliseconds (150 * $attempt)
+        }
+        finally {
+            if ($null -ne $writer) { $writer.Dispose() }
+            elseif ($null -ne $stream) { $stream.Dispose() }
+        }
+    }
+}
+
 function Write-Log {
     param(
         [Parameter(Mandatory)][string]$Message,
@@ -4610,7 +4937,7 @@ function Write-Log {
 
     try {
         Ensure-Directory -Path $LogDirectory
-        Add-Content -LiteralPath $LogPath -Value $line -Encoding UTF8
+        Add-SharedTextLine -Path $LogPath -Line $line
     }
     catch {}
 
@@ -4709,7 +5036,7 @@ function Write-ExecutionRecord {
     try {
         Ensure-Directory -Path $LogDirectory
         $record | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $LatestPath -Encoding UTF8 -Force
-        $record | ConvertTo-Json -Depth 6 -Compress | Add-Content -LiteralPath $TelemetryPath -Encoding UTF8
+        Add-SharedTextLine -Path $TelemetryPath -Line ($record | ConvertTo-Json -Depth 6 -Compress)
     }
     catch {
         Write-Log -Level 'WARN' -Message "Unable to write JSON telemetry: $($_.Exception.Message)"
@@ -4829,13 +5156,88 @@ function Write-RunnerLog {
 
     $computer = if ($env:COMPUTERNAME) { $env:COMPUTERNAME } else { 'UNKNOWN' }
     $line = '{0} [{1}] [{2}] {3}' -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $computer, $Level, $Message
-    Add-Content -LiteralPath $RunnerLogPath -Value $line -Encoding UTF8
+    $logWritten = $false
+    $lastLogException = $null
+    for ($attempt = 1; $attempt -le 10 -and -not $logWritten; $attempt++) {
+        $stream = $null
+        $writer = $null
+        try {
+            $stream = [System.IO.FileStream]::new(
+                $RunnerLogPath,
+                [System.IO.FileMode]::Append,
+                [System.IO.FileAccess]::Write,
+                [System.IO.FileShare]::ReadWrite
+            )
+            $writer = [System.IO.StreamWriter]::new(
+                $stream,
+                [System.Text.UTF8Encoding]::new($false)
+            )
+            $writer.WriteLine($line)
+            $writer.Flush()
+            $logWritten = $true
+        }
+        catch [System.IO.IOException] {
+            $lastLogException = $_.Exception
+            if ($attempt -lt 10) { Start-Sleep -Milliseconds 150 }
+        }
+        catch {
+            $lastLogException = $_.Exception
+            break
+        }
+        finally {
+            if ($null -ne $writer) { $writer.Dispose() }
+            elseif ($null -ne $stream) { $stream.Dispose() }
+        }
+    }
+
+    if (-not $logWritten) {
+        $fallbackLogPath = Join-Path $LogDirectory (
+            '{0}-04_Sunday_Lab_Application_Maintenance-{1}.log' -f $computer, $RunnerRunId
+        )
+        try {
+            [System.IO.File]::AppendAllText(
+                $fallbackLogPath,
+                $line + [Environment]::NewLine,
+                [System.Text.UTF8Encoding]::new($false)
+            )
+            Write-Warning "Primary runner log was locked; wrote this entry to $fallbackLogPath"
+        }
+        catch {
+            Write-Warning "Unable to write runner log entry. Primary error: $($lastLogException.Message); fallback error: $($_.Exception.Message)"
+        }
+    }
     Write-Host $line -ForegroundColor $(switch ($Level) {
         'SUCCESS' { 'Green' }
         'WARNING' { 'Yellow' }
         'ERROR'   { 'Red' }
         default   { 'Cyan' }
     })
+}
+
+function Write-RunnerSection {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$Title,
+        [Parameter(Mandatory)][string]$SectionId,
+        [Parameter(Mandatory)][int]$SectionNumber,
+        [Parameter(Mandatory)][int]$SectionCount,
+        [Parameter(Mandatory)][bool]$Enabled
+    )
+
+    $border = '=' * 72
+    $state = if ($Enabled) { 'ENABLED' } else { 'DISABLED - SKIPPED' }
+    $heading = 'SECTION {0:D2} OF {1:D2} - {2} [{3}]' -f `
+        $SectionNumber, $SectionCount, $Title, $state
+
+    Write-Host ''
+    Write-Host $border -ForegroundColor Magenta
+    Write-Host ("  {0}" -f $heading) -ForegroundColor Magenta
+    Write-Host $border -ForegroundColor Magenta
+
+    Write-RunnerLog `
+        -Message ("Section boundary: Id={0}; Number={1}/{2}; Name={3}; State={4}" -f `
+            $SectionId, $SectionNumber, $SectionCount, $Title, $state) `
+        -Level 'INFO'
 }
 
 function Test-RunnerAdministrator {
@@ -4979,9 +5381,26 @@ function Write-EmbeddedSectionSource {
         throw "Embedded plain-text source is missing for $($Payload.FileName)."
     }
 
+    $sourceText = [string]$Payload.Source
+    while ($sourceText.Length -gt 0 -and
+           ([int][char]$sourceText[0] -in @(0xFEFF, 0x200B, 0x2060))) {
+        $sourceText = $sourceText.Substring(1)
+    }
+
+    # Windows PowerShell requires an advanced script's attribute/param block to
+    # be the first parsed statement. Strip the System Restore help preamble so
+    # no hidden Unicode marker can be interpreted as an earlier expression.
+    if ([string]$Payload.FileName -eq 'Embedded_SystemRestore.ps1') {
+        $parameterBlockStart = $sourceText.IndexOf('[CmdletBinding()]', [System.StringComparison]::Ordinal)
+        if ($parameterBlockStart -lt 0) {
+            throw 'The embedded System Restore payload does not contain its CmdletBinding parameter block.'
+        }
+        $sourceText = $sourceText.Substring($parameterBlockStart)
+    }
+
     [System.IO.File]::WriteAllText(
         $Destination,
-        [string]$Payload.Source,
+        $sourceText,
         [System.Text.UTF8Encoding]::new($true)
     )
 }
@@ -4991,11 +5410,14 @@ function New-SectionBootstrap {
     param([Parameter(Mandatory)][string]$SectionId)
 
     switch ($SectionId) {
-        'AutologonAndEdge' {
+        'EdgeInPrivate' {
             return @'
 $settings = $env:COMPTON_SECTION_SETTINGS | ConvertFrom-Json
 [string[]]$patterns = @($settings.Patterns | ForEach-Object { [string]$_ })
-& $env:COMPTON_SECTION_SCRIPT -ComputerNamePatterns $patterns
+& $env:COMPTON_SECTION_SCRIPT `
+    -ComputerNamePatterns $patterns `
+    -ConfigureEdgeInPrivate ([bool]$settings.ConfigureEdgeInPrivate) `
+    -ConfigureAutologon ([bool]$settings.ConfigureAutologon)
 '@
         }
         'ElasticAgent' {
@@ -5112,6 +5534,72 @@ function Get-SafeObjectPropertyValue {
     }
 
     return $property.Value
+}
+
+function Get-DeepFreezeInstallationState {
+    [CmdletBinding()]
+    param()
+
+    [string[]]$evidence = @()
+
+    try {
+        $services = @(Get-CimInstance -ClassName Win32_Service -ErrorAction Stop | Where-Object {
+            $serviceText = @(
+                [string](Get-SafeObjectPropertyValue -InputObject $_ -Name 'Name')
+                [string](Get-SafeObjectPropertyValue -InputObject $_ -Name 'DisplayName')
+                [string](Get-SafeObjectPropertyValue -InputObject $_ -Name 'PathName')
+            ) -join ' '
+            $serviceText -match '(?i)\bDFServ\b|Deep\s*Freeze|Faronics.*Deep'
+        })
+        foreach ($service in $services) {
+            $evidence += 'Service:{0}' -f [string](Get-SafeObjectPropertyValue -InputObject $service -Name 'Name')
+        }
+    }
+    catch {
+        Write-RunnerLog -Message "Unable to inspect services for Deep Freeze: $($_.Exception.Message)" -Level 'WARNING'
+    }
+
+    $deepFreezePaths = @(
+        'C:\Program Files (x86)\Faronics\Deep Freeze',
+        'C:\Program Files\Faronics\Deep Freeze',
+        'C:\Program Files (x86)\Faronics\Deep Freeze\Install C-0\DFServ.exe',
+        'C:\Program Files\Faronics\Deep Freeze\Install C-0\DFServ.exe'
+    )
+    foreach ($path in $deepFreezePaths) {
+        if (Test-Path -LiteralPath $path -ErrorAction SilentlyContinue) {
+            $evidence += "Path:$path"
+        }
+    }
+
+    $uninstallRoots = @(
+        'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*',
+        'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*'
+    )
+    try {
+        $deepFreezeProducts = @(Get-ItemProperty -Path $uninstallRoots -ErrorAction SilentlyContinue | Where-Object {
+            $displayName = [string](Get-SafeObjectPropertyValue -InputObject $_ -Name 'DisplayName')
+            $publisher = [string](Get-SafeObjectPropertyValue -InputObject $_ -Name 'Publisher')
+            $displayName -match '(?i)Deep\s*Freeze' -or
+            ($publisher -match '(?i)Faronics' -and $displayName -match '(?i)Freeze')
+        })
+        foreach ($product in $deepFreezeProducts) {
+            $evidence += 'Product:{0}' -f [string](Get-SafeObjectPropertyValue -InputObject $product -Name 'DisplayName')
+        }
+    }
+    catch {
+        Write-RunnerLog -Message "Unable to inspect uninstall records for Deep Freeze: $($_.Exception.Message)" -Level 'WARNING'
+    }
+
+    $evidence = @(
+        $evidence |
+            Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) } |
+            Sort-Object -Unique
+    )
+
+    return [pscustomobject][ordered]@{
+        Installed = ($evidence.Count -gt 0)
+        Evidence  = @($evidence)
+    }
 }
 
 function Get-OfficeInstallationInventory {
@@ -5326,7 +5814,7 @@ function Test-OfficeConfigurationSupportsMsiRemoval {
     return ($null -ne $configuration.SelectSingleNode('/Configuration/RemoveMSI'))
 }
 
-function New-OlderOfficeRemovalConfiguration {
+function New-OfficeProductRemovalConfiguration {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory)][string[]]$ProductIds,
@@ -5334,7 +5822,7 @@ function New-OlderOfficeRemovalConfiguration {
     )
 
     if ($ProductIds.Count -eq 0) {
-        throw 'No older Click-to-Run Office product IDs were supplied for removal.'
+        throw 'No Click-to-Run Office product IDs were supplied for removal.'
     }
 
     $productLines = @(
@@ -5526,6 +6014,13 @@ function Invoke-Office2024MaintenanceSection {
     $activated = $false
     $office2024Installed = $false
     $microsoft365Detected = $false
+    $microsoft365Products = @()
+    $microsoft365MigrationAttempted = $false
+    $microsoft365MigrationSucceeded = $false
+    $deepFreezeInstalled = $false
+    $deepFreezeEvidence = @()
+    $deepFreezeGateApplied = $false
+    $deepFreezeCheckPerformed = $false
     $rebootRequired = $false
     $remediationFailure = $false
     $failureStage = $null
@@ -5541,9 +6036,29 @@ function Invoke-Office2024MaintenanceSection {
         $failureStage = 'DetectOffice'
         $inventory = Get-OfficeInstallationInventory
         $microsoft365Detected = [bool]$inventory.Microsoft365Detected
+        $combinedMicrosoft365Products = @($inventory.Microsoft365ProductIds) +
+            @($inventory.Microsoft365DisplayNames)
+        $microsoft365Products = @(
+            $combinedMicrosoft365Products |
+                Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) } |
+                Sort-Object -Unique
+        )
         $office2024Installed = [bool]$inventory.Office2024Detected
         $olderOfficeDetectedThisRun = [bool]$inventory.OlderOfficeDetected
         $olderOfficeDetected = [bool]$history.MigratedFromOlderOffice -or $olderOfficeDetectedThisRun
+
+        if ($microsoft365Detected) {
+            $deepFreezeCheckPerformed = $true
+            $deepFreezeState = Get-DeepFreezeInstallationState
+            $deepFreezeInstalled = [bool]$deepFreezeState.Installed
+            $deepFreezeEvidence = @($deepFreezeState.Evidence)
+            if ($deepFreezeInstalled) {
+                Write-RunnerLog -Message "Deep Freeze installation detected. Evidence: $($deepFreezeEvidence -join '; ')" -Level 'SUCCESS'
+            }
+            else {
+                Write-RunnerLog -Message 'Deep Freeze is not installed. Microsoft 365 replacement is not authorized on this system.' -Level 'WARNING'
+            }
+        }
 
         $combinedOlderOfficeProducts = @($inventory.OlderClickToRunProductIds) +
             @($inventory.OlderOfficeDisplayNames) +
@@ -5554,20 +6069,25 @@ function Invoke-Office2024MaintenanceSection {
                 Sort-Object -Unique
         )
 
-        if ($microsoft365Detected) {
+        if ($microsoft365Detected -and -not $deepFreezeInstalled) {
             $skippedMicrosoft365 = $true
-            $outcome = 'Microsoft365Skipped'
-            Write-RunnerLog -Message 'Microsoft 365 Apps was detected. Office LTSC replacement and volume activation were skipped.' -Level 'SUCCESS'
+            $deepFreezeGateApplied = $true
+            $outcome = 'Microsoft365SkippedNoDeepFreeze'
+            Write-RunnerLog -Message 'Microsoft 365 was detected, but Deep Freeze is not installed. Microsoft 365 was left installed and Office 2024 replacement was skipped.' -Level 'SUCCESS'
         }
-        elseif ($olderOfficeDetectedThisRun) {
+        elseif ($microsoft365Detected -or $olderOfficeDetectedThisRun) {
             $migrationAttempted = $true
-            $history.MigratedFromOlderOffice = $true
-            if ([string]::IsNullOrWhiteSpace([string]$history.FirstDetectedOlderUtc)) {
-                $history.FirstDetectedOlderUtc = (Get-Date).ToUniversalTime().ToString('o')
+            $microsoft365MigrationAttempted = $microsoft365Detected
+
+            if ($olderOfficeDetectedThisRun) {
+                $history.MigratedFromOlderOffice = $true
+                if ([string]::IsNullOrWhiteSpace([string]$history.FirstDetectedOlderUtc)) {
+                    $history.FirstDetectedOlderUtc = (Get-Date).ToUniversalTime().ToString('o')
+                }
+                $history.LastMigrationAttemptUtc = (Get-Date).ToUniversalTime().ToString('o')
+                $history.OriginalOlderProducts = @($olderOfficeProducts)
+                Save-OfficeMigrationHistory -History $history
             }
-            $history.LastMigrationAttemptUtc = (Get-Date).ToUniversalTime().ToString('o')
-            $history.OriginalOlderProducts = @($olderOfficeProducts)
-            Save-OfficeMigrationHistory -History $history
 
             $failureStage = 'StageOffice2024Installer'
             Write-RunnerLog -Message "Staging Office 2024 installation files from $Office2024SourcePath to $localStagePath"
@@ -5584,19 +6104,34 @@ function Invoke-Office2024MaintenanceSection {
                 Write-RunnerLog -Message "Older MSI-based Office was detected. It will be removed by the <RemoveMSI /> element during the Office 2024 installation." -Level 'WARNING'
             }
 
-            if (@($inventory.OlderClickToRunProductIds).Count -gt 0) {
-                $failureStage = 'UninstallOlderOffice'
-                $removalConfigurationPath = Join-Path $localStagePath 'remove-older-office.xml'
-                New-OlderOfficeRemovalConfiguration `
-                    -ProductIds @($inventory.OlderClickToRunProductIds) `
+            $combinedClickToRunProducts = @($inventory.Microsoft365ProductIds) +
+                @($inventory.OlderClickToRunProductIds)
+            $clickToRunProductsToRemove = @(
+                $combinedClickToRunProducts |
+                    Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) } |
+                    Sort-Object -Unique
+            )
+
+            if ($microsoft365Detected -and @($inventory.Microsoft365ProductIds).Count -eq 0) {
+                throw 'Microsoft 365 was detected by its installed display name, but no Microsoft 365 Click-to-Run ProductReleaseId was available for safe targeted removal.'
+            }
+
+            if ($clickToRunProductsToRemove.Count -gt 0) {
+                $failureStage = 'UninstallExistingOffice'
+                $removalConfigurationPath = Join-Path $localStagePath 'remove-existing-office.xml'
+                New-OfficeProductRemovalConfiguration `
+                    -ProductIds $clickToRunProductsToRemove `
                     -Path $removalConfigurationPath
-                Write-RunnerLog -Message "Removing older Office Click-to-Run product IDs: $(@($inventory.OlderClickToRunProductIds) -join ', ')" -Level 'WARNING'
+                Write-RunnerLog -Message "Removing existing Office Click-to-Run product IDs before Office 2024 installation: $($clickToRunProductsToRemove -join ', ')" -Level 'WARNING'
                 $removeExitCode = Invoke-OfficeDeploymentTool `
                     -SetupPath $stagedInstaller.SetupPath `
                     -ConfigurationPath $removalConfigurationPath
                 if ($removeExitCode -eq 3010) { $rebootRequired = $true }
 
                 $afterRemoval = Get-OfficeInstallationInventory
+                if ($afterRemoval.Microsoft365Detected) {
+                    throw "Microsoft 365 remained detected after the removal command: $(@($afterRemoval.Microsoft365DisplayNames + $afterRemoval.Microsoft365ProductIds) -join ', ')"
+                }
                 if (@($afterRemoval.OlderClickToRunProductIds).Count -gt 0) {
                     throw "Older Office Click-to-Run products remained after the removal command: $(@($afterRemoval.OlderClickToRunProductIds) -join ', ')"
                 }
@@ -5617,6 +6152,9 @@ function Invoke-Office2024MaintenanceSection {
             if ($afterInstallation.OlderOfficeDetected) {
                 throw "Office 2024 was installed, but an older Office suite remained detected: $(@($afterInstallation.OlderOfficeDisplayNames + $afterInstallation.OlderClickToRunProductIds) -join ', ')"
             }
+            if ($afterInstallation.Microsoft365Detected) {
+                throw "Office 2024 was installed, but Microsoft 365 remained detected: $(@($afterInstallation.Microsoft365DisplayNames + $afterInstallation.Microsoft365ProductIds) -join ', ')"
+            }
             $uninstallSucceeded = $true
             $installationSucceeded = $true
             $office2024Installed = $true
@@ -5626,12 +6164,23 @@ function Invoke-Office2024MaintenanceSection {
             $activationAttempted = [bool]$activation.ActivationAttempted
             $activated = [bool]$activation.Activated
             $migrationSucceeded = $true
-            $outcome = 'OlderOfficeMigrated'
-            $history.LastMigrationSucceededUtc = (Get-Date).ToUniversalTime().ToString('o')
-            $history.LastFailureStage = $null
-            $history.LastFailureMessage = $null
-            Save-OfficeMigrationHistory -History $history
-            Write-RunnerLog -Message 'Older Office was removed, Office 2024 was installed, and machine-wide activation was verified.' -Level 'SUCCESS'
+            $microsoft365MigrationSucceeded = $microsoft365Detected
+            if ($microsoft365Detected -and $olderOfficeDetectedThisRun) {
+                $outcome = 'Microsoft365AndOlderOfficeMigrated'
+            }
+            elseif ($microsoft365Detected) {
+                $outcome = 'Microsoft365Migrated'
+            }
+            else {
+                $outcome = 'OlderOfficeMigrated'
+            }
+            if ($olderOfficeDetectedThisRun) {
+                $history.LastMigrationSucceededUtc = (Get-Date).ToUniversalTime().ToString('o')
+                $history.LastFailureStage = $null
+                $history.LastFailureMessage = $null
+                Save-OfficeMigrationHistory -History $history
+            }
+            Write-RunnerLog -Message 'Existing Microsoft 365/older Office products were removed, Office 2024 was installed, and machine-wide activation was verified.' -Level 'SUCCESS'
         }
         elseif (-not $office2024Installed) {
             $skippedNotInstalled = $true
@@ -5654,7 +6203,7 @@ function Invoke-Office2024MaintenanceSection {
         $failureMessage = [string]$_.Exception.Message
         $outcome = switch ($failureStage) {
             'ValidateOffice2024Configuration' { 'Office2024ConfigurationInvalid' }
-            'UninstallOlderOffice' { 'OlderOfficeUninstallFailed' }
+            'UninstallExistingOffice' { 'ExistingOfficeUninstallFailed' }
             'InstallOffice2024'    { 'Office2024InstallationFailed' }
             'ActivateOffice2024'   { 'Office2024ActivationFailed' }
             default                { 'Office2024MaintenanceFailed' }
@@ -5694,7 +6243,7 @@ function Invoke-Office2024MaintenanceSection {
     $officeEvent = [ordered]@{
         '@timestamp'    = $eventTime.ToUniversalTime().ToString('o')
         EventType       = 'maintenance.office2024_compliance'
-        SchemaVersion   = '1.0'
+        SchemaVersion   = '1.2'
         ComputerName    = [string]$env:COMPUTERNAME
         ScriptName      = $RunnerScriptName
         ScriptVersion   = $RunnerVersion
@@ -5709,7 +6258,14 @@ function Invoke-Office2024MaintenanceSection {
         FailureMessage  = $failureMessage
         Office = [ordered]@{
             Microsoft365Detected       = $microsoft365Detected
+            Microsoft365Products       = @($microsoft365Products)
             Microsoft365Skipped        = $skippedMicrosoft365
+            Microsoft365MigrationAttempted = $microsoft365MigrationAttempted
+            Microsoft365MigrationSucceeded = $microsoft365MigrationSucceeded
+            DeepFreezeInstalled         = $deepFreezeInstalled
+            DeepFreezeCheckPerformed    = $deepFreezeCheckPerformed
+            DeepFreezeEvidence          = @($deepFreezeEvidence)
+            DeepFreezeGateApplied       = $deepFreezeGateApplied
             Office2024Installed        = $office2024Installed
             OlderOfficeDetectedThisRun = $olderOfficeDetectedThisRun
             MigratedFromOlderOffice    = $olderOfficeDetected
@@ -5761,6 +6317,11 @@ function Invoke-Office2024MaintenanceSection {
         DurationSeconds     = $duration
         SkippedNotInstalled = $skippedNotInstalled
         SkippedMicrosoft365 = $skippedMicrosoft365
+        Microsoft365MigrationAttempted = $microsoft365MigrationAttempted
+        Microsoft365MigrationSucceeded = $microsoft365MigrationSucceeded
+        DeepFreezeInstalled = $deepFreezeInstalled
+        DeepFreezeCheckPerformed = $deepFreezeCheckPerformed
+        DeepFreezeGateApplied = $deepFreezeGateApplied
         Office2024Installed = $office2024Installed
         OlderOfficeDetected = $olderOfficeDetected
         MigrationAttempted  = $migrationAttempted
@@ -5775,63 +6336,122 @@ function Invoke-Office2024MaintenanceSection {
     }
 }
 
-function Resolve-PrinterSectionExitCode {
+function Get-RunnerPropertyValueSafe {
     [CmdletBinding()]
     param(
-        [Parameter(Mandatory)][int]$ProcessExitCode,
-        [Parameter(Mandatory)][string]$LogDirectory
+        [AllowNull()]$InputObject,
+        [Parameter(Mandatory)][string]$Name
     )
 
-    # Script 11 intentionally returns Windows Installer code 3010 when the
-    # printer/PaperCut configuration is compliant but a reboot is pending.
-    # In some Windows PowerShell 5.1 child-process launches that code can be
-    # surfaced to the parent as a generic nonzero value.  The child also
-    # writes an authoritative latest.json result, so use that telemetry to
-    # preserve SuccessRebootRequired instead of incorrectly marking failure.
-    $latestJson = Join-Path $LogDirectory '11_Install_SharpDriver_And_PaperCut.latest.json'
+    if ($null -eq $InputObject) { return $null }
+    $property = $InputObject.PSObject.Properties[$Name]
+    if ($null -eq $property) { return $null }
+    return $property.Value
+}
+
+function Get-ChildSectionTelemetryOutcome {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][ValidateSet('SystemRestore','PrinterAndPaperCut','ElasticAgent')][string]$SectionId,
+        [Parameter(Mandatory)][string]$LogDirectory,
+        [Parameter(Mandatory)][datetime]$NotBefore
+    )
+
+    $fileName = switch ($SectionId) {
+        'SystemRestore'      { '12_Enable-SystemRestore-And-Create-RestorePoint.latest.json' }
+        'PrinterAndPaperCut' { '11_Install_SharpDriver_And_PaperCut.latest.json' }
+        'ElasticAgent'       { '15_Install_Elastic_Agent.latest.json' }
+    }
+    $latestJson = Join-Path $LogDirectory $fileName
 
     if (-not (Test-Path -LiteralPath $latestJson -PathType Leaf)) {
-        return $ProcessExitCode
+        return $null
     }
 
     try {
+        $latestItem = Get-Item -LiteralPath $latestJson -ErrorAction Stop
+        if ($latestItem.LastWriteTimeUtc -lt $NotBefore.ToUniversalTime().AddSeconds(-2)) {
+            Write-RunnerLog -Message "Ignored stale child telemetry for $SectionId`: $latestJson" -Level 'WARNING'
+            return $null
+        }
+
         $result = Get-Content -LiteralPath $latestJson -Raw -ErrorAction Stop |
             ConvertFrom-Json -ErrorAction Stop
 
-        $status = [string]$result.Status
-        $reportedExitCode = 0
-        $hasReportedExitCode = $false
-
-        if ($null -ne $result.PSObject.Properties['ExitCode']) {
-            $reportedExitCode = [int]$result.ExitCode
-            $hasReportedExitCode = $true
+        if ($SectionId -eq 'PrinterAndPaperCut') {
+            $maintenance = Get-RunnerPropertyValueSafe -InputObject $result -Name 'maintenance'
+            $execution = Get-RunnerPropertyValueSafe -InputObject $maintenance -Name 'execution'
+            $printerDeployment = Get-RunnerPropertyValueSafe -InputObject $maintenance -Name 'printerDeployment'
+            $reboot = Get-RunnerPropertyValueSafe -InputObject $printerDeployment -Name 'Reboot'
+            $computerName = [string](Get-RunnerPropertyValueSafe -InputObject $execution -Name 'ComputerName')
+            $status = [string](Get-RunnerPropertyValueSafe -InputObject $execution -Name 'Status')
+            $reportedExitCodeValue = Get-RunnerPropertyValueSafe -InputObject $execution -Name 'ExitCode'
+            $failureMessage = [string](Get-RunnerPropertyValueSafe -InputObject $execution -Name 'FailureMessage')
+            $rebootRequired = [bool](Get-RunnerPropertyValueSafe -InputObject $reboot -Name 'Required')
+        }
+        else {
+            $computerName = [string](Get-RunnerPropertyValueSafe -InputObject $result -Name 'ComputerName')
+            $status = [string](Get-RunnerPropertyValueSafe -InputObject $result -Name 'Status')
+            $reportedExitCodeValue = Get-RunnerPropertyValueSafe -InputObject $result -Name 'ExitCode'
+            $failureMessage = [string](Get-RunnerPropertyValueSafe -InputObject $result -Name 'FailureMessage')
+            $rebootRequired = $false
         }
 
-        $rebootRequired = $false
-        if ($null -ne $result.PSObject.Properties['RebootRequired']) {
-            $rebootRequired = [bool]$result.RebootRequired
+        if (-not [string]::IsNullOrWhiteSpace($computerName) -and $computerName -ine $env:COMPUTERNAME) {
+            Write-RunnerLog -Message "Ignored child telemetry for a different computer. Section=$SectionId; ReportedComputer=$computerName" -Level 'WARNING'
+            return $null
         }
 
-        if (
-            $status -eq 'SuccessRebootRequired' -or
-            ($hasReportedExitCode -and $reportedExitCode -eq 3010) -or
-            ($status -match '^Success' -and $rebootRequired)
-        ) {
-            return 3010
+        $hasReportedExitCode = ($null -ne $reportedExitCodeValue)
+        $reportedExitCode = if ($hasReportedExitCode) { [int]$reportedExitCodeValue } else { $null }
+        if ([string]::IsNullOrWhiteSpace($status) -and -not $hasReportedExitCode) {
+            throw 'Child telemetry contains neither Status nor ExitCode.'
         }
 
-        if ($status -match '^Success' -and $ProcessExitCode -ne 0) {
-            # The child telemetry says the work succeeded and no reboot is
-            # required. Normalize a transport/launcher-only nonzero code.
-            return 0
+        return [pscustomobject][ordered]@{
+            SectionId = $SectionId
+            Path = $latestJson
+            Status = $status
+            ExitCode = $reportedExitCode
+            HasExitCode = $hasReportedExitCode
+            RebootRequired = $rebootRequired
+            FailureMessage = $failureMessage
         }
     }
     catch {
-        Write-RunnerLog `
-            -Message "Unable to read Script 11 latest telemetry for exit-code normalization: $($_.Exception.Message)" `
-            -Level 'WARNING'
+        Write-RunnerLog -Message "Unable to read current child telemetry for $SectionId`: $($_.Exception.Message)" -Level 'WARNING'
+        return $null
+    }
+}
+
+function Resolve-ChildSectionExitCode {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][int]$ProcessExitCode,
+        [Parameter(Mandatory)][AllowNull()]$TelemetryOutcome
+    )
+
+    if ($null -eq $TelemetryOutcome) { return $ProcessExitCode }
+
+    $status = [string]$TelemetryOutcome.Status
+    $reportedExitCode = $TelemetryOutcome.ExitCode
+    $hasReportedExitCode = [bool]$TelemetryOutcome.HasExitCode
+    $rebootRequired = [bool]$TelemetryOutcome.RebootRequired
+    $successfulStatus = ($status -match '^(?:Success|AlreadyCompliant)')
+
+    if (
+        $status -eq 'SuccessRebootRequired' -or
+        ($hasReportedExitCode -and $reportedExitCode -eq 3010) -or
+        ($successfulStatus -and $rebootRequired)
+    ) {
+        return 3010
     }
 
+    if ($successfulStatus -or ($hasReportedExitCode -and $reportedExitCode -eq 0)) {
+        return 0
+    }
+
+    if ($hasReportedExitCode -and $reportedExitCode -ne 0) { return [int]$reportedExitCode }
     return $ProcessExitCode
 }
 
@@ -5862,21 +6482,34 @@ function Invoke-MaintenanceSection {
         $process = Start-Process `
             -FilePath "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe" `
             -ArgumentList @('-NoLogo','-NoProfile','-NonInteractive','-ExecutionPolicy','Bypass','-EncodedCommand',$encodedCommand) `
+            -NoNewWindow `
             -Wait `
             -PassThru
 
         $exitCode = [int]$process.ExitCode
 
-        if ($SectionId -eq 'PrinterAndPaperCut') {
-            $normalizedExitCode = Resolve-PrinterSectionExitCode `
+        if ($SectionId -in @('SystemRestore','PrinterAndPaperCut','ElasticAgent')) {
+            $telemetryOutcome = Get-ChildSectionTelemetryOutcome `
+                -SectionId $SectionId `
+                -LogDirectory $LogDirectory `
+                -NotBefore $sectionStart
+
+            $normalizedExitCode = Resolve-ChildSectionExitCode `
                 -ProcessExitCode $exitCode `
-                -LogDirectory $LogDirectory
+                -TelemetryOutcome $telemetryOutcome
 
             if ($normalizedExitCode -ne $exitCode) {
                 Write-RunnerLog `
-                    -Message "Normalized SHARP/PaperCut child exit code from $exitCode to $normalizedExitCode based on Script 11 telemetry." `
+                    -Message "Normalized $SectionId child exit code from $exitCode to $normalizedExitCode based on current child telemetry." `
                     -Level 'INFO'
                 $exitCode = $normalizedExitCode
+            }
+
+            if ($telemetryOutcome -and
+                -not [string]::IsNullOrWhiteSpace([string]$telemetryOutcome.FailureMessage)) {
+                Write-RunnerLog `
+                    -Message "$DisplayName child detail: $($telemetryOutcome.FailureMessage)" `
+                    -Level $(if ($exitCode -eq 0 -or $exitCode -eq 3010) { 'WARNING' } else { 'ERROR' })
             }
         }
     }
@@ -6071,6 +6704,86 @@ function Set-StartupAllowlistForHive {
     $Counters.HivesProcessed++
 }
 
+function Disable-HpConsumerNotificationLaunchers {
+    [CmdletBinding()]
+    param()
+
+    $result = [ordered]@{
+        ProcessesStopped = 0
+        TasksDisabled    = 0
+        TasksUnchanged   = 0
+        Failures         = 0
+        FailureMessages  = (New-Object System.Collections.Generic.List[string])
+    }
+    $targetPattern = '(?i)(HP\s*Notifications?|HPNotifications|HP\s*System\s*Tray|HPSystemTray|HPSysTray)'
+
+    # These are user-facing notification/tray processes only. Do not match HP
+    # audio, driver, BIOS, HPIA, HPCMSL, analytics, or support services broadly.
+    foreach ($process in @(Get-Process -ErrorAction SilentlyContinue | Where-Object {
+        $_.ProcessName -match '^(?i:HPNotifications|HPSystemTray|HPSysTray)$'
+    })) {
+        try {
+            Stop-Process -Id $process.Id -Force -ErrorAction Stop
+            $result.ProcessesStopped++
+            Write-RunnerLog -Message "Stopped HP consumer notification process '$($process.ProcessName)' (PID $($process.Id))."
+        }
+        catch {
+            $result.Failures++
+            $message = "Process $($process.ProcessName): $($_.Exception.Message)"
+            $result.FailureMessages.Add($message) | Out-Null
+            Write-RunnerLog -Message "Unable to stop HP consumer notification process '$($process.ProcessName)': $($_.Exception.Message)" -Level 'ERROR'
+        }
+    }
+
+    try {
+        $tasks = @(Get-ScheduledTask -ErrorAction Stop)
+        foreach ($task in $tasks) {
+            $taskName = [string]$task.TaskName
+            $taskPath = [string]$task.TaskPath
+            $actionText = New-Object System.Collections.Generic.List[string]
+
+            $actionsProperty = $task.PSObject.Properties['Actions']
+            $taskActions = if ($null -ne $actionsProperty) { @($actionsProperty.Value) } else { @() }
+            foreach ($action in $taskActions) {
+                foreach ($propertyName in @('Execute','Arguments','WorkingDirectory')) {
+                    $property = $action.PSObject.Properties[$propertyName]
+                    if ($null -ne $property -and -not [string]::IsNullOrWhiteSpace([string]$property.Value)) {
+                        $actionText.Add([string]$property.Value) | Out-Null
+                    }
+                }
+            }
+
+            $identity = "$taskPath$taskName $($actionText -join ' ')"
+            if ($identity -notmatch $targetPattern) { continue }
+
+            if ([string]$task.State -eq 'Disabled') {
+                $result.TasksUnchanged++
+                continue
+            }
+
+            try {
+                Disable-ScheduledTask -InputObject $task -ErrorAction Stop | Out-Null
+                $result.TasksDisabled++
+                Write-RunnerLog -Message "Disabled HP consumer notification scheduled task '$taskPath$taskName'."
+            }
+            catch {
+                $result.Failures++
+                $message = "Scheduled task ${taskPath}${taskName}: $($_.Exception.Message)"
+                $result.FailureMessages.Add($message) | Out-Null
+                Write-RunnerLog -Message "Unable to disable HP consumer notification scheduled task '$taskPath$taskName': $($_.Exception.Message)" -Level 'ERROR'
+            }
+        }
+    }
+    catch {
+        $result.Failures++
+        $message = "Scheduled-task discovery: $($_.Exception.Message)"
+        $result.FailureMessages.Add($message) | Out-Null
+        Write-RunnerLog -Message "Unable to inspect HP consumer notification scheduled tasks: $($_.Exception.Message)" -Level 'ERROR'
+    }
+
+    return [pscustomobject]$result
+}
+
 function Invoke-StartupAppAllowlistSection {
     [CmdletBinding()]
     param([Parameter(Mandatory)][string[]]$AllowList)
@@ -6079,6 +6792,14 @@ function Invoke-StartupAppAllowlistSection {
     $counters = [ordered]@{ HivesProcessed=0; Enabled=0; Disabled=0; Unchanged=0; Failures=0 }
     $failureMessages = New-Object System.Collections.Generic.List[string]
     Write-RunnerLog -Message "Starting startup-app allowlist enforcement. Allowed=$($AllowList -join ', ')"
+
+    $hpSuppression = Disable-HpConsumerNotificationLaunchers
+    if ($hpSuppression.Failures -gt 0) {
+        $counters.Failures += [int]$hpSuppression.Failures
+        foreach ($message in @($hpSuppression.FailureMessages)) {
+            $failureMessages.Add("HP notification suppression: $message") | Out-Null
+        }
+    }
 
     # Prevent Edge Startup Boost and background mode from recreating a browser
     # startup entry after the allowlist has disabled msedge.exe.
@@ -6182,6 +6903,9 @@ function Invoke-StartupAppAllowlistSection {
         AllowedItems=@($AllowList); HivesProcessed=$counters.HivesProcessed
         ItemsEnabled=$counters.Enabled; ItemsDisabled=$counters.Disabled
         ItemsUnchanged=$counters.Unchanged; FailureCount=$counters.Failures
+        HpNotificationProcessesStopped=[int]$hpSuppression.ProcessesStopped
+        HpNotificationTasksDisabled=[int]$hpSuppression.TasksDisabled
+        HpNotificationTasksUnchanged=[int]$hpSuppression.TasksUnchanged
         Failures=[string[]]$failureMessages; DurationSeconds=$duration
     }
     try {
@@ -6196,12 +6920,285 @@ function Invoke-StartupAppAllowlistSection {
 
     Write-RunnerLog -Message "Completed startup-app allowlist enforcement. Hives=$($counters.HivesProcessed); Enabled=$($counters.Enabled); Disabled=$($counters.Disabled); Unchanged=$($counters.Unchanged); Failures=$($counters.Failures)" -Level $(if ($success) { 'SUCCESS' } else { 'ERROR' })
     return [pscustomobject][ordered]@{
-        SectionId='StartupAppAllowlist'; DisplayName='Windows startup-app allowlist'
+        SectionId='StartupAppAllowlist'; DisplayName='Windows startup-app allowlist and HP notification suppression'
         ExitCode=$(if ($success) { 0 } else { 1 }); Success=$success
         RebootRequired=$false; DurationSeconds=$duration
         HivesProcessed=$counters.HivesProcessed; ItemsEnabled=$counters.Enabled
         ItemsDisabled=$counters.Disabled; ItemsUnchanged=$counters.Unchanged
+        HpNotificationProcessesStopped=[int]$hpSuppression.ProcessesStopped
+        HpNotificationTasksDisabled=[int]$hpSuppression.TasksDisabled
         FailureCount=$counters.Failures
+    }
+}
+
+function Invoke-AdobeReaderPolicySection {
+    [CmdletBinding()]
+    param()
+
+    $started = Get-Date
+    $displayName = 'Adobe Reader lab-mode policy'
+    $featureLockdownPaths = @(
+        'HKLM:\SOFTWARE\Policies\Adobe\Acrobat Reader\DC\FeatureLockDown',
+        'HKLM:\SOFTWARE\Policies\Adobe\Adobe Acrobat\DC\FeatureLockDown',
+        'HKLM:\SOFTWARE\WOW6432Node\Policies\Adobe\Acrobat Reader\DC\FeatureLockDown',
+        'HKLM:\SOFTWARE\WOW6432Node\Policies\Adobe\Adobe Acrobat\DC\FeatureLockDown'
+    )
+    $policyDefinitions = @(
+        [pscustomobject]@{ SubKey = '';          Name = 'bAcroSuppressUpsell';          Value = 1 },
+        [pscustomobject]@{ SubKey = '';          Name = 'bSuppressSignOut';             Value = 1 },
+        [pscustomobject]@{ SubKey = '';          Name = 'bToggleFTE';                   Value = 1 },
+        [pscustomobject]@{ SubKey = 'cServices'; Name = 'bUpdater';                     Value = 0 },
+        [pscustomobject]@{ SubKey = 'cServices'; Name = 'bToggleAdobeDocumentServices'; Value = 1 },
+        [pscustomobject]@{ SubKey = 'cServices'; Name = 'bToggleDocumentCloud';          Value = 1 },
+        [pscustomobject]@{ SubKey = 'cServices'; Name = 'bToggleWebConnectors';          Value = 1 }
+    )
+    $changesMade = 0
+    $verifiedPolicies = New-Object System.Collections.Generic.List[string]
+    $failureMessages = New-Object System.Collections.Generic.List[string]
+
+    Write-RunnerLog -Message "Starting section: $displayName"
+
+    foreach ($featureLockdownPath in $featureLockdownPaths) {
+        foreach ($definition in $policyDefinitions) {
+            $policyPath = if ([string]::IsNullOrWhiteSpace([string]$definition.SubKey)) {
+                $featureLockdownPath
+            }
+            else {
+                Join-Path $featureLockdownPath ([string]$definition.SubKey)
+            }
+            $policyName = [string]$definition.Name
+            $desiredValue = [int]$definition.Value
+
+            try {
+                if (-not (Test-Path -LiteralPath $policyPath -PathType Container)) {
+                    New-Item -Path $policyPath -ItemType Directory -Force -ErrorAction Stop | Out-Null
+                    $changesMade++
+                }
+
+                $existingItem = Get-ItemProperty -LiteralPath $policyPath -ErrorAction Stop
+                $existingProperty = $existingItem.PSObject.Properties[$policyName]
+                $existingValue = if ($null -ne $existingProperty) { [int]$existingProperty.Value } else { $null }
+
+                if ($existingValue -ne $desiredValue) {
+                    New-ItemProperty `
+                        -LiteralPath $policyPath `
+                        -Name $policyName `
+                        -PropertyType DWord `
+                        -Value $desiredValue `
+                        -Force `
+                        -ErrorAction Stop | Out-Null
+                    $changesMade++
+                }
+
+                $verifiedItem = Get-ItemProperty -LiteralPath $policyPath -ErrorAction Stop
+                $verifiedProperty = $verifiedItem.PSObject.Properties[$policyName]
+                if ($null -eq $verifiedProperty -or [int]$verifiedProperty.Value -ne $desiredValue) {
+                    throw "Registry verification failed for $policyPath\$policyName."
+                }
+
+                $verifiedPolicies.Add("$policyPath\$policyName=$desiredValue") | Out-Null
+                Write-RunnerLog -Message "Verified Adobe lab policy: $policyPath\$policyName=$desiredValue" -Level 'SUCCESS'
+            }
+            catch {
+                $failureMessages.Add("$policyPath\${policyName}: $($_.Exception.Message)") | Out-Null
+                Write-RunnerLog -Message "Adobe lab policy failed for $policyPath\$policyName`: $($_.Exception.Message)" -Level 'ERROR'
+            }
+        }
+    }
+
+    $expectedPolicyCount = $featureLockdownPaths.Count * $policyDefinitions.Count
+    $success = ($failureMessages.Count -eq 0 -and $verifiedPolicies.Count -eq $expectedPolicyCount)
+    $duration = [math]::Round(((Get-Date) - $started).TotalSeconds, 2)
+    $status = if (-not $success) {
+        'Failed'
+    }
+    elseif ($changesMade -eq 0) {
+        'AlreadyCompliant'
+    }
+    else {
+        'Configured'
+    }
+
+    $event = [pscustomobject][ordered]@{
+        EventType       = 'maintenance.adobe_reader_policy'
+        ComputerName    = [string]$env:COMPUTERNAME
+        ScriptName      = $RunnerScriptName
+        ScriptVersion   = $RunnerVersion
+        RunId           = $RunnerRunId
+        TimestampUtc    = (Get-Date).ToUniversalTime().ToString('o')
+        Status          = $status
+        PolicyMode      = 'LocalOnlyNoAdobeAccount'
+        PolicyRoots     = @($featureLockdownPaths | ForEach-Object { [string]$_ })
+        ExpectedPolicies = $expectedPolicyCount
+        VerifiedPolicies = @($verifiedPolicies | ForEach-Object { [string]$_ })
+        ChangesMade     = $changesMade
+        FailureCount    = $failureMessages.Count
+        Failures        = @($failureMessages | ForEach-Object { [string]$_ })
+        DurationSeconds = $duration
+    }
+
+    try {
+        Write-RunnerTelemetryLine -Path $RunnerTelemetryPath -JsonLine ($event | ConvertTo-Json -Depth 6 -Compress)
+        Write-RunnerJsonAtomically `
+            -Path (Join-Path $LogDirectory '04_Adobe_Reader_Policy.latest.json') `
+            -Json ($event | ConvertTo-Json -Depth 6)
+    }
+    catch {
+        $success = $false
+        $status = 'Failed'
+        $failureMessages.Add("Telemetry: $($_.Exception.Message)") | Out-Null
+        Write-RunnerLog -Message "Unable to publish Adobe Reader policy telemetry: $($_.Exception.Message)" -Level 'ERROR'
+    }
+
+    Write-RunnerLog `
+        -Message "Completed section: $displayName. Status=$status; Changes=$changesMade; ExitCode=$(if ($success) { 0 } else { 1 }); DurationSeconds=$duration" `
+        -Level $(if ($success) { 'SUCCESS' } else { 'ERROR' })
+
+    return [pscustomobject][ordered]@{
+        SectionId       = 'AdobeReaderPolicy'
+        DisplayName     = $displayName
+        ExitCode        = if ($success) { 0 } else { 1 }
+        Success         = $success
+        RebootRequired  = $false
+        DurationSeconds = $duration
+        Status          = $status
+        ChangesMade     = $changesMade
+        VerifiedPolicies = $verifiedPolicies.Count
+        FailureCount    = $failureMessages.Count
+    }
+}
+
+function Invoke-PostMaintenanceCopilotCleanupSection {
+    [CmdletBinding()]
+    param()
+
+    $started = Get-Date
+    $displayName = 'Post-maintenance Microsoft Copilot cleanup'
+    $modulePath = $null
+    $cleanupResult = $null
+    $failureMessages = New-Object System.Collections.Generic.List[string]
+    $success = $false
+
+    Write-RunnerLog -Message "Starting section: $displayName"
+
+    try {
+        if (Test-Path -LiteralPath $CopilotModuleLocalPath -PathType Leaf) {
+            $modulePath = $CopilotModuleLocalPath
+        }
+        elseif (Test-Path -LiteralPath $CopilotModuleSharePath -PathType Leaf) {
+            $modulePath = $CopilotModuleSharePath
+            Write-RunnerLog -Message "Local Copilot module was unavailable; using central copy: $modulePath" -Level 'WARNING'
+        }
+        else {
+            throw "Maintenance.Copilot.psm1 was not found at '$CopilotModuleLocalPath' or '$CopilotModuleSharePath'."
+        }
+
+        Import-Module -Name $modulePath -Force -DisableNameChecking -ErrorAction Stop
+        $command = Get-Command -Name 'Invoke-ComprehensiveCopilotRemoval' -ErrorAction Stop
+        if ($null -eq $command) {
+            throw "Invoke-ComprehensiveCopilotRemoval was not exported by $modulePath."
+        }
+
+        $cleanupResult = Invoke-ComprehensiveCopilotRemoval -Logger {
+            param($Message, $Level)
+            $runnerLevel = switch -Regex ([string]$Level) {
+                '^(?i:error|failed)$'       { 'ERROR'; break }
+                '^(?i:warn|warning)$'      { 'WARNING'; break }
+                '^(?i:ok|success)$'        { 'SUCCESS'; break }
+                default                    { 'INFO' }
+            }
+            Write-RunnerLog -Message ([string]$Message) -Level $runnerLevel
+        }
+
+        $reportedFailures = Get-RunnerPropertyValueSafe -InputObject $cleanupResult -Name 'Failures'
+        $failureCount = if ($null -eq $reportedFailures) { 0 } else { [int]$reportedFailures }
+        $success = ($failureCount -eq 0)
+        if (-not $success) {
+            $failureMessages.Add("The Copilot cleanup module reported $failureCount failure(s).") | Out-Null
+        }
+    }
+    catch {
+        $failureMessages.Add([string]$_.Exception.Message) | Out-Null
+        Write-RunnerLog -Message "Post-maintenance Copilot cleanup failed: $($_.Exception.Message)" -Level 'ERROR'
+    }
+
+    $duration = [math]::Round(((Get-Date) - $started).TotalSeconds, 2)
+    $installedFound = Get-RunnerPropertyValueSafe -InputObject $cleanupResult -Name 'InstalledPackagesFound'
+    $installedRemoved = Get-RunnerPropertyValueSafe -InputObject $cleanupResult -Name 'InstalledPackagesRemoved'
+    $provisionedFound = Get-RunnerPropertyValueSafe -InputObject $cleanupResult -Name 'ProvisionedPackagesFound'
+    $provisionedRemoved = Get-RunnerPropertyValueSafe -InputObject $cleanupResult -Name 'ProvisionedPackagesRemoved'
+    $processesStopped = Get-RunnerPropertyValueSafe -InputObject $cleanupResult -Name 'ProcessesStopped'
+    $tasksDisabled = Get-RunnerPropertyValueSafe -InputObject $cleanupResult -Name 'TasksDisabled'
+    $desktopFound = Get-RunnerPropertyValueSafe -InputObject $cleanupResult -Name 'DesktopApplicationsFound'
+    $desktopAttempted = Get-RunnerPropertyValueSafe -InputObject $cleanupResult -Name 'DesktopUninstallsAttempted'
+    $desktopRemoved = Get-RunnerPropertyValueSafe -InputObject $cleanupResult -Name 'DesktopApplicationsRemoved'
+    $desktopRemaining = Get-RunnerPropertyValueSafe -InputObject $cleanupResult -Name 'RemainingDesktopApplications'
+    $desktopExitCodes = Get-RunnerPropertyValueSafe -InputObject $cleanupResult -Name 'DesktopUninstallExitCodes'
+    $desktopDirectoriesRemoved = Get-RunnerPropertyValueSafe -InputObject $cleanupResult -Name 'DesktopDirectoriesRemoved'
+    $moduleStatus = Get-RunnerPropertyValueSafe -InputObject $cleanupResult -Name 'Status'
+
+    $event = [pscustomobject][ordered]@{
+        EventType                    = 'maintenance.copilot_cleanup'
+        ComputerName                 = [string]$env:COMPUTERNAME
+        ScriptName                   = $RunnerScriptName
+        ScriptVersion                = $RunnerVersion
+        RunId                        = $RunnerRunId
+        TimestampUtc                 = (Get-Date).ToUniversalTime().ToString('o')
+        Status                       = if ($success) { 'Success' } else { 'Failed' }
+        ModuleStatus                 = $moduleStatus
+        ModulePath                   = $modulePath
+        InstalledPackagesFound       = $installedFound
+        InstalledPackagesRemoved     = $installedRemoved
+        ProvisionedPackagesFound     = $provisionedFound
+        ProvisionedPackagesRemoved   = $provisionedRemoved
+        ProcessesStopped             = $processesStopped
+        TasksDisabled                = $tasksDisabled
+        DesktopApplicationsFound     = $desktopFound
+        DesktopUninstallsAttempted   = $desktopAttempted
+        DesktopApplicationsRemoved   = $desktopRemoved
+        RemainingDesktopApplications = $desktopRemaining
+        DesktopUninstallExitCodes    = @($desktopExitCodes)
+        DesktopDirectoriesRemoved    = $desktopDirectoriesRemoved
+        FailureCount                 = $failureMessages.Count
+        Failures                     = @($failureMessages | ForEach-Object { [string]$_ })
+        DurationSeconds              = $duration
+    }
+
+    try {
+        Write-RunnerTelemetryLine -Path $RunnerTelemetryPath -JsonLine ($event | ConvertTo-Json -Depth 6 -Compress)
+        Write-RunnerJsonAtomically `
+            -Path (Join-Path $LogDirectory '04_Copilot_Cleanup.latest.json') `
+            -Json ($event | ConvertTo-Json -Depth 6)
+    }
+    catch {
+        $success = $false
+        $failureMessages.Add("Telemetry: $($_.Exception.Message)") | Out-Null
+        Write-RunnerLog -Message "Unable to publish Copilot cleanup telemetry: $($_.Exception.Message)" -Level 'ERROR'
+    }
+
+    Write-RunnerLog `
+        -Message "Completed section: $displayName. DesktopRemoved=$desktopRemoved; InstalledRemoved=$installedRemoved; ProvisionedRemoved=$provisionedRemoved; ExitCode=$(if ($success) { 0 } else { 1 }); DurationSeconds=$duration" `
+        -Level $(if ($success) { 'SUCCESS' } else { 'ERROR' })
+
+    return [pscustomobject][ordered]@{
+        SectionId                    = 'PostMaintenanceCopilotCleanup'
+        DisplayName                  = $displayName
+        ExitCode                     = if ($success) { 0 } else { 1 }
+        Success                      = $success
+        RebootRequired               = $false
+        DurationSeconds              = $duration
+        ModuleStatus                 = $moduleStatus
+        InstalledPackagesFound       = $installedFound
+        InstalledPackagesRemoved     = $installedRemoved
+        ProvisionedPackagesFound     = $provisionedFound
+        ProvisionedPackagesRemoved   = $provisionedRemoved
+        DesktopApplicationsFound     = $desktopFound
+        DesktopUninstallsAttempted   = $desktopAttempted
+        DesktopApplicationsRemoved   = $desktopRemoved
+        RemainingDesktopApplications = $desktopRemaining
+        DesktopUninstallExitCodes    = @($desktopExitCodes)
+        DesktopDirectoriesRemoved    = $desktopDirectoriesRemoved
+        FailureCount                 = $failureMessages.Count
     }
 }
 
@@ -6250,15 +7247,26 @@ try {
         [pscustomobject]@{ Id='SystemRestore'; Name='System Restore and verified restore point'; Enabled=$RunSystemRestore; Settings=[ordered]@{} }
         [pscustomobject]@{ Id='PrinterAndPaperCut'; Name='SHARP driver, PaperCut, and printer'; Enabled=$RunPrinterAndPaperCut; Settings=[ordered]@{} }
         [pscustomobject]@{ Id='Office2024Maintenance'; Name='Office LTSC detection, Office 2024 migration, and activation'; Enabled=$RunOffice2024Maintenance; Settings=[ordered]@{} }
-        [pscustomobject]@{ Id='AutologonAndEdge'; Name='Autologon and Edge startup'; Enabled=$RunAutologonAndEdge; Settings=[ordered]@{ Patterns=@($AutologonComputerPatterns) } }
+        [pscustomobject]@{ Id='EdgeInPrivate'; Name='Microsoft Edge InPrivate startup'; Enabled=$RunEdgeInPrivate; Settings=[ordered]@{ Patterns=@($EdgeInPrivateComputerPatterns); ConfigureEdgeInPrivate=$true; ConfigureAutologon=$false } }
         [pscustomobject]@{ Id='ElasticAgent'; Name='Elastic Agent installation'; Enabled=$RunElasticAgent; Settings=[ordered]@{ Prefixes=@($ElasticAgentComputerPrefixes); ForceReinstall=[bool]$ForceElasticAgentReinstall } }
         [pscustomobject]@{ Id='BrowserHomepage'; Name='Browser homepage policies'; Enabled=$RunBrowserHomepage; Settings=[ordered]@{ HomepageUrl=$HomepageUrl } }
+        [pscustomobject]@{ Id='AdobeReaderPolicy'; Name='Adobe Reader local-only lab policy'; Enabled=$RunAdobeReaderPolicy; Settings=[ordered]@{} }
         [pscustomobject]@{ Id='Honorlock'; Name='Honorlock Chrome extension'; Enabled=$RunHonorlock; Settings=[ordered]@{ Patterns=@($HonorlockComputerPatterns) } }
         [pscustomobject]@{ Id='StellariumLocation'; Name='Stellarium Location Services'; Enabled=$RunStellariumLocation; Settings=[ordered]@{ Patterns=@($StellariumComputerPatterns) } }
-        [pscustomobject]@{ Id='StartupAppAllowlist'; Name='Windows startup-app allowlist'; Enabled=$RunStartupAppAllowlist; Settings=[ordered]@{ AllowedItems=@($AllowedStartupApplications) } }
+        [pscustomobject]@{ Id='StartupAppAllowlist'; Name='Windows startup-app allowlist and HP notification suppression'; Enabled=$RunStartupAppAllowlist; Settings=[ordered]@{ AllowedItems=@($AllowedStartupApplications) } }
+        [pscustomobject]@{ Id='PostMaintenanceCopilotCleanup'; Name='Post-maintenance Microsoft Copilot cleanup'; Enabled=$RunPostMaintenanceCopilotCleanup; Settings=[ordered]@{} }
     )
 
+    $sectionNumber = 0
     foreach ($section in $sectionPlan) {
+        $sectionNumber++
+        Write-RunnerSection `
+            -Title ([string]$section.Name) `
+            -SectionId ([string]$section.Id) `
+            -SectionNumber $sectionNumber `
+            -SectionCount $sectionPlan.Count `
+            -Enabled ([bool]$section.Enabled)
+
         if (-not [bool]$section.Enabled) {
             Add-SkippedSectionResult -Results $results -SectionId $section.Id -DisplayName $section.Name
             continue
@@ -6271,6 +7279,16 @@ try {
 
         if ($section.Id -eq 'StartupAppAllowlist') {
             [void]$results.Add((Invoke-StartupAppAllowlistSection -AllowList @($section.Settings.AllowedItems)))
+            continue
+        }
+
+        if ($section.Id -eq 'AdobeReaderPolicy') {
+            [void]$results.Add((Invoke-AdobeReaderPolicySection))
+            continue
+        }
+
+        if ($section.Id -eq 'PostMaintenanceCopilotCleanup') {
+            [void]$results.Add((Invoke-PostMaintenanceCopilotCleanupSection))
             continue
         }
 

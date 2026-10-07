@@ -1,9 +1,9 @@
 {
   "SchemaVersion": 1,
-  "PolicyVersion": "1.0.3",
+  "PolicyVersion": "1.0.0",
   "FleetStatusRoots": [
-    "\\\\SERVER\\MaintenanceStatus",
-    "\\\\FALLBACK-SERVER\\MaintenanceStatus"
+    "\\\\filesvr\\MaintenanceStatus",
+    "\\\\10.2.3.30\\MaintenanceStatus"
   ],
   "StaleWarningDays": 3,
   "StaleCriticalDays": 7,
@@ -48,7 +48,7 @@
       "Dependencies": []
     },
     {
-      "Name": "04_Sunday_Lab_Application_Maintenance.ps1",
+      "Name": "04_Update_Edge_Silent.ps1",
       "Window": {
         "Enforce": true,
         "Days": [
@@ -142,7 +142,7 @@
       "Dependencies": []
     },
     {
-      "Name": "14_Endpoint_Health_Inventory.ps1",
+      "Name": "11_Install_SharpDriver_And_PaperCut.ps1",
       "Window": {
         "Enforce": true,
         "Days": [
@@ -154,17 +154,31 @@
       "Dependencies": []
     },
     {
-      "Name": "16_Check_Deep_Freeze_Status.ps1",
+      "Name": "12_Enable-SystemRestore-And-Create-RestorePoint.ps1",
       "Window": {
-        "Enforce": false,
-        "Days": [],
+        "Enforce": true,
+        "Days": [
+          "Sunday"
+        ],
         "Start": "00:00",
-        "End": "23:59"
+        "End": "10:00"
       },
       "Dependencies": []
     },
     {
-      "Name": "Repair-MicrosoftEdgeUpdate.ps1",
+      "Name": "13_Configure_Autologon_And_Edge.ps1",
+      "Window": {
+        "Enforce": true,
+        "Days": [
+          "Sunday"
+        ],
+        "Start": "07:30",
+        "End": "09:00"
+      },
+      "Dependencies": []
+    },
+    {
+      "Name": "14_Endpoint_Health_Inventory.ps1",
       "Window": {
         "Enforce": true,
         "Days": [

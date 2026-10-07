@@ -1,8 +1,17 @@
 # =====================================================================
 # ScriptName: 08_System_Repair.ps1
-# ScriptVersion: 4.6.1
-# LastUpdated: 2026-09-21
-# Changes: v4.6.1 fixes maintenance-log retention so .log files are included and
+# ScriptVersion: 4.6.4
+# LastUpdated: 2026-10-06
+# Changes: v4.6.4 records reparse-point/security cleanup exclusions as intentional
+#          safety skips instead of TempCleanup warnings and keeps a healthy RPC
+#          root-cause assessment out of the warning/notes collection.
+# Previous: v4.6.3 permits exact SYSTEM-profile cache targets and treats empty
+# event-log queries as informational.
+# Previous: v4.6.2 establishes Script 08 as the sole owner of maintenance-log
+#          consolidation and adds size-based rotation for Maintenance-Telemetry.ndjson.
+#          Rotated NDJSON files join the normal weekly archive/retention workflow;
+#          current *.latest.json dashboard files are preserved.
+#          v4.6.1 fixes maintenance-log retention so .log files are included and
 #          LastWriteTime is used, prunes expired files already under C:\Logs\Old Logs,
 #          permits guarded removal of C:\HP_Bios_Config, and cleans the contents of
 #          C:\Temp while preserving the C:\Temp directory.
@@ -64,7 +73,7 @@ param(
 $ErrorActionPreference = 'Stop'
 
 $script:ScriptName = '08_System_Repair.ps1'
-$script:ScriptVersion = '4.6.1'
+$script:ScriptVersion = '4.6.4'
 $script:RunId = [guid]::NewGuid().Guid
 $script:TelemetryNdjsonPath = Join-Path $LogDirectory 'Maintenance-Telemetry.ndjson'
 $script:LatestTelemetryPath = Join-Path $LogDirectory '08_System_Repair.latest.json'
@@ -1003,7 +1012,27 @@ function Test-SafeCleanupPath {
         return $false
     }
 
-    $normalized = $Path.TrimEnd('\')
+    # Canonicalize before comparison; do not accept relative or wildcard paths.
+    if ($Path -notmatch '^[A-Za-z]:\\' -or $Path -match '[*?]') { return $false }
+    try { $normalized = [System.IO.Path]::GetFullPath($Path.Trim()).TrimEnd('\') }
+    catch { return $false }
+
+    # Scheduled maintenance runs as SYSTEM. Its LocalAppData lives below
+    # System32, which stays blocked except for these exact cache roots.
+    $systemCacheRoots = @(
+        'C:\Windows\System32\config\systemprofile\AppData\Local',
+        'C:\Windows\SysWOW64\config\systemprofile\AppData\Local'
+    )
+    $systemCacheLeaves = @(
+        'Temp', 'Microsoft\Windows\INetCache', 'Microsoft\Windows\WebCache',
+        'CrashDumps', 'Microsoft\Windows\DeliveryOptimization\Cache',
+        'D3DSCache', 'NVIDIA\DXCache', 'NVIDIA\GLCache'
+    )
+    foreach ($root in $systemCacheRoots) {
+        foreach ($leaf in $systemCacheLeaves) {
+            if ($normalized -ieq ($root + '\' + $leaf)) { return $true }
+        }
+    }
 
     $blockedPaths = @(
         'C:\Windows\System32',
@@ -1070,6 +1099,20 @@ function Remove-FolderContents {
         }
     }
 
+    # Reject junctions/symlinks in the target or its ancestors before cleanup.
+    try {
+        $probe = Get-Item -LiteralPath $Path -Force -ErrorAction Stop
+        while ($null -ne $probe) {
+            if (($probe.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+                return @{ Success = $false; SpaceFreed = [int64]0; ItemCount = 0; Message = 'Cleanup path traverses a reparse point' }
+            }
+            $probe = $probe.Parent
+        }
+    }
+    catch {
+        return @{ Success = $false; SpaceFreed = [int64]0; ItemCount = 0; Message = $_.Exception.Message }
+    }
+
     if (-not (Test-SafeCleanupPath -Path $Path)) {
         return @{
             Success    = $false
@@ -1080,6 +1123,13 @@ function Remove-FolderContents {
     }
 
     try {
+        $linkedChild = Get-ChildItem -LiteralPath $Path -Force -Recurse -ErrorAction Stop |
+            Where-Object { ($_.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0 } |
+            Select-Object -First 1
+        if ($null -ne $linkedChild) {
+            return @{ Success = $false; SpaceFreed = [int64]0; ItemCount = 0; Message = 'Cleanup target contains a reparse point' }
+        }
+
         $items = if ($ContentsOnly) {
             @(Get-ChildItem -LiteralPath $Path -Force -ErrorAction SilentlyContinue)
         }
@@ -2652,13 +2702,19 @@ function Invoke-TempCleanup {
             }) | Out-Null
         }
         else {
-            Warn-Step -Name 'TempCleanup' -Reason "$($target.Description) failed: $($result.Message)"
+            $isIntentionalSafetySkip = [string]$result.Message -match '(?i)reparse point|blocked for security'
+            if ($isIntentionalSafetySkip) {
+                Write-Log "$($target.Description) skipped by cleanup safety policy: $($result.Message)" 'INFO'
+            }
+            else {
+                Warn-Step -Name 'TempCleanup' -Reason "$($target.Description) failed: $($result.Message)"
+            }
             $cleanupResults.Add([PSCustomObject]@{
                 Path        = $target.Path
                 Description = $target.Description
                 ItemCount   = 0
                 SpaceFreed  = [int64]0
-                Status      = 'Failed'
+                Status      = if ($isIntentionalSafetySkip) { 'SkippedSafety' } else { 'Failed' }
                 Message     = $result.Message
             }) | Out-Null
         }
@@ -3560,7 +3616,8 @@ function Invoke-RpcDiagnostics {
     $rpcAssessmentLevel = if ($localProblem -or $remoteProblem) { 'WARN' } else { 'OK' }
     Write-Log "RPC_ROOT_CAUSE_ASSESSMENT|$rpcAssessment" $rpcAssessmentLevel
     Write-Log "RPC_DIAGNOSTICS_SUMMARY|Status=$($script:Summary.RpcDiagnosticsStatus)|ClientSideIssue=$($script:Summary.RpcClientSideIssueDetected)|RemoteOrNetworkIssue=$($script:Summary.RpcRemoteSideIssueDetected)|ServiceProblems=$($serviceProblems.Count)|RemoteProblems=$($remoteProblems.Count)|Assessment=$(Convert-RpcSafeString $rpcAssessment)" ($(if ($localProblem -or $remoteProblem) { 'WARN' } else { 'INFO' }))
-    Add-Note "RPC root cause assessment: $rpcAssessment"
+    # A healthy assessment is operational evidence, not a warning/note. The
+    # problem branches above already add actionable notes when RPC is unhealthy.
 
     Add-DetailedResult -Step 'RpcDiagnostics' -Status 'Info' -Message 'RPC diagnostics completed.' -Data @{
         Status = $script:Summary.RpcDiagnosticsStatus
@@ -4576,6 +4633,14 @@ function Invoke-EventLogSummary {
         }
     }
     catch {
+        if ($_.FullyQualifiedErrorId -like 'NoMatchingEventsFound*') {
+            Write-Log 'No unexpected shutdown events found in the last seven days.' 'INFO'
+            Add-DetailedResult -Step 'EventLogSummary' -Status 'Info' -Message 'No recent unexpected shutdown events.' -Data @{
+                UnexpectedShutdownCount = 0
+            }
+            return
+        }
+
         $eventLogError = $_.Exception.Message
         Warn-Step -Name 'EventLogSummary' -Reason $eventLogError
 
@@ -4898,6 +4963,53 @@ function Remove-WindowsOldFolder {
 }
 
 
+function Invoke-MaintenanceTelemetryRotation {
+    [CmdletBinding()]
+    param(
+        [string]$TelemetryPath = 'C:\Logs\Maintenance-Telemetry.ndjson',
+        [ValidateRange(5,1024)][int]$MaximumSizeMB = 25
+    )
+
+    if (-not (Test-Path -LiteralPath $TelemetryPath -PathType Leaf)) {
+        Write-Log "Maintenance telemetry file does not exist yet; rotation is not required: $TelemetryPath" 'INFO'
+        return
+    }
+
+    $telemetryItem = Get-Item -LiteralPath $TelemetryPath -Force -ErrorAction Stop
+    $maximumBytes = [int64]$MaximumSizeMB * 1MB
+    if ($telemetryItem.Length -lt $maximumBytes) {
+        Write-Log ("Maintenance telemetry rotation is not required. SizeMB={0}; MaximumSizeMB={1}." -f `
+            [math]::Round($telemetryItem.Length / 1MB, 2), $MaximumSizeMB) 'INFO'
+        return
+    }
+
+    $rotationName = '{0}-Maintenance-Telemetry-{1}.ndjson' -f `
+        $script:ComputerName, (Get-Date -Format 'yyyy-MM-dd_HH-mm-ss')
+    $rotationPath = Join-Path (Split-Path -Parent $TelemetryPath) $rotationName
+
+    try {
+        Move-Item -LiteralPath $TelemetryPath -Destination $rotationPath -Force -ErrorAction Stop
+        [System.IO.File]::WriteAllText(
+            $TelemetryPath,
+            [string]::Empty,
+            [System.Text.UTF8Encoding]::new($false)
+        )
+        Write-Log "Rotated maintenance telemetry to $rotationPath because it reached the ${MaximumSizeMB}MB limit." 'OK'
+        Add-DetailedResult -Step 'MaintenanceTelemetryRotation' -Status 'Success' -Message 'Maintenance telemetry was rotated.' -Data @{
+            MaximumSizeMB = $MaximumSizeMB
+            RotatedPath   = $rotationPath
+            RotatedBytes  = $telemetryItem.Length
+        }
+    }
+    catch {
+        Write-Log "Maintenance telemetry rotation was deferred because the file could not be moved safely: $($_.Exception.Message)" 'WARN'
+        Add-DetailedResult -Step 'MaintenanceTelemetryRotation' -Status 'Warning' -Message $_.Exception.Message -Data @{
+            MaximumSizeMB = $MaximumSizeMB
+            TelemetryPath = $TelemetryPath
+        }
+    }
+}
+
 function Invoke-LogArchiveRetention {
     [CmdletBinding()]
     param(
@@ -4922,12 +5034,16 @@ function Invoke-LogArchiveRetention {
     Write-Log "Previous Sunday: $previousSunday" 'INFO'
     Write-Log "Two Sundays Ago: $twoSundaysAgo" 'INFO'
 
-    $extensions = @('.log', '.yaml', '.yml', '.txt')
+    # Rotated NDJSON files are archived like other completed logs. The active
+    # Maintenance-Telemetry.ndjson file is explicitly excluded below.
+    $extensions = @('.log', '.yaml', '.yml', '.txt', '.ndjson')
 
     $allLooseLogs = Get-ChildItem -LiteralPath $LogDirectory -File -Force -ErrorAction SilentlyContinue |
         Where-Object {
             $extensions -contains $_.Extension.ToLowerInvariant() -and
-            $_.FullName -ne $script:YamlLogPath -and $_.FullName -ne $script:PublishedTextLogPath
+            $_.FullName -ne $script:YamlLogPath -and
+            $_.FullName -ne $script:PublishedTextLogPath -and
+            $_.FullName -ne $script:TelemetryNdjsonPath
         }
 
     $logsToArchive = $allLooseLogs | Where-Object {
@@ -5014,7 +5130,9 @@ function Invoke-LogArchiveRetention {
     $remainingLooseLogs = Get-ChildItem -LiteralPath $LogDirectory -File -Force -ErrorAction SilentlyContinue |
         Where-Object {
             $extensions -contains $_.Extension.ToLowerInvariant() -and
-            $_.FullName -ne $script:YamlLogPath -and $_.FullName -ne $script:PublishedTextLogPath
+            $_.FullName -ne $script:YamlLogPath -and
+            $_.FullName -ne $script:PublishedTextLogPath -and
+            $_.FullName -ne $script:TelemetryNdjsonPath
         }
 
     $oldLooseLogsToDelete = $remainingLooseLogs | Where-Object {
@@ -5596,6 +5714,7 @@ try {
 
     Invoke-Safely -Name 'RollbackRetentionCleanup' -ScriptBlock { Invoke-RollbackRetentionCleanup -RollbackRoot 'C:\Scripts\Rollback' -RetentionDays 7 } -WarnOnly | Out-Null
     Invoke-Safely -Name 'WindowsOldCleanup' -ScriptBlock { Remove-WindowsOldFolder -Path 'C:\Windows.old' } -WarnOnly | Out-Null
+    Invoke-Safely -Name 'MaintenanceTelemetryRotation' -ScriptBlock { Invoke-MaintenanceTelemetryRotation -TelemetryPath $script:TelemetryNdjsonPath -MaximumSizeMB 25 } -WarnOnly | Out-Null
     Invoke-Safely -Name 'LogArchiveRetention' -ScriptBlock { Invoke-LogArchiveRetention -LogDirectory $LogDirectory } -WarnOnly | Out-Null
 
     $script:DiskSpaceAfter = Get-SystemDriveTelemetry

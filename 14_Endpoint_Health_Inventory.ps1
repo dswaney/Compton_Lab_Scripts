@@ -251,9 +251,9 @@ param(
 
     [switch]$ShowCollectorProgress = $true,
 
-    [string]$HpBiosConfigShare = '\\filesvr\labscripts\HP_Bios_Config',
+    [string]$HpBiosConfigShare = '\\SERVER\DeploymentShare\HP_Bios_Config',
 
-    [string]$DellCommandConfigureShare = '\\filesvr\labscripts\Dell\Command Configure'
+    [string]$DellCommandConfigureShare = '\\SERVER\DeploymentShare\Dell\Command Configure'
 )
 
 Set-StrictMode -Version 2.0

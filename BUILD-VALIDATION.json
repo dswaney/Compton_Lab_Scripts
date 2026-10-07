@@ -1,5 +1,5 @@
 {
-  "PackageVersion": "2.6.4",
+  "PackageVersion": "3.0.1",
   "PowerShellParserExecuted": false,
   "StructuralChecks": [
     "Manifest hashes generated",
@@ -8,7 +8,8 @@
     "Consolidated script 04 included",
     "Retired standalone scripts excluded from active manifest and task rotation",
     "System Restore embedded in script 04 and standalone script 12 retired",
-    "Public script 04 credential fields blank and credential-dependent sections disabled",
+    "Public script 04 credential fields are blank or placeholders and credential-dependent sections are disabled",
+    "Public scripts and policies contain no production Fleet token, private IP address, or internal server/share name",
     "Internal server names, private IP addresses, and installer shares replaced with public placeholders",
     "Elastic StartsWith prefixes in script 04 contain no wildcard characters and are documented in README",
     "Script 14 safely handles optional scheduled-task actions, adapter statistics, and single-item baseline collections",

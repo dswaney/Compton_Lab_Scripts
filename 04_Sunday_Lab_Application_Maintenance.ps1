@@ -2,7 +2,7 @@
 #requires -RunAsAdministrator
 # ScriptName:    04_Sunday_Lab_Application_Maintenance.ps1
 # ScriptVersion: 1.17.0
-# LastUpdated:   2026-10-06
+# LastUpdated:   2026-10-07
 <#
 .SYNOPSIS
     Runs the Sunday lab application and configuration maintenance in one script.
@@ -27,7 +27,7 @@
 .NOTES
     ScriptName:    04_Sunday_Lab_Application_Maintenance.ps1
     ScriptVersion: 1.17.0
-    LastUpdated:   2026-10-06
+    LastUpdated:   2026-10-07
     Requires:      64-bit Windows PowerShell 5.1, Administrator or SYSTEM
 
     Changes:       v1.17.0 makes Script 04 the sole numbered-script owner of
@@ -226,7 +226,7 @@ $ErrorActionPreference = 'Stop'
 [bool]$RunPrinterAndPaperCut = $true
 [bool]$RunSystemRestore     = $true
 [bool]$RunEdgeInPrivate     = $true
-[bool]$RunElasticAgent      = $true
+[bool]$RunElasticAgent      = $false
 [bool]$RunBrowserHomepage   = $true
 # Honorlock is deployed by Group Policy. Keep the embedded section available for
 # rollback/reference, but do not execute it from Script 04.
@@ -241,13 +241,13 @@ $ErrorActionPreference = 'Stop'
 # GENERAL SETTINGS
 # ============================================================================
 [string]$HomepageUrl = 'https://www.compton.edu'
-[string]$Office2024SourcePath = '\\filesvr\Labscripts\Installers\Office2024'
+[string]$Office2024SourcePath = '\\SERVER\DeploymentShare\Installers\Office2024'
 [string]$Office2024ConfigurationFile = 'office2024config.xml'
 [string]$LogDirectory = 'C:\Logs'
 [string]$RunnerScriptName = '04_Sunday_Lab_Application_Maintenance.ps1'
 [string]$RunnerVersion = '1.17.0'
 [string]$CopilotModuleLocalPath = 'C:\Scripts\Maintenance.Copilot.psm1'
-[string]$CopilotModuleSharePath = '\\filesvr\Labscripts\Maintenance.Copilot.psm1'
+[string]$CopilotModuleSharePath = '\\SERVER\DeploymentShare\Maintenance.Copilot.psm1'
 [string]$RunnerLogPath = Join-Path $LogDirectory '04_Sunday_Lab_Application_Maintenance.log'
 [string]$RunnerLatestPath = Join-Path $LogDirectory '04_Sunday_Lab_Application_Maintenance.latest.json'
 [string]$RunnerTelemetryPath = Join-Path $LogDirectory 'Maintenance-Telemetry.ndjson'
@@ -1458,10 +1458,10 @@ $ErrorActionPreference = 'Stop'
 # =========================
 $ScriptName = '11_Install_SharpDriver_And_PaperCut.ps1'
 $ScriptVersion = '1.2.8'
-$DriverSourcePath = '\\papercut\Printer Drivers\MFP\win\SH_D31_PCL6_PS_2410a_EnglishUS_64bit'
+$DriverSourcePath = '\\PRINT-SERVER\Drivers\SHARP\SH_D31_PCL6_PS_2410a_EnglishUS_64bit'
 $PrinterDriverName = 'Sharp BP-70C31 PCL6'
-$PaperCutMsiPath = '\\papercut\Print Deploy Clients\win\pc-print-deploy-client[10.2.3.44].msi'
-$PrinterSharePath = '\\papercut\StudentSecurePrint'
+$PaperCutMsiPath = '\\PRINT-SERVER\PrintDeploy\pc-print-deploy-client.msi'
+$PrinterSharePath = '\\PRINT-SERVER\StudentSecurePrint'
 $LocalDriverStage = 'C:\ProgramData\Compton\Drivers\Sharp'
 $StateDirectory = 'C:\ProgramData\Compton\State'
 $StatePath = Join-Path $StateDirectory 'SharpDriver-PaperCut-State.json'
@@ -3249,16 +3249,16 @@ $ScriptVersion = '2.1.5'
 
 # Fleet enrollment settings copied from the current Install.ps1.
 # NOTE: The enrollment token is sensitive. Restrict read access to this script/share.
-[string]$FleetServerUrl = 'https://10.2.12.4:8220'
-[string]$EnrollmentToken = 'X2lseThaOEJ2UFRmNGxFS0k1aEg6dUI2VVFOVGRnWHhmeHI5S05uWDd2dw=='
+[string]$FleetServerUrl = 'https://FLEET-SERVER:8220'
+[string]$EnrollmentToken = ''
 
 # Fleet Server is currently using the Quick Start self-signed TLS certificate.
 # Keep this $true until Fleet Server is moved to a certificate trusted by the lab PCs.
 [bool]$UseInsecureFleetTls = $true
 
 # Preferred and fallback ZIP locations.
-[string]$PreferredInstallerPath = "\\filesvr\Labscripts\ElasticAgent\elastic-agent-$ElasticAgentVersion-windows-x86_64.zip"
-[string]$FallbackInstallerPath = "\\10.2.3.30\Labscripts\ElasticAgent\elastic-agent-$ElasticAgentVersion-windows-x86_64.zip"
+[string]$PreferredInstallerPath = "\\SERVER\DeploymentShare\ElasticAgent\elastic-agent-$ElasticAgentVersion-windows-x86_64.zip"
+[string]$FallbackInstallerPath = "\\FALLBACK-SERVER\DeploymentShare\ElasticAgent\elastic-agent-$ElasticAgentVersion-windows-x86_64.zip"
 
 # Official Elastic download fallback. Used automatically when both internal shares are unavailable.
 [string]$DownloadUri = "https://artifacts.elastic.co/downloads/beats/elastic-agent/elastic-agent-$ElasticAgentVersion-windows-x86_64.zip"

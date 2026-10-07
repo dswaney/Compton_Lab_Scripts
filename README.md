@@ -4,21 +4,20 @@
 [![Platform](https://img.shields.io/badge/Platform-Windows%2011-0078D4?logo=windows11&logoColor=white)](https://www.microsoft.com/windows/windows-11)
 [![Execution](https://img.shields.io/badge/Execution-SYSTEM-success)](#scheduled-task-deployment)
 
-PowerShell-based maintenance automation for Compton College Windows lab computers. The project keeps recurring endpoint maintenance consistent across multiple labs while providing readable logs, structured telemetry, rollback protection, computer-name targeting, and centralized Task Scheduler management.
+PowerShell-based maintenance automation for Compton College Windows lab computers. The project synchronizes a controlled maintenance package to each endpoint, runs recurring work under `NT AUTHORITY\SYSTEM`, verifies changes, publishes human-readable logs and Elastic-compatible telemetry, and supports computer-name-based configuration targeting.
 
-The scripts are designed primarily for 64-bit Windows PowerShell 5.1 and normally run as `NT AUTHORITY\SYSTEM` with highest privileges.
+The active endpoint scripts are designed primarily for 64-bit Windows PowerShell 5.1.
 
 > [!IMPORTANT]
-> Review all paths, computer-name patterns, service settings, credentials, enrollment information, and maintenance times before deploying these scripts in another environment.
+> Review server paths, credentials, enrollment tokens, computer-name patterns, maintenance windows, firmware settings, and scheduled times before using this project outside the protected Compton College deployment environment.
 
 ## Contents
 
 - [Project goals](#project-goals)
-- [Active maintenance scripts](#active-maintenance-scripts)
+- [Repository inventory](#repository-inventory)
 - [Detailed script descriptions](#detailed-script-descriptions)
 - [Supporting files](#supporting-files)
 - [Scheduled task deployment](#scheduled-task-deployment)
-- [Sunday maintenance schedule](#sunday-maintenance-schedule)
 - [Deployment workflow](#deployment-workflow)
 - [Logging and telemetry](#logging-and-telemetry)
 - [Security considerations](#security-considerations)
@@ -26,304 +25,205 @@ The scripts are designed primarily for 64-bit Windows PowerShell 5.1 and normall
 
 ## Project goals
 
-- Automate routine Sunday maintenance on Windows lab computers.
-- Keep the scripts on each endpoint synchronized with a central file share.
-- Run maintenance under SYSTEM without requiring an interactive administrator session.
-- Verify changes instead of assuming that a command succeeded.
-- Preserve human-readable operational logs and structured Elastic-compatible telemetry.
-- Target lab-specific settings using computer-name prefixes and wildcard patterns.
-- Reduce the number of separate scheduled tasks by consolidating related application and lab configuration work.
-- Keep rollback copies before replacing or retiring locally deployed scripts.
+- Automate recurring maintenance on shared Windows lab computers.
+- Keep `C:\Scripts` synchronized with the approved central package.
+- Run maintenance as SYSTEM without requiring an interactive administrator session.
+- Verify changes instead of treating a successful command launch as proof of success.
+- Preserve readable logs, latest-state JSON, and NDJSON events for Elastic.
+- Build current hardware, BIOS, warranty, health, and normalized software inventory.
+- Limit automated remediation to explicitly approved actions and maintenance windows.
+- Protect boot-critical, storage, firmware, and encrypted-system operations with safety gates.
+- Retain rollback copies when managed scripts are replaced or retired.
 
-## Active maintenance scripts
+## Repository inventory
+
+### Active endpoint and deployment scripts
+
+| File | Current responsibility |
+|---|---|
+| [`Post-Deployment.ps1`](./Post-Deployment.ps1) | Prepares newly deployed HP or Dell computers, services vendor drivers/firmware, installs PaperCut and Action1, removes Copilot through the shared module, refreshes `C:\Scripts`, registers tasks, activates Office LTSC 2024 when present, updates applications and Windows, and optionally reboots. |
+| [`00_Update-Scripts-FromShare.ps1`](./00_Update-Scripts-FromShare.ps1) | Manifest-driven, self-updating synchronization of approved files from the configured primary or fallback deployment share; validates syntax and hashes, creates rollback copies, retires superseded files, and reconciles scheduled tasks. |
+| [`01_Enable_Windows_Update_Services.ps1`](./01_Enable_Windows_Update_Services.ps1) | Bootstraps the current package, restores Windows Update services/tasks/policies, verifies service recovery, applies standard Windows UI configuration, and can reboot when critical update services cannot be recovered. |
+| [`02_Remove_User_Profiles.ps1`](./02_Remove_User_Profiles.ps1) | Removes eligible stale user profiles with protected-profile, loaded-profile, age, timeout, and disk-space safeguards; applies the standard Windows 11 user environment. Copilot and Edge ownership have moved to Script 04. |
+| [`03_Weekend_Apps_Update.ps1`](./03_Weekend_Apps_Update.ps1) | Inventories available application upgrades, updates supported packages through WinGet, handles pinned/unknown packages according to switches, services Office Click-to-Run, and publishes per-application results. |
+| [`04_Sunday_Lab_Application_Maintenance.ps1`](./04_Sunday_Lab_Application_Maintenance.ps1) | Consolidated Sunday application/configuration runner: restore point, printing, Office migration/activation, Edge InPrivate, Elastic Agent, browser defaults/homepages, Adobe lab policy, Stellarium location, startup allowlist, and final Copilot cleanup. Honorlock remains embedded but disabled because GPO owns it. |
+| [`05_Weekend_HP_Drivers_Update.ps1`](./05_Weekend_HP_Drivers_Update.ps1) | Vendor-aware HP/Dell maintenance with safe driver filtering, HPIA/DCU workflows, HP BIOS Internet-update policy, AV scheduled power-on, Dell Wake-on-LAN validation, Dell cleanup of orphaned HP software, and hardware/driver telemetry. |
+| [`06_Weekend_Windows_Updates.ps1`](./06_Weekend_Windows_Updates.ps1) | Installs Microsoft/Windows updates with PSWindowsUpdate, optionally resets Windows Update components, compares pre/post compliance, records detailed results, and reports—but does not itself perform—the required reboot. |
+| [`07_Force_Reboot_Install_Updates.ps1`](./07_Force_Reboot_Install_Updates.ps1) | Coordinates a persistent, verified multi-reboot cycle; supports scheduled, startup-resume, maintenance-closeout, and final-verification modes; records the source of persistent reboot flags. |
+| [`08_System_Repair.ps1`](./08_System_Repair.ps1) | Performs DISM/SFC, storage, WMI, RPC, Explorer, Windows Update, management-agent, disk-usage, and cleanup diagnostics/repairs. It is the sole owner of log consolidation, telemetry rotation, `C:\Temp` cleanup, and expired-log retention. |
+| [`09_Disable_Windows_Update_Services.ps1`](./09_Disable_Windows_Update_Services.ps1) | Applies and verifies the post-maintenance Windows Update service, scheduled-task, and registry-policy state. |
+| [`10_Sync_System_Time.ps1`](./10_Sync_System_Time.ps1) | Detects domain or standalone time mode, configures Windows Time, safely restarts/resynchronizes it, validates offset/source/stratum, and publishes recent time-service evidence. |
+| [`14_Endpoint_Health_Inventory.ps1`](./14_Endpoint_Health_Inventory.ps1) | Produces the authoritative endpoint snapshot: hardware, OS, BIOS settings/version, warranty, security, networking, drivers, health findings, remediation candidates, normalized software records, and uninstall tombstones. |
+| [`16_Check_Deep_Freeze_Status.ps1`](./16_Check_Deep_Freeze_Status.ps1) | Uses the Faronics CLI to report Frozen, Thawed, Unknown, or NotInstalled state and tracks how long the current state has persisted. |
+| [`Repair-MicrosoftEdgeUpdate.ps1`](./Repair-MicrosoftEdgeUpdate.ps1) | Detection-first Edge Update repair for the fixed `MicrosoftEdgeUpdateRepair` remediation class; verifies policy, services, tasks, updater state, and optional signed Enterprise MSI repair. |
+
+### Administrative, framework, and validation files
 
 | File | Purpose |
 |---|---|
-| [`Post-Deployment.ps1`](./Post-Deployment.ps1) | Prepares newly deployed HP and Dell endpoints, installs required agents, removes Microsoft Copilot through the shared module, refreshes the maintenance package, activates Office LTSC 2024, and runs initial updates. |
-| [`00_Update-Scripts-FromShare.ps1`](./00_Update-Scripts-FromShare.ps1) | Synchronizes the approved maintenance package from the primary or fallback share, validates PowerShell files, preserves rollback copies, retires replaced scripts, and reconciles scheduled tasks. |
-| [`01_Enable_Windows_Update_Services.ps1`](./01_Enable_Windows_Update_Services.ps1) | Restores Windows Update services, scheduled tasks, policy settings, and required Windows configuration before the update stages begin. |
-| [`02_Remove_User_Profiles.ps1`](./02_Remove_User_Profiles.ps1) | Removes eligible stale local profiles, enforces the standard lab UI, and runs the canonical Microsoft Copilot removal routine. |
-| [`03_Weekend_Apps_Update.ps1`](./03_Weekend_Apps_Update.ps1) | Updates applications through WinGet and services Microsoft Office Click-to-Run before driver and operating-system maintenance. |
-| [`04_Sunday_Lab_Application_Maintenance.ps1`](./04_Sunday_Lab_Application_Maintenance.ps1) | Creates and verifies the weekly restore point, runs consolidated application/configuration maintenance, and enforces the approved Windows startup-app allowlist for existing and future profiles. |
-| [`05_Weekend_HP_Drivers_Update.ps1`](./05_Weekend_HP_Drivers_Update.ps1) | Performs supported HP and Dell driver and firmware maintenance, with safeguards around sensitive storage-related driver categories. |
-| [`06_Weekend_Windows_Updates.ps1`](./06_Weekend_Windows_Updates.ps1) | Installs Windows Updates in two Sunday passes and records detailed compliance, result, and reboot telemetry. |
-| [`07_Force_Reboot_Install_Updates.ps1`](./07_Force_Reboot_Install_Updates.ps1) | Coordinates as many as three planned reboot/update cycles and resumes verification at startup. |
-| [`08_System_Repair.ps1`](./08_System_Repair.ps1) | Runs Windows image, file-system, disk, service, management-agent, and cleanup diagnostics and repairs; cleans expired maintenance logs, `C:\Temp`, and retired HP BIOS staging; Copilot removal remains an explicit opt-in fallback. |
-| [`09_Disable_Windows_Update_Services.ps1`](./09_Disable_Windows_Update_Services.ps1) | Applies the college's post-maintenance Windows Update service, policy, and scheduled-task state. |
-| [`10_Sync_System_Time.ps1`](./10_Sync_System_Time.ps1) | Synchronizes system time and runs independently every four hours. |
-| [`14_Endpoint_Health_Inventory.ps1`](./14_Endpoint_Health_Inventory.ps1) | Captures the endpoint's final weekly health and compliance inventory after the other Sunday stages finish. |
-| [`16_Check_Deep_Freeze_Status.ps1`](./16_Check_Deep_Freeze_Status.ps1) | Records Frozen, Thawed, or Unknown Deep Freeze state each Monday at 7:00 AM, running after a missed start when necessary. |
-| [`Repair-MicrosoftEdgeUpdate.ps1`](./Repair-MicrosoftEdgeUpdate.ps1) | Performs purpose-built, detection-first Microsoft Edge Update servicing repair for future allowlisted Elastic/n8n remediation; it is deployed but not scheduled. |
+| [`Register-Tasks_SYSTEM.ps1`](./Register-Tasks_SYSTEM.ps1) | Idempotently creates and repairs the approved SYSTEM scheduled tasks, removes obsolete task names and retired-script references, and publishes reconciliation telemetry. |
+| [`Invoke-MaintenanceScript.ps1`](./Invoke-MaintenanceScript.ps1) | Allowlisted launcher that maps a fixed `ActionId` to an approved script and fixed arguments; enforces policy, dependencies, execution locking, remediation metadata, and maintenance windows. |
+| [`Get-MaintenanceFleetStatus.ps1`](./Get-MaintenanceFleetStatus.ps1) | Reads endpoint status documents from configured fleet-status shares and produces an operator-friendly fleet summary. |
+| [`Update-DeploymentManifest.ps1`](./Update-DeploymentManifest.ps1) | Rebuilds `DeploymentManifest.json`, extracts versions, calculates hashes, preserves required ordering/metadata, and writes the manifest safely. |
+| [`Test-AllMaintenanceScripts.ps1`](./Test-AllMaintenanceScripts.ps1) | Parses every `.ps1` and `.psm1` in a selected source directory and exits nonzero if any PowerShell parser error is found. |
+| [`Test-MaintenanceTelemetry.ps1`](./Test-MaintenanceTelemetry.ps1) | Concurrently stress-tests NDJSON telemetry writes and rotation, then reports invalid JSON lines and created archives. Use only as a controlled validation test. |
+| [`Maintenance.Framework.psm1`](./Maintenance.Framework.psm1) | Shared initialization, logging, telemetry, event-log, retention, policy, maintenance-window, dependency, lock, and fleet-status functions. |
+| [`Maintenance.Copilot.psm1`](./Maintenance.Copilot.psm1) | Canonical Copilot removal and prevention implementation used by Script 04, Script 08 when explicitly enabled, and post-deployment. |
+| [`Maintenance.Policy.json`](./Maintenance.Policy.json) | Central policy for windows, dependencies, locks, retention, fleet-status paths, and launcher behavior. |
+| [`SoftwareInventory.Policy.json`](./SoftwareInventory.Policy.json) | Defines which non-system applications Script 14 tracks, exclusions for Windows/runtime components, canonical product names/categories, and snapshot retention. |
+| [`DeploymentManifest.json`](./DeploymentManifest.json) | Version and SHA-256 inventory of managed deployment files. |
+| [`BUILD-VALIDATION.json`](./BUILD-VALIDATION.json) | Records package-level structural validation and whether Windows PowerShell parser validation is still required. |
+| [`SHA256SUMS.txt`](./SHA256SUMS.txt) | Human-readable checksum list for repository artifacts. |
+| [`README-Maintenance-Framework.txt`](./README-Maintenance-Framework.txt) | Focused operational notes for the shared maintenance framework. |
 
 ## Detailed script descriptions
 
 ### `Post-Deployment.ps1`
 
-Runs the initial deployment workflow before the numbered maintenance schedule takes over. It supports HP and Dell driver, BIOS, and firmware servicing; refreshes `C:\Scripts`; registers scheduled tasks; installs PaperCut Print Deploy and Action1; checks Office LTSC 2024 activation; updates applications and Windows; and records an isolated result for every section.
+Runs a section-isolated initial deployment workflow. It detects HP or Dell hardware; performs supported vendor driver, BIOS, and firmware work; temporarily adjusts power behavior; suspends BitLocker when required for vendor firmware; installs PaperCut Print Deploy and Action1; removes Copilot; refreshes the local maintenance folder; executes task registration; checks and activates installed Office LTSC 2024; updates WinGet applications and Windows; and optionally reboots. A failure in one section is logged without preventing later sections from running.
 
-Microsoft Copilot removal loads `Maintenance.Copilot.psm1` directly from the configured central share, so the target computer does not need to have `C:\Scripts` beforehand. The public copy uses placeholder server and share paths; replace them only in the protected operational copy.
+The public copy intentionally uses placeholder deployment paths. Do not commit production enrollment data, credentials, or private share information.
 
 ### `00_Update-Scripts-FromShare.ps1`
 
-The manifest-driven updater maintains `C:\Scripts` from the college deployment share. It prefers `\\SERVER\DeploymentShare` and uses `\\FALLBACK-SERVER\DeploymentShare` as a fallback.
-
-Major functions include:
-
-- Loads and validates `DeploymentManifest.json`.
-- Limits deployment to an explicit approved-file list.
-- Deploys selected supplemental files even while the manifest is being refreshed.
-- Compares actual source and local SHA-256 hashes.
-- Parses PowerShell files before installation and validates them again afterward.
-- Creates rollback copies before replacing existing files.
-- Updates itself last and relaunches the new version safely.
-- Runs `Register-Tasks_SYSTEM.ps1` after synchronization.
-- Cleans old staging directories and rollback folders according to retention rules.
-- Deploys `04_Sunday_Lab_Application_Maintenance.ps1` and removes the seven standalone scripts it replaces.
-
-Retired scripts are removed from `C:\Scripts` only after script 04 exists locally and passes PowerShell parser validation. Removed files are moved into the updater's rollback structure and retained for 30 days.
+The updater persists the last working source roots so a self-update does not revert to public placeholders. It validates `DeploymentManifest.json`, restricts deployment to an internal approved-file list, directly deploys critical supplemental files during manifest transitions, compares SHA-256 hashes, parses PowerShell before and after installation, rejects updater downgrades, updates itself last, and relaunches with the working source configuration. Superseded numbered scripts are retired only after Script 04 validates successfully.
 
 ### `01_Enable_Windows_Update_Services.ps1`
 
-Prepares the endpoint for the Sunday update window by restoring and validating the services, tasks, and settings required by Windows Update.
-
-The script includes:
-
-- Bootstrap synchronization through the latest script 00 before loading shared framework components.
-- Service recovery and retry handling for Windows Update-related services.
-- Validation of services such as Windows Update, BITS, Delivery Optimization, Update Orchestrator, Cryptographic Services, and Windows Installer.
-- Recovery of required Microsoft update scheduled tasks.
-- Cleanup of conflicting Windows Update policy values.
-- Windows 11 configuration enforcement used by the maintenance environment.
-- Controlled reboot handling if critical update services cannot be recovered.
-- Scheduled-task reconciliation through `Register-Tasks_SYSTEM.ps1`.
-- A consistent Sunday 1:00 AM validation time for the updater task.
+Prepares the endpoint for the maintenance window by synchronizing Script 00 first, restoring required Windows Update services and registry startup modes, enabling required update tasks, removing conflicting policy values, and retrying service startup. It records before/after service and policy state, reconciles the master schedule, and can force a controlled reboot if critical services remain unavailable.
 
 ### `02_Remove_User_Profiles.ps1`
 
-Performs the weekly local-profile cleanup stage. The script is intended to reduce stale profile accumulation on shared lab systems while protecting accounts and profiles that must remain available.
+Enumerates local profiles without using destructive broad deletion. It excludes configured accounts, system/special profiles, and loaded hives; can enforce an age threshold; measures profile sizes; removes OneDrive tasks associated with deleted profiles; maintains resumable cleanup state; limits concurrent deletion jobs; and records deleted, skipped, deferred, timed-out, and failed profiles plus recovered disk space.
 
-Eligibility is controlled by the configured age threshold and exclusions. Loaded, special, system, and explicitly protected profiles are skipped. The script records reclaimed space and before-and-after disk information in its maintenance telemetry.
-
-The script also retains legacy computer-name-based Edge InPrivate startup handling for the configured lab groups. It is the primary recurring enforcement point for Microsoft Copilot removal and calls `Maintenance.Copilot.psm1` so the same tested behavior is shared with post-deployment and system repair. Review the profile protections and Edge patterns before expanding deployment to new computer groups.
+It also applies the standard Windows 11 UI preferences to current, loaded, offline, and Default User hives. As of version 2.5.0, it no longer removes Copilot or configures Edge InPrivate; those recurring functions belong to Script 04.
 
 ### `03_Weekend_Apps_Update.ps1`
 
-Runs the general application-update phase through WinGet, including configured handling for pinned packages, unknown versions, and Microsoft Store sources. It can also initiate and wait for Microsoft Office Click-to-Run servicing. The stage runs after script 04 creates its verified restore point and completes combined lab configuration, but before device-driver and Windows Update maintenance.
+Refreshes WinGet sources, captures available-upgrade inventory, runs the general upgrade operation, and performs targeted retries where appropriate. It can include unknown versions, optionally include pinned packages or Microsoft Store sources, intentionally defers self-servicing packages such as App Installer, services Office Click-to-Run, detects pending reboot state, and writes normalized per-application before/after/failure telemetry plus a latest application-inventory file.
 
 ### `04_Sunday_Lab_Application_Maintenance.ps1`
 
-Consolidates seven former standalone scripts into one scheduled maintenance runner. Each embedded section runs in an isolated 64-bit Windows PowerShell process so duplicate helper functions, strict-mode settings, and a section's final `exit` statement cannot interfere with later work.
+Runs each major section independently so a child script's functions, strict mode, or `exit` cannot terminate the remaining workflow. Current sections are:
 
-The combined sections are:
+1. Enables System Restore, initializes shadow-copy services, creates and verifies a restore point, and removes obsolete managed restore points.
+2. Maintains the SHARP driver, PaperCut Print Deploy, and `StudentSecurePrint` connection.
+3. Detects Office products, migrates supported older perpetual/LTSC suites, and—only when Deep Freeze is installed—replaces Microsoft 365 Apps with Office LTSC 2024; verifies machine-wide activation.
+4. Starts Edge InPrivate on targeted `SSB-122-*`, `SSB-114*`, and `SSB-171*` computers while explicitly leaving autologon disabled and existing Winlogon settings unchanged.
+5. Installs, enrolls, repairs, or verifies Elastic Agent for configured computer-name prefixes.
+6. Sets `https://www.compton.edu` as the Chrome, Edge, and Firefox homepage/startup page; suppresses Chrome sign-in/onboarding/default-browser prompts; applies a supported default-associations XML that makes Chrome the handler for HTTP, HTTPS, `.htm`, and `.html`.
+7. Applies Adobe Reader/Acrobat machine policy that suppresses Pro trials, upsells, account sign-in, Document Cloud, cloud connectors, and first-run online experiences while preserving local PDF functions.
+8. Retains the embedded Honorlock installer for rollback/reference, but leaves it disabled because Group Policy owns deployment.
+9. Enables Windows Location Services for Stellarium on configured labs.
+10. Enforces the startup-app allowlist for existing users and Default User, and suppresses HP notification consumer popups without removing HP hardware-support components.
+11. Runs final Copilot cleanup after application maintenance so Copilot restored by Edge or other servicing is removed before inventory.
 
-1. System Restore enablement, verified restore-point creation, and managed retention.
-2. SHARP printer driver, PaperCut Print Deploy, and `StudentSecurePrint` connection maintenance.
-3. Microsoft Office 2024 activation-status verification and activation when required.
-4. Autologon configuration and Microsoft Edge InPrivate startup.
-5. Elastic Agent installation, enrollment, health checking, and package fallback handling.
-6. Chrome, Edge, and Firefox homepage/startup policy configuration.
-7. Honorlock Chrome extension force-install policy configuration.
-8. Windows Location Services configuration for Stellarium.
-9. Uninstalls any Microsoft Office versions that is older than 2024 edition and install 2024 LTS. Computers with Office 365 installed are skipped.
-10. Windows startup-app allowlist enforcement for existing profiles and the Default User profile.
-
-The startup allowlist leaves only `DWRCST.EXE`, `initialise.bat`, `OneDrive.exe`,
-`student.exe`, and `RtkAudUService64.exe` enabled. Other discovered Task Manager
-startup entries are disabled rather than uninstalled. This includes the Windows
-Security notification-area icon; Microsoft Defender services remain installed
-and running.
-
-The easy-to-edit configuration area near the top contains:
-
-- Autologon computer wildcard patterns.
-- Elastic Agent computer-name prefixes.
-- Honorlock computer wildcard patterns.
-- Stellarium computer wildcard patterns.
-- Approved Windows startup application names.
-- A `$true` or `$false` switch for each internal section.
-
-The current Elastic Agent prefix list covers `IB1`, `IB2`, `SSC-216`, and
-`AHB-146`. The embedded installer uses case-insensitive `StartsWith` matching,
-so Elastic prefixes must not contain wildcard characters. The public copy preserves this scope for documentation but keeps the
-Elastic section disabled and its enrollment token blank. Enable it only in the
-protected operational copy after supplying the correct Fleet configuration.
-
-The System Restore section runs first. Script 04 is scheduled before the general
-application-update stage so its restore point remains a pre-maintenance checkpoint.
-- The shared browser homepage URL.
-
-The runner continues to the next section when one section fails and produces its own combined JSON summary in addition to the preserved per-section logs and telemetry.
-
-> [!CAUTION]
-> The public GitHub copy contains blank Autologon and Elastic enrollment credentials, and those two credential-dependent sections are disabled. Configure and enable them only in the protected deployment-share copy; never commit the operational credentials to this repository.
+The current startup allowlist contains `DWRCST.EXE`, `initialise.bat`, `OneDrive.exe`, `student.exe`, `teacher.exe`, and `RtkAudUService64.exe`. Non-allowlisted startup entries are disabled, not uninstalled.
 
 ### `05_Weekend_HP_Drivers_Update.ps1`
 
-Runs the device-driver and firmware maintenance stage for supported HP and Dell systems after detecting the hardware vendor.
+Detects the hardware vendor and chooses the matching workflow. HP uses HPIA and HP CMSL; Dell uses Dell Command Update and verifies its supporting service and .NET Desktop Runtime. Normal scheduled operation permits safe unattended driver/application classes while BIOS, firmware, storage, chipset, controller, Intel RST, VMD, NVMe, and other boot-sensitive categories require explicit switches.
 
-- HP systems use HP Image Assistant, with share and Internet package fallbacks; HP CMSL maintenance is performed only on HP hardware.
-- Dell systems use Dell Command Update, with package fallback handling when required.
-- Required .NET Desktop Runtime components can be installed from the share or an approved Internet source.
-- Storage, chipset, Intel RST, VMD, and NVMe-related updates remain subject to safety controls because unattended installation of those categories can affect boot or storage availability.
+Additional platform controls include:
+
+- Idempotently disabling HP BIOS Internet/network firmware updates through the supplied BCU/password resources.
+- Setting the AV-computer scheduled power-on policy, including HP models that expose separate integer hour/minute settings.
+- Verifying Dell BIOS wired Wake-on-LAN and physical Ethernet-adapter wake settings.
+- Removing orphaned HP management/support software, services, tasks, and inactive component-driver packages from Dell images while preserving printer, scanner, and active peripheral support.
+- Recording hardware, storage, Device Manager, installed-driver, driver-change, vendor-utility, update-selection, and failure telemetry.
 
 ### `06_Weekend_Windows_Updates.ps1`
 
-Performs Windows Update installation during two scheduled passes:
-
-- The first pass installs the initially available updates.
-- The second pass runs after the planned reboot to find updates that became applicable only after the first pass or reboot.
-
-The script uses PSWindowsUpdate and publishes detailed JSON/NDJSON results, before-and-after compliance state, and reboot-required status. It records the need for a reboot but leaves reboot coordination to script 07.
+Ensures NuGet/PSWindowsUpdate prerequisites, optionally resets Windows Update components, captures Windows build/update/reboot state, installs available Microsoft updates with an operation timeout, and compares available updates before and after the run. The same script is scheduled twice; Script 07 owns reboot coordination.
 
 ### `07_Force_Reboot_Install_Updates.ps1`
 
-Coordinates as many as three planned reboot/update cycles when maintenance requires them. Persistent state and reboot-cause telemetry allow a companion startup task to run the script with `-StartupResume`, continue verification after Windows starts, and stop safely when completion criteria or the cycle limit is reached.
+Uses a durable state file and single-instance lock to prevent repeated or unverified reboot consumption. It requires a newer boot time before advancing a reboot stage, can recover an abandoned non-startup cycle, inventories pending-reboot flags and likely causes, optionally clears only approved flags, and stops after the configured maximum. Startup resume exits safely when no active cycle exists; closeout/final-verification modes do not reboot a clean computer.
 
 ### `08_System_Repair.ps1`
 
-Runs system integrity and repair checks after the Windows Update stages. Operations include DISM and SFC checks, disk and NVMe health inspection, Explorer/RPC diagnostics, temporary-file cleanup, and management-agent validation, including Action1. Safety defaults constrain disruptive repairs. Microsoft Copilot removal uses the shared canonical module and remains controlled by `-AllowCopilotRemoval`; the registered weekly task now supplies that switch for post-update enforcement. The task is given a one-hour window before final inventory so longer operations can complete.
+Runs detection-first repairs with disruptive operations controlled by switches. Major areas include DISM component-store detection/repair, SFC and CBS corruption extraction, volume scan/SpotFix/offline repair, SSD/NVMe SMART and reliability data, WMI, DNS/network reset options, RPC root-cause testing, Explorer crash/hang and shell-extension diagnostics, Search/Explorer cache repair, Action1 validation, SoftwareDistribution cleanup, and optional HP driver-only repair when CBS evidence supports it.
+
+Script 08 is also the sole cleanup owner. It consolidates old maintenance logs, prunes expired archives and Deep Freeze events, rotates oversized `Maintenance-Telemetry.ndjson`, cleans safe contents beneath `C:\Temp`, and removes retired HP BIOS staging. Reparse points and security-blocked targets are intentional skips rather than health warnings. Copilot removal remains an explicit `-AllowCopilotRemoval` fallback.
 
 ### `09_Disable_Windows_Update_Services.ps1`
 
-Applies the college's post-maintenance Windows Update configuration after both update passes have finished. It stops and disables the selected services, applies Automatic Updates policy, disables selected update tasks, and can leave BITS available when configured to do so.
+Stops and applies the approved startup state to selected Windows Update services, disables selected update tasks, writes and verifies post-maintenance policy values, captures pending reboot state, and publishes before/after service, registry, and task evidence.
 
 ### `10_Sync_System_Time.ps1`
 
-Maintains reliable system time independently of the weekly Sunday chain. `Register-Tasks_SYSTEM.ps1` creates daily triggers at:
-
-- 12:00 AM
-- 4:00 AM
-- 8:00 AM
-- 12:00 PM
-- 4:00 PM
-- 8:00 PM
+Selects domain-hierarchy or configured NTP behavior, repairs Windows Time startup/configuration, safely handles a stuck service, performs resynchronization, parses `w32tm` status/stripchart output, validates time source and offset, and publishes recent time-service events. The managed task runs every four hours.
 
 ### `14_Endpoint_Health_Inventory.ps1`
 
-Collects a final weekly endpoint snapshot after the other maintenance stages. The inventory is designed to support proactive troubleshooting, compliance reporting, and Elastic dashboards.
+Collects one fault-tolerant weekly `endpoint.health` snapshot and separate events for findings, remediation candidates, and tracked software. Major inventory areas include:
 
-Collected areas include:
+- Computer identity, hostname-derived building/lab/device ID, domain state, enclosure/chassis, serial number, system SKU, baseboard, monitors, CPU, GPU, memory modules, storage, optical drives, printers, audio devices, battery, and firmware.
+- Windows edition/build/activation, Office activation, uptime, pending reboot, performance, disk space, SMART/reliability, Defender, Firewall, BitLocker, TPM, Secure Boot, services, scheduled tasks, time synchronization, Windows Update, network adapters/routes/gateways/DNS, and management agents.
+- HP and Dell BIOS settings exported as normalized name/value rows with sensitive/password fields redacted; installed BIOS version and available-update evidence are included for fleet queries.
+- One-time, serial-bound HP CMSL and Dell TechDirect warranty snapshots normalized to common lifecycle fields. Dell credentials remain external to logs and telemetry.
+- Device Manager problems with detailed PnP and signed-driver evidence. Repeated USB Code 43 findings produce gated driver-repair candidates.
+- Application crashes/hangs and WER records with deduplication and filtering for benign servicing, Edge/Copilot crashpad, and policy-expected events.
+- Stable SHA-256 fingerprints that omit volatile timestamps, process IDs, report IDs, and versions where necessary so Elastic/n8n can determine whether the same problem remains after remediation.
+- Idempotent administrator-only WinRM configuration with a single verified service restart when settings change.
+- A locally secured Windows Autopilot hardware-hash CSV.
+- Policy-normalized non-system software inventory without `Win32_Product`. Each package produces an `endpoint.software` event; packages missing from a complete comparable run produce removal tombstones with prior RunId, previous version, reason, and removal timestamp.
 
-- CPU, memory, disk utilization, and disk health.
-- Windows edition, version, build, uptime, and last boot.
-- Pending-reboot state.
-- Device Manager problems. Present USB devices reporting Code 43 emit a stable
-  `UsbDriverRepairCandidate`; orchestration must observe the same fingerprint in at
-  least two script-14 runs before permitting script 05. Persistent failures after
-  driver maintenance and a reboot are flagged for physical device/port inspection.
-- Microsoft Defender and Windows Firewall status.
-- BitLocker, TPM, and Secure Boot state.
-- Network adapters, IP addressing, gateways, and DNS configuration.
-- Recent update state.
-- Critical system and crash events. Windows Error Reporting records are classified by
-  report type and deduplicated by `ReportId`, so servicing, Edge Update, and policy-expected
-  Copilot reports are not mislabeled as application crashes.
-- Windows component-store failures are reported separately with structured remediation
-  classifications that can support a future controlled Elastic/n8n repair workflow.
-- Every finding receives a deterministic SHA-256 fingerprint derived from the hostname,
-  category, check, and any stable device-specific identity supplied by the collector.
-- Windows failure signatures also produce `endpoint.health.remediation_candidate` events.
-  Their fingerprints exclude timestamps, report/record IDs, process IDs, and version
-  values so Elastic can determine whether the same problem remains after remediation.
-- Driver repair candidates are marked as requiring at least two detection runs before
-  an orchestration workflow should permit script 05.
-- An access-denied result while reading `CapabilityAccessManager.db-wal` metadata is
-  retained as an informational `AccessDenied` inspection state. It does not create a
-  storage-health warning because the protected/active WAL could not be measured.
-- Required service health.
-- Management and monitoring agent status.
+An access-denied result for active `CapabilityAccessManager.db-wal` inspection is recorded as informational, not storage corruption.
 
 ### `16_Check_Deep_Freeze_Status.ps1`
 
-Runs each Monday at 7:00 AM to classify Deep Freeze as Frozen, Thawed, or Unknown and retains its JSON status history for 14 days. The scheduled task uses `StartWhenAvailable`, so a computer that was off at 7:00 AM runs the check after it next becomes available. Thawed and Unknown results generate alerts; systems without Deep Freeze exit safely without unnecessary maintenance-launcher telemetry.
+Finds `DFC.exe`, queries the installed state, writes one atomic JSON event per run, updates a persistent state record, and reports `StateChanged`, `PreviousState`, `StateSinceUtc`, `ThawedSinceUtc`, `ThawedForHours`, and `ThawedForDays`. It publishes `Installed=false` for computers without Deep Freeze so current-state transforms can remove stale historical state.
+
+### `Repair-MicrosoftEdgeUpdate.ps1`
+
+Validates Edge Update policy, services, tasks, installed updater, and final servicing state. It can restart/repair services and tasks, invoke the installed updater, or use an administrator-supplied Microsoft Edge Enterprise MSI after copying it locally and verifying Microsoft Authenticode. It does not modify Edge profiles, favorites, or user data. The script writes `maintenance.remediation` telemetry and is deployed but not assigned a recurring task.
 
 ## Supporting files
 
 ### `Maintenance.Copilot.psm1`
 
-Canonical Microsoft Copilot removal module used by script 02, the script 08 post-update repair path, and Post-Deployment. It stops Copilot processes, disables related scheduled tasks and startup entries, removes standalone Copilot packages and the packaged Microsoft 365 Copilot application (`Microsoft.MicrosoftOfficeHub`), applies machine/current/offline/default-user policies, removes Copilot shortcuts, disables Edge Copilot entry points, and verifies package removal. Removing the packaged Microsoft 365 Copilot application does not uninstall the Office LTSC desktop applications.
+The sole Copilot implementation stops Copilot processes, removes the Microsoft-published system-level Win32 Copilot application, removes approved Copilot Appx/provisioned packages and `Microsoft.MicrosoftOfficeHub`, disables related startup/task entries, applies machine and current/offline/default-user policies, removes shortcuts, disables Edge Copilot entry points, cleans residual directories, and verifies the result. Removing `Microsoft.MicrosoftOfficeHub` does not uninstall Office LTSC desktop applications.
 
 ### `Maintenance.Framework.psm1`
 
-Shared PowerShell module used by the maintenance scripts. It centralizes recurring functionality such as:
-
-- Maintenance environment initialization.
-- Staged text-log creation and publication.
-- Log archival and retention.
-- Structured NDJSON telemetry writes.
-- Windows Event Log entries.
-- Fleet-status publication.
-- Common configuration and policy handling.
+Provides standardized directories, staged immutable log publication, retention/archive handling, latest JSON and NDJSON writes protected by a mutex, telemetry rotation, event-log registration, run contexts, exit codes, maintenance execution locks, policy loading, dependency/window checks, correlation IDs, and fleet-status publication.
 
 ### `Maintenance.Policy.json`
 
-Central maintenance policy consumed by the framework. It defines shared configuration such as allowed maintenance windows, dependencies, lock and log settings, fleet-status locations, and policy version information. Keep its script entries aligned whenever files are consolidated or renamed.
+Defines the shared maintenance window, dependency and execution-lock behavior, log retention/rotation, status locations, and launcher policy. Keep it synchronized with launcher and scheduled-task changes.
+
+### `SoftwareInventory.Policy.json`
+
+Controls Script 14 software normalization. It tracks non-system applications, excludes Windows updates and common runtime/framework components, maps known products into stable canonical names/categories, and defines the local inventory snapshot retention period. A policy-version change safely resets uninstall comparison to prevent false tombstones.
 
 ### `Invoke-MaintenanceScript.ps1`
 
-Allowlisted launcher used by managed scheduled tasks and future n8n remediation. New callers provide a fixed `ActionId`; each action maps locally to one script and a fixed argument list. A guarded transition mode accepts old task parameters only when the supplied path resolves directly under `C:\Scripts` and the script/argument pair exactly matches the allowlist. It then discards that path and reconstructs execution from the internal catalog. Remediation metadata is separately validated, maintenance windows and dependencies are enforced, and execution produces `maintenance.launcher` telemetry.
-
-The currently approved automated remediation action is `MicrosoftEdgeUpdateRepair`. Windows component-store and repeated driver repair can be added only after their execution modes and n8n recurrence gates are approved.
+Accepts a fixed `ActionId`, resolves it through the local allowlist, reconstructs the approved executable and arguments, checks policy/dependencies/window/lock, validates correlation and finding metadata, and emits launcher telemetry. Legacy script-path compatibility is accepted only when the path resolves directly under `C:\Scripts` and the script/argument pair exactly matches an approved action.
 
 ### `Get-MaintenanceFleetStatus.ps1`
 
-Reads and summarizes the latest maintenance status information published by managed endpoints.
+Reads the latest endpoint status JSON from the configured primary/fallback status shares and displays fleet-level script status, age, exit codes, and failure details for operators.
 
-### `Repair-MicrosoftEdgeUpdate.ps1`
+### `DeploymentManifest.json` and `Update-DeploymentManifest.ps1`
 
-Dedicated remediation for the `MicrosoftEdgeUpdateRepair` classification emitted by script 14. It validates Edge Update policy, services, scheduled tasks, the installed updater, and the final servicing state. It can optionally use an administrator-supplied Microsoft Edge Enterprise MSI, but only after copying it locally and verifying a valid Microsoft Authenticode signature. The script does not change Edge browser policies, profiles, favorites, or user data.
+The manifest lists each managed file's version and hash. The update utility validates inputs, extracts versions from scripts/modules/policy files, calculates SHA-256 values, updates package metadata, and writes the result safely. Regenerate the manifest after changing any managed file.
 
-The remediation is included in the deployment manifest but intentionally has no recurring scheduled task. It enforces the Sunday maintenance window from `Maintenance.Policy.json`, accepts correlation and finding identifiers for Elastic/n8n, and writes `maintenance.remediation` telemetry plus `Repair-MicrosoftEdgeUpdate.latest.json`.
+### Validation artifacts
 
-Example technician test outside the scheduled window:
-
-```powershell
-& 'C:\Scripts\Repair-MicrosoftEdgeUpdate.ps1' `
-    -BypassMaintenanceWindow `
-    -CorrelationId 'manual-pilot-001' `
-    -FindingFingerprint '0000000000000000000000000000000000000000000000000000000000000000' `
-    -InstallerPath '\\SERVER\DeploymentShare\Installers\MicrosoftEdge\MicrosoftEdgeEnterpriseX64.msi'
-```
-
-Allowlisted launcher example during the configured maintenance window:
-
-```powershell
-& 'C:\Scripts\Invoke-MaintenanceScript.ps1' `
-    -ActionId 'MicrosoftEdgeUpdateRepair' `
-    -CorrelationId 'n8n-edge-0001' `
-    -FindingFingerprint '0000000000000000000000000000000000000000000000000000000000000000' `
-    -AttemptNumber 1
-```
-
-### `DeploymentManifest.json`
-
-Lists files managed by the deployment package, including version and hash metadata. The source share remains authoritative, while the manifest provides package structure and traceability. Regenerate it whenever an active or retired script changes so endpoints receive the intended package.
-
-### `Update-DeploymentManifest.ps1`
-
-Regenerates or refreshes `DeploymentManifest.json` after maintenance files are added, changed, renamed, or removed.
+- `Test-AllMaintenanceScripts.ps1` provides the required Windows PowerShell parser pass.
+- `Test-MaintenanceTelemetry.ps1` validates concurrent telemetry writes and size rotation.
+- `BUILD-VALIDATION.json` records structural checks performed for a package build.
+- `SHA256SUMS.txt` permits independent checksum verification.
+- `README-Maintenance-Framework.txt` contains framework-specific operator notes.
 
 ## Scheduled task deployment
 
-### `Register-Tasks_SYSTEM.ps1`
+`Register-Tasks_SYSTEM.ps1` reconciles only Compton-managed tasks and leaves unrelated/Microsoft tasks untouched. It uses SYSTEM with highest privileges, verifies actions/triggers/settings, removes obsolete names and retired-script references, and writes `maintenance.task_reconciliation` telemetry.
 
-Creates, updates, validates, and removes Compton College maintenance tasks. It is idempotent: running it again leaves correct tasks alone and repairs only managed properties that differ.
+### Sunday schedule
 
-It manages:
-
-- Weekly Sunday task actions, arguments, and start times.
-- SYSTEM principals with highest privileges.
-- Task execution settings and time limits.
-- The system-time synchronization task.
-- The post-reboot startup-resume task.
-- The Monday 7:00 AM Deep Freeze check, including run-after-missed-start behavior.
-- Removal of obsolete task names from earlier schedules.
-- Removal of any managed task whose action references one of the retired standalone scripts.
-- Structured task-reconciliation telemetry and verification results.
-
-The script creates the following weekly schedule:
-
-| Order | Sunday time | Scheduled task | Script |
+| Order | Time | Task | Script |
 |---:|---:|---|---|
 | 1 | 1:00 AM | Check for Updated Scripts | `00_Update-Scripts-FromShare.ps1` |
 | 2 | 1:15 AM | Enable Windows Update Services | `01_Enable_Windows_Update_Services.ps1` |
@@ -331,86 +231,85 @@ The script creates the following weekly schedule:
 | 4 | 2:00 AM | Sunday Lab Application Maintenance | `04_Sunday_Lab_Application_Maintenance.ps1` |
 | 5 | 3:15 AM | Weekend Apps Update | `03_Weekend_Apps_Update.ps1` |
 | 6 | 4:15 AM | Weekend HP Drivers Update | `05_Weekend_HP_Drivers_Update.ps1` |
-| 7 | 5:15 AM | Weekend Windows Updates—First Pass | `06_Weekend_Windows_Updates.ps1` |
-| 8 | 6:15 AM | Force Reboot and Install Updates | `07_Force_Reboot_Install_Updates.ps1` |
-| 9 | 6:45 AM | Weekend Windows Updates—Second Pass | `06_Weekend_Windows_Updates.ps1` |
+| 7 | 5:15 AM | Windows Updates—First Pass | `06_Weekend_Windows_Updates.ps1` |
+| 8 | 6:15 AM | Force Reboot/Install Updates | `07_Force_Reboot_Install_Updates.ps1` |
+| 9 | 6:45 AM | Windows Updates—Second Pass | `06_Weekend_Windows_Updates.ps1` |
 | 10 | 7:45 AM | Disable Windows Update Services | `09_Disable_Windows_Update_Services.ps1` |
-| 11 | 8:00 AM | System Repair | `08_System_Repair.ps1` |
+| 11 | 8:00 AM | System Repair | `08_System_Repair.ps1 -AllowCopilotRemoval` |
 | 12 | 9:00 AM | Weekly Endpoint Health Inventory | `14_Endpoint_Health_Inventory.ps1` |
 
 Additional managed triggers:
 
-| Trigger | Task | Script and arguments |
-|---|---|---|
-| Every four hours | Sync System Time | `10_Sync_System_Time.ps1` |
-| At system startup | Resume Reboot Verification | `07_Force_Reboot_Install_Updates.ps1 -StartupResume` |
-| Monday at 7:00 AM; run after a missed start | Check Deep Freeze Status | `16_Check_Deep_Freeze_Status.ps1` |
+| Trigger | Task |
+|---|---|
+| Every four hours | `10_Sync_System_Time.ps1` |
+| At system startup | `07_Force_Reboot_Install_Updates.ps1 -StartupResume` |
+| Monday at 7:00 AM, with run-after-missed-start | `16_Check_Deep_Freeze_Status.ps1` |
 
-The System Repair task runs with `-AllowCopilotRemoval`, providing a second
-Copilot-removal pass after application and Windows Updates have completed. The
-schedule deliberately leaves larger windows around application maintenance,
-drivers, Windows Updates, and system repair. Task start times are fixed; they do
-not guarantee that an earlier task has finished, so execution duration should
-continue to be monitored through telemetry.
+Task start times are fixed and do not prove that the previous task has finished. Use telemetry to monitor duration and overlap.
 
 ## Deployment workflow
 
-1. Place the approved scripts and supporting files in `\\SERVER\DeploymentShare`.
-2. Keep the fallback share at `\\FALLBACK-SERVER\DeploymentShare` synchronized as required.
-3. Remove retired standalone scripts from the active deployment-share folder or archive them outside the managed folder.
-4. Run `Update-DeploymentManifest.ps1` after files are added, changed, renamed, or removed.
-5. Test `00_Update-Scripts-FromShare.ps1` on a pilot endpoint.
-6. Confirm that `04_Sunday_Lab_Application_Maintenance.ps1` was deployed to `C:\Scripts`.
-7. Confirm that retired files and retired scheduled tasks were removed.
-8. Review `Register-Tasks_SYSTEM.latest.json` and Task Scheduler for the expected task count and times.
-9. Expand deployment after the pilot endpoint completes successfully.
+1. Update and test files in a controlled staging location.
+2. Run `Test-AllMaintenanceScripts.ps1` with 64-bit Windows PowerShell 5.1.
+3. Run any applicable functional tests, including telemetry concurrency when framework logging changes.
+4. Copy approved files to the protected production deployment share and keep the fallback synchronized.
+5. Run `Update-DeploymentManifest.ps1` after every managed-file change.
+6. Pilot Script 00 on one endpoint and verify hashes, rollback behavior, task reconciliation, and latest JSON.
+7. Confirm retired scripts/tasks were removed and Script 04 sections reflect the intended production switches.
+8. Validate Elastic ingestion and current-state dashboards before broad deployment.
 
 ## Logging and telemetry
 
-Operational logs are normally written beneath:
+Primary local locations:
 
 ```text
+C:\Scripts
 C:\Logs
-```
-
-Shared structured telemetry is written to:
-
-```text
 C:\Logs\Maintenance-Telemetry.ndjson
+C:\ProgramData\Compton
 ```
 
-Most scripts also maintain a script-specific `*.latest.json` document containing the most recent execution state. Framework-enabled scripts stage their text logs and publish the completed log only after telemetry finalization so log ingestion receives a stable file.
+Framework-enabled scripts stage active text logs outside the Elastic-watched completed-log location, then publish the immutable file after final telemetry. Most scripts write a script-specific `*.latest.json`; selected workflows also produce YAML, atomic event JSON, or protected state/snapshot files.
 
-The combined script adds:
+Important event families include:
 
-```text
-C:\Logs\04_Sunday_Lab_Application_Maintenance.log
-C:\Logs\04_Sunday_Lab_Application_Maintenance.latest.json
-```
+- `maintenance.execution`
+- `maintenance.updater`
+- `maintenance.task_reconciliation`
+- `maintenance.launcher`
+- `maintenance.remediation`
+- `endpoint.health`
+- `endpoint.health.finding`
+- `endpoint.health.remediation_candidate`
+- `endpoint.software`
+- Deep Freeze, Office, Elastic Agent, startup allowlist, Adobe, browser, System Restore, and Copilot-specific events
+
+Script 08 owns retention and consolidation so cleanup behavior is not duplicated across application sections.
 
 ## Security considerations
 
-- Run scripts only from a trusted and access-controlled deployment share.
-- Restrict modification rights on `C:\Scripts`, the central share, manifests, framework files, and scheduled tasks.
-- Keep operational Autologon credentials and Elastic Agent enrollment information only in the protected deployment-share copy. The public GitHub copy intentionally leaves them blank and disables those sections.
-- Remember that Base64 encoding is obfuscation, not encryption.
-- Use SYSTEM only where required and keep task actions limited to approved scripts.
-- Review log and telemetry output to prevent accidental exposure of passwords, tokens, or other secrets.
-- Pilot changes before broad deployment.
-- Retain rollback copies only as long as operationally necessary and protect their permissions.
-- Treat computer-name targeting as deployment scope control, not as a security boundary.
+- Restrict write access to the production deployment share, `C:\Scripts`, manifests, policies, modules, and scheduled tasks.
+- Keep Autologon credentials, Elastic enrollment tokens, Dell TechDirect credentials, BIOS password resources, and private server paths out of the public repository.
+- The public copy must contain blank or placeholder credential values.
+- Base64 is obfuscation, not encryption.
+- Require parser validation and manifest regeneration before deployment.
+- Pilot firmware, BIOS, storage, reboot, Office migration, and repair changes before fleet rollout.
+- Treat hostname targeting as scope control, not an authorization boundary.
+- Do not broaden the launcher allowlist or automated remediation classes without review and repeat-detection safeguards.
+- Review telemetry schemas before adding fields to avoid Elastic mapping conflicts.
 
 ## Retired scripts
 
-The following scripts are retired. Seven standalone scripts were consolidated into [`04_Sunday_Lab_Application_Maintenance.ps1`](./04_Sunday_Lab_Application_Maintenance.ps1), while the former Edge MSI updater had already become a retirement stub. These files should no longer remain in `C:\Scripts`, the active deployment-share folder, `DeploymentManifest.json`, or active scheduled tasks.
+The following files are retained under [`Retired`](./Retired) for history only. They must not remain in the active share, `C:\Scripts`, the deployment manifest, or active tasks.
 
-| Retired file | Replacement |
+| Retired file | Replacement in active code |
 |---|---|
-| [`04_Update_Edge_Silent.ps1`](./Retired/04_Update_Edge_Silent.ps1) | [`Repair-MicrosoftEdgeUpdate.ps1`](./Repair-MicrosoftEdgeUpdate.ps1) plus health visibility from script 14 |
-| [`11_Install_SharpDriver_And_PaperCut.ps1`](./Retired/11_Install_SharpDriver_And_PaperCut.ps1) | SHARP printer driver, PaperCut Print Deploy, and shared printer maintenance |
-| [`12_Enable-SystemRestore-And-Create-RestorePoint.ps1`](./Retired/12_Enable-SystemRestore-And-Create-RestorePoint.ps1) | System Restore enablement, verified restore-point creation, and managed retention |
-| [`13_Configure_Autologon_And_Edge.ps1`](./Retired/13_Configure_Autologon_And_Edge.ps1) | Autologon and Edge InPrivate startup configuration |
-| [`15_Install_Elastic_Agent.ps1`](./Retired/15_Install_Elastic_Agent.ps1) | Elastic Agent installation, enrollment, and health verification |
-| [`17_Set_Browser_Homepage.ps1`](./Retired/17_Set_Browser_Homepage.ps1) | Chrome, Edge, and Firefox homepage/startup policies |
-| [`18_Install_Honorlock_Chrome_Extension.ps1`](./Retired/18_Install_Honorlock_Chrome_Extension.ps1) | Honorlock Chrome extension force-install policy |
-| [`19_Stellarium_Location_Services.ps1`](./Retired/19_Stellarium_Location_Services.ps1) | Windows Location Services configuration for Stellarium |
+| `04_Update_Edge_Silent.ps1` | `Repair-MicrosoftEdgeUpdate.ps1` plus Script 14 detection |
+| `11_Install_SharpDriver_And_PaperCut.ps1` | Script 04 printing section |
+| `12_Enable-SystemRestore-And-Create-RestorePoint.ps1` | Script 04 System Restore section |
+| `13_Configure_Autologon_And_Edge.ps1` | Script 04 Edge InPrivate section; autologon is disabled |
+| `15_Install_Elastic_Agent.ps1` | Script 04 Elastic Agent section |
+| `17_Set_Browser_Homepage.ps1` | Script 04 browser policy/default-browser section |
+| `18_Install_Honorlock_Chrome_Extension.ps1` | Group Policy; embedded Script 04 section is disabled |
+| `19_Stellarium_Location_Services.ps1` | Script 04 Stellarium section |

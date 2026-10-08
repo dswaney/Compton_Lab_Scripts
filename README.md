@@ -16,6 +16,7 @@ The active endpoint scripts are designed primarily for 64-bit Windows PowerShell
 - [Project goals](#project-goals)
 - [Repository inventory](#repository-inventory)
 - [Detailed script descriptions](#detailed-script-descriptions)
+- [Script 08 n8n repair approvals](#n8n-repair-approval-process)
 - [Supporting files](#supporting-files)
 - [Scheduled task deployment](#scheduled-task-deployment)
 - [Deployment workflow](#deployment-workflow)
@@ -50,7 +51,7 @@ The active endpoint scripts are designed primarily for 64-bit Windows PowerShell
 | [`05_Weekend_HP_Drivers_Update.ps1`](./05_Weekend_HP_Drivers_Update.ps1) | Vendor-aware HP/Dell maintenance with safe driver filtering, HPIA/DCU workflows, HP BIOS Internet-update policy, AV scheduled power-on, Dell Wake-on-LAN validation, Dell cleanup of orphaned HP software, and hardware/driver telemetry. |
 | [`06_Weekend_Windows_Updates.ps1`](./06_Weekend_Windows_Updates.ps1) | Installs Microsoft/Windows updates with PSWindowsUpdate, optionally resets Windows Update components, compares pre/post compliance, records detailed results, and reports—but does not itself perform—the required reboot. |
 | [`07_Force_Reboot_Install_Updates.ps1`](./07_Force_Reboot_Install_Updates.ps1) | Coordinates a persistent, verified multi-reboot cycle; supports scheduled, startup-resume, maintenance-closeout, and final-verification modes; records the source of persistent reboot flags. |
-| [`08_System_Repair.ps1`](./08_System_Repair.ps1) | Performs DISM/SFC, storage, WMI, RPC, Explorer, Windows Update, management-agent, disk-usage, and cleanup diagnostics/repairs. With explicit authorization it escalates persistent corruption to matching source-WIM repair and an in-place Windows repair that preserves applications, files, profiles, domain membership, and settings. |
+| [`08_System_Repair.ps1`](./08_System_Repair.ps1) | Performs DISM/SFC, storage, WMI, RPC, Explorer, Windows Update, management-agent, disk-usage, and cleanup diagnostics/repairs. Persistent corruption requires explicit opt-in plus a matching, unexpired n8n approval before source-WIM/in-place repair escalation. |
 | [`09_Disable_Windows_Update_Services.ps1`](./09_Disable_Windows_Update_Services.ps1) | Applies and verifies the post-maintenance Windows Update service, scheduled-task, and registry-policy state. |
 | [`10_Sync_System_Time.ps1`](./10_Sync_System_Time.ps1) | Detects domain or standalone time mode, configures Windows Time, safely restarts/resynchronizes it, validates offset/source/stratum, and publishes recent time-service evidence. |
 | [`14_Endpoint_Health_Inventory.ps1`](./14_Endpoint_Health_Inventory.ps1) | Produces the authoritative endpoint snapshot: hardware, OS, BIOS settings/version, warranty, security, networking, drivers, health findings, remediation candidates, normalized software records, and uninstall tombstones. |
@@ -145,7 +146,7 @@ Uses a durable state file and single-instance lock to prevent repeated or unveri
 
 Runs detection-first repairs with disruptive operations controlled by switches. Major areas include DISM component-store detection/repair, SFC and CBS corruption extraction, volume scan/SpotFix/offline repair, SSD/NVMe SMART and reliability data, WMI, DNS/network reset options, RPC root-cause testing, Explorer crash/hang and shell-extension diagnostics, Search/Explorer cache repair, Action1 validation, SoftwareDistribution cleanup, and optional HP driver-only repair when CBS evidence supports it.
 
-Component-store escalation is disabled by default. With both `-AutoRepairOnDetection` and `-AllowComponentStoreEscalation`, Script 08 first completes its ordinary online DISM/SFC workflow and repeats DISM/SFC verification. Persistent corruption then invokes `Repair-Windows-ComponentStore.ps1`, which:
+Component-store escalation is disabled by default. With `-AutoRepairOnDetection`, Script 08 first completes its ordinary online DISM/SFC workflow and repeats DISM/SFC verification. If corruption remains, escalation requires **both** `-AllowComponentStoreEscalation` and a matching, unexpired n8n approval. Missing approval, rejection, expiration, an unreadable key file, or a failed API lookup defers escalation. Once authorized, Script 08 invokes `Repair-Windows-ComponentStore.ps1`, which:
 
 1. Verifies that Deep Freeze is either not installed or explicitly reports `Thawed`.
 2. Matches the installed Windows edition, architecture, and language to the correct `install.wim` index.
@@ -157,6 +158,146 @@ Component-store escalation is disabled by default. With both `-AutoRepairOnDetec
 The in-place repair retains installed applications, user data, profiles, domain membership, and Windows settings. It refuses to launch when Deep Freeze is Frozen, its state cannot be verified, the media is older than the installed build, required setup files are missing, or free disk space is insufficient.
 
 Script 08 is also the sole cleanup owner. It consolidates old maintenance logs, prunes expired archives and Deep Freeze events, rotates oversized `Maintenance-Telemetry.ndjson`, cleans safe contents beneath `C:\Temp`, and removes retired HP BIOS staging. Reparse points and security-blocked targets are intentional skips rather than health warnings. Copilot removal remains an explicit `-AllowCopilotRemoval` fallback.
+
+#### n8n repair approval process
+
+The workflow connects endpoint repair telemetry in Elastic to a technician approval dashboard and an authenticated lookup API. Approving a request records a decision; it does not start repair remotely. Script 08 checks that decision when persistent corruption is detected again during its next eligible execution. In the current full task rotation this is normally Sunday at 08:00, within the launcher's Sunday 00:00–10:00 policy window. A targeted update preserves the endpoint's existing schedule.
+
+![Script 08 n8n workflow: request collection, approval lookup, dashboard, and decision handling](./docs/images/script08-repair-approval-workflow.png)
+
+[Open the workflow image at full size](./docs/images/script08-repair-approval-workflow.png).
+
+1. **Detect and repair normally.** Script 08 runs its online repair sequence and checks DISM/SFC again. A clean result needs no escalation approval.
+2. **Request approval when corruption remains.** Script 08 computes a SHA-256 fingerprint from the uppercase computer name, `WindowsInPlaceRepair`, and the sorted corruption signals. It looks up the exact computer/fingerprint pair. Without authorization, it emits `endpoint.remediation.approval_required` and a deferred `endpoint.remediation.result` event, and leaves escalation unstarted.
+3. **Collect requests.** The n8n schedule queries Elastic. The workflow normalizes each event and inserts only fingerprints absent from `script08_repair_approvals`. Each new row starts as `Pending`, with an expiration 14 days after the event's request timestamp.
+4. **Review and decide.** A technician opens the Basic Auth protected dashboard, enters their name, and selects Approve or Reject. The decision branch validates the form and checks that the matching row is still pending and unexpired before updating it.
+5. **Check again on the endpoint.** On the next run, Script 08 rechecks corruption and queries the approval API. It accepts only a Boolean `approved: true`, exact `Approved` status, matching computer and fingerprint, and a future `expiresAt`. All checks must pass along with the escalation switch.
+6. **Escalate in stages.** The helper tries the matching WIM source and, where applicable, Windows Update fallback. An in-place Windows repair is considered only if those stages leave corruption or fail in a way that permits escalation. Deep Freeze, media, disk-space, and other helper safeguards still apply.
+7. **Verify and report.** Script 08 publishes repair-result telemetry. A Setup handoff requiring reboot is recorded as `StartedRebootRequired`, not proof of a completed repair. The helper's SYSTEM startup task performs post-upgrade DISM/SFC verification and restores the previously enabled maintenance tasks.
+
+The fingerprint omits the run ID and timestamp so repeated reports of the same signals deduplicate. A change in the corruption signals changes the fingerprint and requires a matching decision for the new identity.
+
+##### Workflow branches and node responsibilities
+
+| Branch | Nodes and purpose |
+|---|---|
+| Request collection | `Schedule Trigger` → `Find Approval Requests` → `Normalize Approval Requests` → `Only New Fingerprints` → `Insert Pending Approval`. Read Elastic events, normalize the latest item per fingerprint, and insert new pending rows. |
+| Endpoint lookup | `Script 08 Approval Lookup` → `Validate Lookup Request` → `Lookup Request Valid` → `Get Approval Record` → `Evaluate Approval Status` → `Return Approval Status`. Invalid input uses `Reject Invalid Lookup`. |
+| Dashboard | `Script 08 Approval Dashboard` → `Get Pending Approvals` → `Build Approval Dashboard` → `Return Approval Dashboard`. Render pending rows or a visible empty-state page. |
+| Decision | `Script 08 Approval Decision` → `Validate Approval Decision` → `Approval Decision Valid` → `Get Pending Decision Record` → `Evaluate Decision Target` → `Decision Can Be Applied` → `Apply Approval Decision` → `Return to Approval Dashboard`. Invalid and stale requests use their rejection branches. |
+
+`Find Approval Requests` uses an authenticated POST to `logs-compton.maintenance-*/_search`. The collector queries the last 30 days, sorts newest first, and currently retrieves up to 100 events. Adjust collection frequency and result limits if the backlog can exceed that count. `maintenance_event.EventType` is mapped as `keyword`, so the exact term query uses that field directly:
+
+```json
+{
+  "size": 100,
+  "sort": [{ "@timestamp": { "order": "desc" } }],
+  "_source": [
+    "@timestamp",
+    "maintenance_event.RunId",
+    "maintenance_event.ComputerName",
+    "maintenance_event.ScriptVersion",
+    "maintenance_event.RemediationClass",
+    "maintenance_event.Fingerprint",
+    "maintenance_event.Status",
+    "maintenance_event.Reason",
+    "maintenance_event.Approval",
+    "maintenance_event.Repair",
+    "maintenance_event.Evidence"
+  ],
+  "query": {
+    "bool": {
+      "filter": [
+        { "term": { "maintenance_event.EventType": "endpoint.remediation.approval_required" } },
+        { "range": { "@timestamp": { "gte": "now-30d" } } }
+      ]
+    }
+  }
+}
+```
+
+`Only New Fingerprints` must check whether the fingerprint exists **across all statuses**, not just pending rows. Keep Always Output Data off for that insertion filter so an existing approved/rejected record is not inserted again. `Normalize Approval Requests` sets `repairOutcome` to `NotRun` and `corruptionStillPresent` to `true` for new requests.
+
+##### Data table and decision handling
+
+Select the **`script08_repair_approvals`** data table in every lookup, insert, dashboard, and decision data-table node.
+
+| Fields | Meaning |
+|---|---|
+| `fingerprint`, `computerName`, `runId` | Repair identity and originating execution. Fingerprints are 64 lowercase hexadecimal characters; computer names are normalized to uppercase. |
+| `requestStatus`, `requestedAt`, `lastSeenAt`, `expiresAt` | Request state and timestamps. New requests are pending and expire after 14 days from the request event. |
+| `decisionAt`, `decidedBy` | Technician decision audit. The submitted name is 2–100 characters. |
+| `reason`, `scriptVersion` | Displayed request evidence and emitting script version. |
+| `repairOutcome`, `failureDetail`, `corruptionStillPresent`, `consumedAt` | Fields reserved for repair lifecycle tracking; initial values do not establish the final repair result. |
+| `id`, `createdAt`, `updatedAt` | n8n-managed row metadata. |
+
+The decision lookup/update matches the fingerprint, computer name, and `Pending` status. The target evaluator rejects missing, stale, already-decided, or expired requests. Map only the decision's `requestStatus`, `decisionAt`, and `decidedBy` into the update. Do not overwrite identity/evidence fields with blank values or set `corruptionStillPresent` to false merely because approval was granted.
+
+The dashboard lists pending requests only, so an approved row disappears from that page. It remains in the table and can still return `approved: true` through the lookup API until expiration. This workflow currently does **not** consume approvals or automatically update table rows from repair-result events. Review final outcomes in Elastic/helper logs. Expired or rejected rows are not automatically renewed because deduplication checks all statuses; an administrator must manage a deliberate reapproval through the table/workflow. A pending row may remain visible after expiry, but the decision and endpoint expiry checks still prevent authorization.
+
+##### Webhooks, authentication, and browser responses
+
+Publish the workflow before using production URLs. The deployment uses the DNS host `n8n.compton.edu:5678`:
+
+| Method | Production URL | Authentication |
+|---|---|---|
+| GET | `http://n8n.compton.edu:5678/webhook/script08/approvals` | Basic Auth, `Script 08 Approval Administrator` credential. |
+| POST | `http://n8n.compton.edu:5678/webhook/script08/approval-decision` | The same administrator Basic Auth credential. |
+| GET | `http://n8n.compton.edu:5678/webhook/script08/approval-status` | Header Auth, `Script 08 Approval API` credential; header `x-compton-remediation-key`. |
+
+The lookup takes URL-encoded `computerName` and `fingerprint` query parameters and returns JSON with `approved`, `status`, identity, decision information, expiration, and reason. `NotFound` means the lookup succeeded but no matching record exists; it must return `approved: false`.
+
+Configure the dashboard webhook to **Using Respond to Webhook Node**. `Return Approval Dashboard` uses **Text**, body `{{ $json.html }}`, response code **200**, and header `Content-Type: text/html; charset=utf-8`. Enable Always Output Data on `Get Pending Approvals` so zero rows still reach the builder; the builder ignores the empty `{}` item and renders “No pending Script 08 repair approvals were found.”
+
+Forms and the **303** redirect after a decision must use the same DNS host as the dashboard. Build absolute URLs for the matching execution mode: `/webhook-test/` for a listening test execution and `/webhook/` for the published workflow. Do not mix the internal IP host with the DNS host. n8n's sandboxed HTML can submit `Origin: null`; the decision validation must retain its expected-host/referrer checks for that case rather than disabling request validation.
+
+Use a complete workflow test execution when checking HTML responses. Executing a single node or editing/pinning webhook output does not prove that the browser received an HTTP response. Test URLs need an active listener; an unregistered test endpoint or an unpublished production endpoint can return 404.
+
+##### Endpoint configuration and scheduled deployment
+
+Script 08 v4.9.2 reads the key on demand from **`\\filesvr\labscripts\Installers\approval-key.txt`**. Store only the API key in that file, matching the n8n Header Auth credential. No key is embedded in this repository. The script reads and trims the file; it does not create the file or change its permissions. The administrator manages share/file access separately. Validate access under SYSTEM, since an interactive administrator's access does not establish the computer account's access.
+
+| Script 08 parameter | Default |
+|---|---|
+| `ApprovalStatusUrl` | `http://n8n.compton.edu:5678/webhook/script08/approval-status` |
+| `ApprovalApiKeyPath` | `\\filesvr\labscripts\Installers\approval-key.txt` |
+| `ApprovalLookupTimeoutSeconds` | `15` seconds |
+| `ComponentStoreRepairScriptPath` | `\\filesvr\labscripts\Repair-Windows-ComponentStore.ps1` |
+| `ComponentStoreImagePath` | `\\filesvr\labscripts\Installers\25H2\sources\install.wim` |
+| `ComponentStoreSetupMediaPath` | `\\filesvr\labscripts\Installers\25H2` |
+| `ComponentStoreAdkPath` | `\\filesvr\labscripts\Installers\ADK\Deployment Tools` |
+
+The configured endpoint must be an absolute HTTP/HTTPS production `/webhook/script08/approval-status` URL with no preexisting query, fragment, or embedded credentials. Redirects are refused. An unavailable API/key, malformed response, identity mismatch, non-Boolean approval, or expired decision prevents escalation. The currently configured HTTP endpoint is intended for the protected deployment network; an HTTPS deployment can be supplied through `ApprovalStatusUrl`.
+
+Deploy Script 08 together with the updated launcher, task-registration script, and matching deployment manifest/checksums to the central package. Existing share-based distribution then installs the approved files on endpoints. Updating GitHub alone does not copy them to the deployment share or update a running n8n workflow.
+
+For an existing repair task, preview and apply only its action from an elevated Windows PowerShell session:
+
+```powershell
+Set-Location C:\Scripts
+.\Register-Tasks_SYSTEM.ps1 -SystemRepairOnly -WhatIf
+.\Register-Tasks_SYSTEM.ps1 -SystemRepairOnly
+```
+
+This mode accepts either `11. System Repair` (current package) or `12. System Repair` (older endpoint schedule), requires exactly one matching SYSTEM task, and preserves its triggers, settings, principal, and enabled state. It does not start the task. The direct action includes `-AutoRepairOnDetection -AllowComponentStoreEscalation -AllowCopilotRemoval`; Copilot removal preserves the current package's existing opt-in behavior.
+
+A full reconciliation uses `Invoke-MaintenanceScript.ps1 -ActionId SystemRepairWeekly`, whose fixed child arguments contain those same three switches. The launcher continues enforcing maintenance policy/dependencies/locking and refuses an older Script 08 without the n8n approval integration. Registration also checks that integration before enabling the repair action.
+
+##### Validation and troubleshooting
+
+The October 8 validation covered a synthetic `TEST-COMPUTER` request: insertion, dashboard review, technician approval, authenticated lookup returning `approved: true`, deletion of the test row, and a subsequent `NotFound`/`approved: false` response. A SYSTEM-context lookup confirmed that the endpoint could retrieve the shared key and call the production API. No in-place repair was run during that test.
+
+| Symptom | Check |
+|---|---|
+| Empty dashboard | Pending rows may genuinely be absent or already approved. Verify the collector's Elastic results and the selected table. |
+| Blank page | Follow the entire execution through the builder and response node; verify the Text response body, content type, and empty-row output setting. |
+| 404 after submitting | Check published/listening mode, POST path, absolute form URL, and redirect URL. |
+| Decision takes the false branch | Inspect validation and target output: identity, allowed decision, technician name, trusted request origin/referrer, pending status, and expiry. |
+| `ApprovalLookupUnavailable` | Check DNS/connectivity, production endpoint, matching Header Auth key, and shared-file readability under SYSTEM without printing the key. |
+| `NotFound` | Confirm exact computer/fingerprint identity and that collection has inserted the request. This is a successful lookup with no authorization. |
+| Approved but escalation deferred | Recheck expiry, current fingerprint, repair switches, persistent corruption, and helper prerequisites. |
+
+Windows PowerShell parser and scheduled-task validation remain required for the final package; this repository update does not claim a real corruption repair or completed Windows Setup lifecycle test.
 
 ### `09_Disable_Windows_Update_Services.ps1`
 
@@ -247,7 +388,7 @@ The manifest lists each managed file's version and hash. The update utility vali
 | 8 | 6:15 AM | Force Reboot/Install Updates | `07_Force_Reboot_Install_Updates.ps1` |
 | 9 | 6:45 AM | Windows Updates—Second Pass | `06_Weekend_Windows_Updates.ps1` |
 | 10 | 7:45 AM | Disable Windows Update Services | `09_Disable_Windows_Update_Services.ps1` |
-| 11 | 8:00 AM | System Repair | `08_System_Repair.ps1 -AllowCopilotRemoval` |
+| 11 | 8:00 AM | System Repair | `08_System_Repair.ps1 -AutoRepairOnDetection -AllowComponentStoreEscalation -AllowCopilotRemoval` |
 | 12 | 9:00 AM | Weekly Endpoint Health Inventory | `14_Endpoint_Health_Inventory.ps1` |
 
 Additional managed triggers:
@@ -302,7 +443,7 @@ Script 08 owns retention and consolidation so cleanup behavior is not duplicated
 ## Security considerations
 
 - Restrict write access to the production deployment share, `C:\Scripts`, manifests, policies, modules, and scheduled tasks.
-- Keep Autologon credentials, Elastic enrollment tokens, Dell TechDirect credentials, BIOS password resources, and private server paths out of the public repository.
+- Keep Autologon credentials, Elastic enrollment tokens, Dell TechDirect credentials, BIOS passwords, and the Script 08 approval API key out of the public repository. Site-specific Script 08 paths and the supplied workflow image document this deployment; review those settings before reuse elsewhere.
 - The public copy must contain blank or placeholder credential values.
 - Base64 is obfuscation, not encryption.
 - Require parser validation and manifest regeneration before deployment.
@@ -325,3 +466,4 @@ The following files are retained under [`Retired`](./Retired) for history only. 
 | `17_Set_Browser_Homepage.ps1` | Script 04 browser policy/default-browser section |
 | `18_Install_Honorlock_Chrome_Extension.ps1` | Group Policy; embedded Script 04 section is disabled |
 | `19_Stellarium_Location_Services.ps1` | Script 04 Stellarium section |
+

@@ -2,8 +2,9 @@
 #requires -RunAsAdministrator
 # =====================================================================
 # ScriptName:    Invoke-MaintenanceScript.ps1
-# ScriptVersion: 2.0.0
-# LastUpdated:   2026-09-21
+# ScriptVersion: 2.1.0
+# LastUpdated:   2026-10-08
+# Changes:       SystemRepairWeekly enables normal repair and n8n-gated escalation.
 # Purpose:       Executes only locally allowlisted maintenance actions with
 #                fixed script mappings and fixed arguments.
 # =====================================================================
@@ -69,7 +70,7 @@ $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 
 $script:ScriptName = 'Invoke-MaintenanceScript.ps1'
-$script:ScriptVersion = '2.0.0'
+$script:ScriptVersion = '2.1.0'
 $script:Root = 'C:\Scripts'
 $script:LogRoot = 'C:\Logs'
 $script:RunId = [guid]::NewGuid().Guid
@@ -143,7 +144,7 @@ $actionCatalog = @{
     }
     SystemRepairWeekly = [pscustomobject]@{
         ScriptName = '08_System_Repair.ps1'
-        FixedArguments = [string[]]@('-AllowCopilotRemoval')
+        FixedArguments = [string[]]@('-AutoRepairOnDetection', '-AllowComponentStoreEscalation', '-AllowCopilotRemoval')
         Kind = 'ScheduledMaintenance'
     }
     EndpointHealthInventory = [pscustomobject]@{
@@ -200,8 +201,8 @@ function Resolve-LegacyActionId {
     }
 
     if ($scriptName -eq '08_System_Repair.ps1') {
-        if ($normalizedArguments -ne '-AllowCopilotRemoval') {
-            throw "Legacy SystemRepairWeekly requires the fixed argument '-AllowCopilotRemoval'."
+        if ($normalizedArguments -notin @('-AllowCopilotRemoval', '-AutoRepairOnDetection -AllowComponentStoreEscalation -AllowCopilotRemoval')) {
+            throw 'Legacy SystemRepairWeekly arguments must match an approved fixed combination.'
         }
     }
     elseif (-not [string]::IsNullOrWhiteSpace($normalizedArguments)) {
@@ -324,6 +325,14 @@ try {
 
     if (-not (Test-Path -LiteralPath $resolvedTarget -PathType Leaf)) {
         throw "Allowlisted target script is missing: $resolvedTarget"
+    }
+
+    if ($ActionId -eq 'SystemRepairWeekly') {
+        $repairContent = Get-Content -LiteralPath $resolvedTarget -Raw -ErrorAction Stop
+        if ($repairContent -notmatch 'function Test-WindowsInPlaceRepairApproval' -or
+            $repairContent -notmatch 'ApprovedByN8n') {
+            throw 'SystemRepairWeekly requires approval-integrated Script 08 v4.9.2 or newer.'
+        }
     }
 
     $window = Test-MaintenanceWindow -ScriptName $script:TargetScriptName -Policy $policy

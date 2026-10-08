@@ -1,11 +1,17 @@
 ﻿# =====================================================================
 # ScriptName: 08_System_Repair.ps1
-# ScriptVersion: 4.7.0
-# LastUpdated: 2026-10-07
-# Changes: v4.7.0 adds guarded component-store escalation. After the normal
+# ScriptVersion: 4.9.2
+# LastUpdated: 2026-10-08
+# Changes: v4.9.2 reads approval-key.txt from the central Installers share.
+#          File permissions are managed separately by the administrator.
+# Previous: v4.9.0 requires a matching, unexpired n8n approval in addition to
+#          AllowComponentStoreEscalation; lookup failures defer escalation.
+# Previous: v4.7.0 adds guarded component-store escalation. After the normal
 #          online DISM/SFC workflow, Script 08 verifies the component store and
 #          system files again. If corruption remains and the explicit opt-in is
 #          enabled, it stages and launches Repair-Windows-ComponentStore.ps1.
+#          v4.9.2 publishes mapping-safe approval-request and repair-result
+#          events for the WindowsInPlaceRepair remediation workflow.
 #          That helper automatically selects the matching install.wim index,
 #          tries source-WIM repair, and can perform an in-place Windows repair
 #          that preserves applications, files, profiles, domain membership,
@@ -67,11 +73,14 @@ param(
     [string]$HpImageAssistantSourcePath = '\\SERVER\DeploymentShare\HPImageAssistant',
     [string]$HpImageAssistantLocalPath = 'C:\ProgramData\SystemRepair\HPImageAssistant',
     [switch]$AllowComponentStoreEscalation = $false,
-    [string]$ComponentStoreRepairScriptPath = '\\SERVER\DeploymentShare\Repair-Windows-ComponentStore.ps1',
+    [string]$ApprovalStatusUrl = 'http://n8n.compton.edu:5678/webhook/script08/approval-status',
+    [string]$ApprovalApiKeyPath = '\\filesvr\labscripts\Installers\approval-key.txt',
+    [ValidateRange(1,120)][int]$ApprovalLookupTimeoutSeconds = 15,
+    [string]$ComponentStoreRepairScriptPath = '\\filesvr\labscripts\Repair-Windows-ComponentStore.ps1',
     [string]$ComponentStoreRepairLocalPath = 'C:\ProgramData\Compton\SystemRepair\Repair-Windows-ComponentStore.ps1',
-    [string]$ComponentStoreImagePath = '\\SERVER\DeploymentShare\Installers\25H2\sources\install.wim',
-    [string]$ComponentStoreSetupMediaPath = '\\SERVER\DeploymentShare\Installers\25H2',
-    [string]$ComponentStoreAdkPath = '\\SERVER\DeploymentShare\Installers\ADK\Deployment Tools',
+    [string]$ComponentStoreImagePath = '\\filesvr\labscripts\Installers\25H2\sources\install.wim',
+    [string]$ComponentStoreSetupMediaPath = '\\filesvr\labscripts\Installers\25H2',
+    [string]$ComponentStoreAdkPath = '\\filesvr\labscripts\Installers\ADK\Deployment Tools',
     [switch]$AllowCopilotRemoval = $false,
     [switch]$AggressiveCleanup = $false,
     [switch]$ClearEventLogs = $false,
@@ -87,7 +96,7 @@ param(
 $ErrorActionPreference = 'Stop'
 
 $script:ScriptName = '08_System_Repair.ps1'
-$script:ScriptVersion = '4.7.0'
+$script:ScriptVersion = '4.9.2'
 $script:RunId = [guid]::NewGuid().Guid
 $script:TelemetryNdjsonPath = Join-Path $LogDirectory 'Maintenance-Telemetry.ndjson'
 $script:LatestTelemetryPath = Join-Path $LogDirectory '08_System_Repair.latest.json'
@@ -139,7 +148,12 @@ $script:Summary = [ordered]@{
     HpImageAssistantPath         = $null
     ComponentStoreEscalationAttempted = $false
     ComponentStoreEscalationExitCode = $null
-    InPlaceRepairAuthorized      = [bool]$AllowComponentStoreEscalation
+    InPlaceRepairAuthorized      = $false
+    InPlaceRepairRequired        = $false
+    InPlaceRepairFingerprint     = $null
+    InPlaceRepairApprovalStatus  = 'NotRequired'
+    InPlaceRepairOutcome         = 'NotRun'
+    InPlaceRepairResultPublished = $false
     WmiRepositoryInconsistent    = $false
     StorageHealthWarnings        = 0
     StorageFailurePredicted      = $false
@@ -158,6 +172,7 @@ $script:Summary = [ordered]@{
 }
 
 $script:DetailedResults = New-Object System.Collections.Generic.List[object]
+$script:RemediationTelemetryEvents = New-Object System.Collections.Generic.List[object]
 
 # Load the shared framework from the same directory as this script.
 $MaintenanceFrameworkPath = 'C:\Scripts\Maintenance.Framework.psm1'
@@ -3146,42 +3161,259 @@ function Invoke-SystemFileRepairWorkflow {
     }
 }
 
+function Get-WindowsInPlaceRepairFingerprint {
+    [CmdletBinding()]
+    param()
+
+    $corruptionSignals = @()
+    if ($script:Summary.DismCorruptionDetected) { $corruptionSignals += 'DISM' }
+    if ($script:Summary.SfcIntegrityViolations) { $corruptionSignals += 'SFC' }
+    if ($script:Summary.CbsDriverCorruptionRemaining) { $corruptionSignals += 'CBSDriver' }
+    if ($corruptionSignals.Count -eq 0) { $corruptionSignals += 'ComponentStore' }
+
+    $identity = '{0}|WindowsInPlaceRepair|{1}' -f `
+        ([string]$script:ComputerName).Trim().ToUpperInvariant(),
+        (($corruptionSignals | Sort-Object -Unique) -join ',')
+
+    $sha256 = [System.Security.Cryptography.SHA256]::Create()
+    try {
+        $bytes = [System.Text.Encoding]::UTF8.GetBytes($identity)
+        return (($sha256.ComputeHash($bytes) | ForEach-Object { $_.ToString('x2') }) -join '')
+    }
+    finally {
+        $sha256.Dispose()
+    }
+}
+
+function Write-WindowsInPlaceRepairEvent {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [ValidateSet('ApprovalRequired','RepairResult')]
+        [string]$EventKind,
+
+        [Parameter(Mandatory)]
+        [string]$Status,
+
+        [Parameter(Mandatory)]
+        [string]$Reason,
+
+        [AllowNull()]
+        [Nullable[int]]$ExitCode,
+
+        [AllowNull()]
+        [Nullable[bool]]$CorruptionStillPresent,
+
+        [AllowNull()]
+        [string]$FailureDetail
+    )
+
+    try {
+        Ensure-LogDirectory
+
+        if ([string]::IsNullOrWhiteSpace([string]$script:Summary.InPlaceRepairFingerprint)) {
+            $script:Summary.InPlaceRepairFingerprint = Get-WindowsInPlaceRepairFingerprint
+        }
+
+        $windowsBuild = Get-WindowsBuildTelemetry
+        $eventType = if ($EventKind -eq 'ApprovalRequired') {
+            'endpoint.remediation.approval_required'
+        }
+        else {
+            'endpoint.remediation.result'
+        }
+
+        $event = [PSCustomObject][ordered]@{
+            '@timestamp'       = (Get-Date).ToUniversalTime().ToString('o')
+            EventType          = $eventType
+            SchemaVersion      = '1.0'
+            RunId              = $script:RunId
+            ComputerName       = $script:ComputerName
+            ScriptName         = $script:ScriptName
+            ScriptVersion      = $script:ScriptVersion
+            RemediationClass   = 'WindowsInPlaceRepair'
+            Fingerprint        = [string]$script:Summary.InPlaceRepairFingerprint
+            FingerprintVersion = '1'
+            Status             = $Status
+            Reason             = $Reason
+            Approval = [ordered]@{
+                Required   = [bool]$script:Summary.InPlaceRepairRequired
+                Authorized = [bool]$script:Summary.InPlaceRepairAuthorized
+                Status     = [string]$script:Summary.InPlaceRepairApprovalStatus
+            }
+            Repair = [ordered]@{
+                Attempted               = [bool]$script:Summary.ComponentStoreEscalationAttempted
+                Outcome                 = [string]$script:Summary.InPlaceRepairOutcome
+                ExitCode                = $ExitCode
+                CorruptionStillPresent  = $CorruptionStillPresent
+                DismCorruptionDetected  = [bool]$script:Summary.DismCorruptionDetected
+                SfcIntegrityViolations  = [bool]$script:Summary.SfcIntegrityViolations
+                RebootRequired          = [bool]$script:Summary.RebootRequired
+                FailureDetail           = $FailureDetail
+                HelperLogDirectory      = $LogDirectory
+            }
+            Evidence = [ordered]@{
+                RepairsAttempted = @($script:Summary.RepairsAttempted | Select-Object -Unique | ForEach-Object { [string]$_ })
+                CbsCorruptFileCount = [int]$script:Summary.CbsCorruptFileCount
+                WindowsEdition     = [string]$windowsBuild.EditionId
+                WindowsDisplayVersion = [string]$windowsBuild.DisplayVersion
+                WindowsBuild       = [string]$windowsBuild.Build
+                TextLogPath        = if (-not [string]::IsNullOrWhiteSpace($script:PublishedTextLogPath)) {
+                    $script:PublishedTextLogPath
+                }
+                else {
+                    $script:TextLogPath
+                }
+            }
+        }
+
+        $script:RemediationTelemetryEvents.Add($event) | Out-Null
+        Write-Log ("Queued {0} event for remediation class WindowsInPlaceRepair. Status={1}; Fingerprint={2}" -f `
+            $eventType,
+            $Status,
+            $script:Summary.InPlaceRepairFingerprint) 'INFO'
+    }
+    catch {
+        Write-Log "Unable to publish WindowsInPlaceRepair $EventKind telemetry: $($_.Exception.Message)" 'WARN'
+    }
+}
+
+function Write-QueuedWindowsInPlaceRepairEvents {
+    [CmdletBinding()]
+    param()
+
+    if ($null -eq $script:RemediationTelemetryEvents -or $script:RemediationTelemetryEvents.Count -eq 0) {
+        return
+    }
+
+    $eventsToWrite = @($script:RemediationTelemetryEvents)
+    foreach ($event in $eventsToWrite) {
+        try {
+            $json = $event | ConvertTo-Json -Depth 10 -Compress
+            Write-MaintenanceTelemetryLine -Path $script:TelemetryNdjsonPath -JsonLine $json
+            Write-Log ("Published {0} event for remediation class WindowsInPlaceRepair. Status={1}; Fingerprint={2}" -f `
+                $event.EventType,
+                $event.Status,
+                $event.Fingerprint) 'INFO'
+        }
+        catch {
+            Write-Log "Unable to publish queued WindowsInPlaceRepair telemetry: $($_.Exception.Message)" 'WARN'
+        }
+    }
+
+    $script:RemediationTelemetryEvents.Clear()
+}
+
+function Test-WindowsInPlaceRepairApproval {
+    [CmdletBinding()]
+    param()
+
+    # Read on demand; never write the API key or HTTP error body to telemetry.
+    $apiKey = $null
+    try {
+        $endpoint = [uri]$ApprovalStatusUrl
+        if (-not $endpoint.IsAbsoluteUri -or $endpoint.Scheme -notin @('http','https') -or
+            $endpoint.AbsolutePath -ne '/webhook/script08/approval-status' -or
+            $endpoint.Query -or $endpoint.Fragment -or $endpoint.UserInfo) {
+            throw 'Invalid production approval endpoint.'
+        }
+        $apiKey = (Get-Content -LiteralPath $ApprovalApiKeyPath -Raw -ErrorAction Stop).Trim()
+        if ([string]::IsNullOrWhiteSpace($apiKey) -or $apiKey -match '[\r\n]') {
+            throw 'Missing or invalid approval key.'
+        }
+        $computer = ([string]$script:ComputerName).Trim().ToUpperInvariant()
+        $fingerprint = [string]$script:Summary.InPlaceRepairFingerprint
+        $lookupUri = '{0}?computerName={1}&fingerprint={2}' -f $endpoint.AbsoluteUri,
+            [uri]::EscapeDataString($computer), [uri]::EscapeDataString($fingerprint)
+        $response = Invoke-RestMethod -Method Get -Uri $lookupUri -Headers @{
+            'x-compton-remediation-key' = $apiKey
+        } -TimeoutSec $ApprovalLookupTimeoutSeconds -MaximumRedirection 0 -ErrorAction Stop
+
+        $expiry = [DateTimeOffset]::MinValue
+        $expiryValid = [DateTimeOffset]::TryParse([string]$response.expiresAt, [ref]$expiry)
+        $approved = ($response.approved -is [bool]) -and ($response.approved -eq $true) -and
+            ([string]$response.status -ceq 'Approved') -and
+            ([string]$response.computerName -ceq $computer) -and
+            ([string]$response.fingerprint -ceq $fingerprint) -and
+            $expiryValid -and ($expiry -gt [DateTimeOffset]::UtcNow)
+        if ($approved) {
+            $script:Summary.InPlaceRepairApprovalStatus = 'ApprovedByN8n'
+            Write-Log 'APPROVAL_LOOKUP|Status=Approved|IdentityMatched=True|Unexpired=True' 'INFO'
+            return $true
+        }
+        $script:Summary.InPlaceRepairApprovalStatus = 'ApprovalNotGranted'
+        Write-Log 'APPROVAL_LOOKUP|Status=NotGranted|NextStep=ReviewApprovalDashboard' 'WARN'
+        return $false
+    }
+    catch {
+        $script:Summary.InPlaceRepairApprovalStatus = 'ApprovalLookupUnavailable'
+        Write-Log 'APPROVAL_LOOKUP|Status=Unavailable|RepairDeferred=True|Check=Endpoint,KeyFile,Connectivity' 'WARN'
+        return $false
+    }
+    finally { $apiKey = $null }
+}
+
 function Invoke-ComponentStoreEscalation {
     [CmdletBinding()]
     param()
 
-    $script:Summary.ComponentStoreEscalationAttempted = $true
+    $script:Summary.ComponentStoreEscalationAttempted = $false
+    $script:Summary.InPlaceRepairAuthorized = $false
+    $script:Summary.InPlaceRepairRequired = $true
+    $script:Summary.InPlaceRepairFingerprint = Get-WindowsInPlaceRepairFingerprint
 
-    if (-not $AllowComponentStoreEscalation) {
-        Write-Log 'COMPONENT_STORE_ESCALATION|Status=Skipped|Reason=AllowComponentStoreEscalationDisabled|NextStep=Run with -AllowComponentStoreEscalation after confirming the maintenance window.' 'WARN'
+    $approvalGranted = Test-WindowsInPlaceRepairApproval
+    if (-not $AllowComponentStoreEscalation -or -not $approvalGranted) {
+        $script:Summary.InPlaceRepairOutcome = 'DeferredAwaitingApproval'
+        Write-Log 'COMPONENT_STORE_ESCALATION|Status=Deferred|Requires=ExplicitOptInAndValidN8nApproval' 'WARN'
         Add-DetailedResult -Step 'ComponentStoreEscalation' -Status 'Skipped' -Message 'Persistent corruption remains, but source-WIM and in-place repair escalation is not authorized.'
+        Write-WindowsInPlaceRepairEvent `
+            -EventKind ApprovalRequired `
+            -Status 'AwaitingApproval' `
+            -Reason 'Persistent component-store or system-file corruption remains after the approved online repair sequence.' `
+            -ExitCode $null `
+            -CorruptionStillPresent $true `
+            -FailureDetail $null
+        Write-WindowsInPlaceRepairEvent `
+            -EventKind RepairResult `
+            -Status 'DeferredAwaitingApproval' `
+            -Reason 'Escalation requires both explicit opt-in and a matching, unexpired n8n approval.' `
+            -ExitCode $null `
+            -CorruptionStillPresent $true `
+            -FailureDetail $null
+        $script:Summary.InPlaceRepairResultPublished = $true
         return
     }
 
-    if (-not (Test-Path -LiteralPath $ComponentStoreRepairScriptPath -PathType Leaf)) {
-        throw "Component-store escalation helper was not found: $ComponentStoreRepairScriptPath"
-    }
-    if (-not (Test-Path -LiteralPath $ComponentStoreImagePath -PathType Leaf)) {
-        throw "Component-store repair image was not found: $ComponentStoreImagePath"
-    }
-    if (-not (Test-Path -LiteralPath (Join-Path $ComponentStoreSetupMediaPath 'setup.exe') -PathType Leaf)) {
-        throw "Expanded Windows setup media is missing setup.exe: $ComponentStoreSetupMediaPath"
-    }
+    $script:Summary.InPlaceRepairAuthorized = $true
+    $script:Summary.ComponentStoreEscalationAttempted = $true
 
-    $localParent = Split-Path -Path $ComponentStoreRepairLocalPath -Parent
-    if (-not (Test-Path -LiteralPath $localParent -PathType Container)) {
-        New-Item -Path $localParent -ItemType Directory -Force -ErrorAction Stop | Out-Null
-    }
-    Copy-Item -LiteralPath $ComponentStoreRepairScriptPath -Destination $ComponentStoreRepairLocalPath -Force -ErrorAction Stop
+    try {
 
-    $localHash = (Get-FileHash -LiteralPath $ComponentStoreRepairLocalPath -Algorithm SHA256 -ErrorAction Stop).Hash
-    $sourceHash = (Get-FileHash -LiteralPath $ComponentStoreRepairScriptPath -Algorithm SHA256 -ErrorAction Stop).Hash
-    if ($localHash -ne $sourceHash) {
-        throw 'The locally staged component-store repair helper failed SHA-256 verification.'
-    }
+        if (-not (Test-Path -LiteralPath $ComponentStoreRepairScriptPath -PathType Leaf)) {
+            throw "Component-store escalation helper was not found: $ComponentStoreRepairScriptPath"
+        }
+        if (-not (Test-Path -LiteralPath $ComponentStoreImagePath -PathType Leaf)) {
+            throw "Component-store repair image was not found: $ComponentStoreImagePath"
+        }
+        if (-not (Test-Path -LiteralPath (Join-Path $ComponentStoreSetupMediaPath 'setup.exe') -PathType Leaf)) {
+            throw "Expanded Windows setup media is missing setup.exe: $ComponentStoreSetupMediaPath"
+        }
 
-    $powerShell = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
-    $arguments = @(
+        $localParent = Split-Path -Path $ComponentStoreRepairLocalPath -Parent
+        if (-not (Test-Path -LiteralPath $localParent -PathType Container)) {
+            New-Item -Path $localParent -ItemType Directory -Force -ErrorAction Stop | Out-Null
+        }
+        Copy-Item -LiteralPath $ComponentStoreRepairScriptPath -Destination $ComponentStoreRepairLocalPath -Force -ErrorAction Stop
+
+        $localHash = (Get-FileHash -LiteralPath $ComponentStoreRepairLocalPath -Algorithm SHA256 -ErrorAction Stop).Hash
+        $sourceHash = (Get-FileHash -LiteralPath $ComponentStoreRepairScriptPath -Algorithm SHA256 -ErrorAction Stop).Hash
+        if ($localHash -ne $sourceHash) {
+            throw 'The locally staged component-store repair helper failed SHA-256 verification.'
+        }
+
+        $powerShell = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+        $arguments = @(
         '-NoProfile',
         '-NonInteractive',
         '-ExecutionPolicy', 'Bypass',
@@ -3190,33 +3422,89 @@ function Invoke-ComponentStoreEscalation {
         '-SetupMediaShare', ('"{0}"' -f $ComponentStoreSetupMediaPath),
         '-AdkSharePath', ('"{0}"' -f $ComponentStoreAdkPath),
         '-EnableInPlaceRepair:$true'
-    )
+        )
 
-    Write-Log 'COMPONENT_STORE_ESCALATION|Status=Starting|Sequence=MatchWimIndex,SourceWimRestoreHealth,WindowsUpdateFallback,InPlaceRepairIfStillCorrupt' 'WARN'
-    Write-Log "Component-store helper staged and verified: $ComponentStoreRepairLocalPath; SHA256=$localHash" 'INFO'
-    Add-RepairAttempt 'Component-store source-WIM/in-place repair escalation'
+        Write-Log 'COMPONENT_STORE_ESCALATION|Status=Starting|Sequence=MatchWimIndex,SourceWimRestoreHealth,WindowsUpdateFallback,InPlaceRepairIfStillCorrupt' 'WARN'
+        Write-Log "Component-store helper staged and verified: $ComponentStoreRepairLocalPath; SHA256=$localHash" 'INFO'
+        Add-RepairAttempt 'Component-store source-WIM/in-place repair escalation'
 
-    $process = Start-Process -FilePath $powerShell -ArgumentList ($arguments -join ' ') -Wait -PassThru -WindowStyle Hidden -ErrorAction Stop
-    $script:Summary.ComponentStoreEscalationExitCode = [int]$process.ExitCode
+        $process = Start-Process -FilePath $powerShell -ArgumentList ($arguments -join ' ') -Wait -PassThru -WindowStyle Hidden -ErrorAction Stop
+        $script:Summary.ComponentStoreEscalationExitCode = [int]$process.ExitCode
 
-    if ($process.ExitCode -notin @(0, 1641, 3010)) {
-        throw "Component-store escalation helper failed with exit code $($process.ExitCode). Review its timestamped log under $LogDirectory."
+        if ($process.ExitCode -notin @(0, 1641, 3010)) {
+            throw "Component-store escalation helper failed with exit code $($process.ExitCode). Review its timestamped log under $LogDirectory."
+        }
+
+        if ($process.ExitCode -in @(1641, 3010)) {
+            $script:Summary.RebootRequired = $true
+            $script:Summary.InPlaceRepairOutcome = 'StartedRebootRequired'
+            Write-Log "COMPONENT_STORE_ESCALATION|Status=RepairInstallAccepted|ExitCode=$($process.ExitCode)|RebootRequired=True|Preserve=Apps,Files,Profiles,DomainMembership,Settings" 'WARN'
+            Write-WindowsInPlaceRepairEvent `
+                -EventKind RepairResult `
+                -Status 'StartedRebootRequired' `
+                -Reason 'Windows Setup accepted the in-place repair; final verification is pending a reboot and resume run.' `
+                -ExitCode ([int]$process.ExitCode) `
+                -CorruptionStillPresent $null `
+                -FailureDetail $null
+        }
+        else {
+            Write-Log 'COMPONENT_STORE_ESCALATION|Status=Completed|ExitCode=0|Verification=Starting' 'INFO'
+            Invoke-DismDetection
+            Invoke-SfcDetection
+            $corruptionStillPresent = [bool]($script:Summary.DismCorruptionDetected -or $script:Summary.SfcIntegrityViolations)
+
+            if ($corruptionStillPresent) {
+                $script:Summary.InPlaceRepairOutcome = 'CompletedWithCorruption'
+                Write-Log 'COMPONENT_STORE_ESCALATION|Status=CompletedWithCorruption|ExitCode=0|CorruptionStillPresent=True' 'WARN'
+                Write-WindowsInPlaceRepairEvent `
+                    -EventKind RepairResult `
+                    -Status 'CompletedWithCorruption' `
+                    -Reason 'The escalation helper completed, but post-repair DISM or SFC verification still detects corruption.' `
+                    -ExitCode 0 `
+                    -CorruptionStillPresent $true `
+                    -FailureDetail 'Post-repair verification did not report a clean component store and system-file state.'
+            }
+            else {
+                $script:Summary.InPlaceRepairOutcome = 'Succeeded'
+                Write-Log 'COMPONENT_STORE_ESCALATION|Status=Succeeded|ExitCode=0|CorruptionStillPresent=False' 'OK'
+                Write-WindowsInPlaceRepairEvent `
+                    -EventKind RepairResult `
+                    -Status 'Succeeded' `
+                    -Reason 'Post-repair DISM and SFC verification completed without remaining corruption.' `
+                    -ExitCode 0 `
+                    -CorruptionStillPresent $false `
+                    -FailureDetail $null
+            }
+        }
+
+        $script:Summary.InPlaceRepairResultPublished = $true
+        Add-DetailedResult -Step 'ComponentStoreEscalation' -Status 'Success' -Message 'Component-store escalation helper completed or handed off to Windows Setup.' -Data @{
+            ExitCode        = [int]$process.ExitCode
+            HelperPath      = $ComponentStoreRepairLocalPath
+            ImagePath       = $ComponentStoreImagePath
+            SetupMediaShare = $ComponentStoreSetupMediaPath
+            HelperSha256    = $localHash
+            Fingerprint     = $script:Summary.InPlaceRepairFingerprint
+            Outcome         = $script:Summary.InPlaceRepairOutcome
+        }
     }
-
-    if ($process.ExitCode -in @(1641, 3010)) {
-        $script:Summary.RebootRequired = $true
-        Write-Log "COMPONENT_STORE_ESCALATION|Status=RepairInstallAccepted|ExitCode=$($process.ExitCode)|RebootRequired=True|Preserve=Apps,Files,Profiles,DomainMembership,Settings" 'WARN'
-    }
-    else {
-        Write-Log 'COMPONENT_STORE_ESCALATION|Status=Completed|ExitCode=0|RebootRequired=EvaluatePendingReboot' 'OK'
-    }
-
-    Add-DetailedResult -Step 'ComponentStoreEscalation' -Status 'Success' -Message 'Component-store escalation helper completed or handed off to Windows Setup.' -Data @{
-        ExitCode        = [int]$process.ExitCode
-        HelperPath      = $ComponentStoreRepairLocalPath
-        ImagePath       = $ComponentStoreImagePath
-        SetupMediaShare = $ComponentStoreSetupMediaPath
-        HelperSha256    = $localHash
+    catch {
+        $script:Summary.InPlaceRepairOutcome = 'Failed'
+        $failureExitCode = if ($null -ne $script:Summary.ComponentStoreEscalationExitCode) {
+            [int]$script:Summary.ComponentStoreEscalationExitCode
+        }
+        else {
+            $null
+        }
+        Write-WindowsInPlaceRepairEvent `
+            -EventKind RepairResult `
+            -Status 'Failed' `
+            -Reason 'The component-store escalation helper or in-place repair workflow failed.' `
+            -ExitCode $failureExitCode `
+            -CorruptionStillPresent $true `
+            -FailureDetail $_.Exception.Message
+        $script:Summary.InPlaceRepairResultPublished = $true
+        throw
     }
 }
 
@@ -5595,6 +5883,11 @@ function New-SystemRepairTelemetryEvent {
                 ComponentStoreEscalationAuthorized = [bool]$script:Summary.InPlaceRepairAuthorized
                 ComponentStoreEscalationAttempted = [bool]$script:Summary.ComponentStoreEscalationAttempted
                 ComponentStoreEscalationExitCode = $script:Summary.ComponentStoreEscalationExitCode
+                InPlaceRepairRequired = [bool]$script:Summary.InPlaceRepairRequired
+                InPlaceRepairFingerprint = [string]$script:Summary.InPlaceRepairFingerprint
+                InPlaceRepairApprovalStatus = [string]$script:Summary.InPlaceRepairApprovalStatus
+                InPlaceRepairOutcome = [string]$script:Summary.InPlaceRepairOutcome
+                InPlaceRepairResultPublished = [bool]$script:Summary.InPlaceRepairResultPublished
                 WmiRepositoryInconsistent = [bool]$script:Summary.WmiRepositoryInconsistent
                 StorageHealthWarnings = [int]$script:Summary.StorageHealthWarnings
                 StorageFailurePredictionDetected = [bool]$script:Summary.StorageFailurePredicted
@@ -5644,6 +5937,7 @@ function Write-SystemRepairTelemetry {
 
     try {
         Ensure-LogDirectory
+        Write-QueuedWindowsInPlaceRepairEvents
         $event = New-SystemRepairTelemetryEvent -Status $Status -ExitCode $ExitCode -FailureMessage $FailureMessage
 
         try {

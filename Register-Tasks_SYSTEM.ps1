@@ -1,8 +1,8 @@
 #requires -Version 5.1
 #requires -RunAsAdministrator
 # ScriptName:    Register-Tasks_SYSTEM.ps1
-# ScriptVersion: 4.11.0
-# LastUpdated:   2026-09-21
+# ScriptVersion: 4.12.0
+# LastUpdated:   2026-10-08
 <#
 .SYNOPSIS
     Reconciles Compton College managed scheduled tasks under SYSTEM.
@@ -14,10 +14,13 @@
 
 .NOTES
     ScriptName:    Register-Tasks_SYSTEM.ps1
-    ScriptVersion: 4.11.0
+    ScriptVersion: 4.12.0
     Change: Replaces seven standalone weekly tasks with combined script 04, removes
             tasks that reference retired scripts, and refactors Sunday timing.
-    LastUpdated:   2026-09-21
+    LastUpdated:   2026-10-08
+    Changes:       v4.12.0 enables approval-gated Script 08 repair through the
+                   fixed launcher action. -SystemRepairOnly updates an existing
+                   repair task action while preserving its schedule and principal.
     Changes:       v4.11.0 registers launcher actions by fixed ActionId and rejects
                    any script/argument combination outside the launcher allowlist.
                    v4.10.0 runs script 08 with -AllowCopilotRemoval after the
@@ -44,18 +47,19 @@
     Designed for:  Windows PowerShell 5.1
 #>
 
-[CmdletBinding()]
+[CmdletBinding(SupportsShouldProcess = $true)]
 param(
     [string]$ScriptsRoot = 'C:\Scripts',
     [string]$TaskPath = '\',
-    [string]$LogDirectory = 'C:\Logs'
+    [string]$LogDirectory = 'C:\Logs',
+    [switch]$SystemRepairOnly = $false
 )
 
 Set-StrictMode -Version 2.0
 $ErrorActionPreference = 'Stop'
 
 $script:ScriptName       = 'Register-Tasks_SYSTEM.ps1'
-$script:ScriptVersion    = '4.11.0'
+$script:ScriptVersion    = '4.12.0'
 $script:RunId            = [guid]::NewGuid().Guid
 $script:StartTime        = Get-Date
 $script:WarningCount     = 0
@@ -73,6 +77,40 @@ $script:NdjsonPath = Join-Path $LogDirectory 'Maintenance-Telemetry.ndjson'
 $script:LatestPath = Join-Path $LogDirectory 'Register-Tasks_SYSTEM.latest.json'
 
 $WindowsPowerShellExe = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+
+# Check before any reconciliation or log initialization. The old Script 08
+# used the escalation switch alone as authorization and must not be enabled.
+$repairScriptPath = Join-Path $ScriptsRoot '08_System_Repair.ps1'
+$repairContent = Get-Content -LiteralPath $repairScriptPath -Raw -ErrorAction Stop
+if ($repairContent -notmatch 'function Test-WindowsInPlaceRepairApproval' -or
+    $repairContent -notmatch 'ApprovedByN8n') {
+    throw 'Deploy approval-integrated Script 08 v4.9.2 or newer before updating tasks.'
+}
+
+if ($SystemRepairOnly) {
+    Import-Module ScheduledTasks -ErrorAction Stop
+    $repairTasks = @(Get-ScheduledTask -TaskPath $TaskPath -ErrorAction Stop |
+        Where-Object { $_.TaskName -in @('11. System Repair', '12. System Repair') })
+    if ($repairTasks.Count -ne 1) {
+        throw 'Expected exactly one existing 11. System Repair or 12. System Repair task.'
+    }
+    $repairTask = $repairTasks[0]
+    if ($repairTask.Principal.UserId -notin @('SYSTEM', 'NT AUTHORITY\SYSTEM', 'S-1-5-18')) {
+        throw 'The existing repair task must run as SYSTEM.'
+    }
+    $repairArguments = '-NoProfile -ExecutionPolicy Bypass -File "{0}" -AutoRepairOnDetection -AllowComponentStoreEscalation -AllowCopilotRemoval' -f $repairScriptPath
+    $repairAction = New-ScheduledTaskAction -Execute $WindowsPowerShellExe -Argument $repairArguments
+    if ($PSCmdlet.ShouldProcess(($repairTask.TaskPath + $repairTask.TaskName), 'Update repair task action; preserve schedule and principal')) {
+        Set-ScheduledTask -TaskName $repairTask.TaskName -TaskPath $repairTask.TaskPath -Action $repairAction -ErrorAction Stop | Out-Null
+        Write-Host 'Updated only the System Repair task action. The task was not started.'
+    }
+    return
+}
+
+# A full -WhatIf exits before framework initialization or task mutations.
+if (-not $PSCmdlet.ShouldProcess($TaskPath, 'Reconcile all managed SYSTEM maintenance tasks')) {
+    return
+}
 
 # Load the shared framework from the same directory as this script.
 $MaintenanceFrameworkPath = 'C:\Scripts\Maintenance.Framework.psm1'
@@ -184,8 +222,8 @@ function Resolve-LauncherActionId {
     }
 
     if ($scriptName -eq '08_System_Repair.ps1') {
-        if ($normalizedExtra -ne '-AllowCopilotRemoval') {
-            throw "SystemRepairWeekly requires the fixed argument '-AllowCopilotRemoval'. Received: '$normalizedExtra'"
+        if ($normalizedExtra -ne '-AutoRepairOnDetection -AllowComponentStoreEscalation -AllowCopilotRemoval') {
+            throw "SystemRepairWeekly requires the fixed approval-gated repair arguments. Received: '$normalizedExtra'"
         }
     }
     elseif (-not [string]::IsNullOrWhiteSpace($normalizedExtra)) {
@@ -808,7 +846,7 @@ try {
         [pscustomobject]@{ Name='08. Force Reboot Install Updates';          Script='07_Force_Reboot_Install_Updates.ps1';                 Time='06:15'; Args='' },
         [pscustomobject]@{ Name='09. Weekend Windows Updates - 2nd Pass';    Script='06_Weekend_Windows_Updates.ps1';                      Time='06:45'; Args='' },
         [pscustomobject]@{ Name='10. Disable Windows Update Services';       Script='09_Disable_Windows_Update_Services.ps1';              Time='07:45'; Args='' },
-        [pscustomobject]@{ Name='11. System Repair';                         Script='08_System_Repair.ps1';                                Time='08:00'; Args='-AllowCopilotRemoval' },
+        [pscustomobject]@{ Name='11. System Repair';                         Script='08_System_Repair.ps1';                                Time='08:00'; Args='-AutoRepairOnDetection -AllowComponentStoreEscalation -AllowCopilotRemoval' },
         [pscustomobject]@{ Name='12. Weekly Endpoint Health Inventory';      Script='14_Endpoint_Health_Inventory.ps1';                    Time='09:00'; Args='' }
     )
 
@@ -980,3 +1018,4 @@ finally {
 }
 
 exit $exitCode
+

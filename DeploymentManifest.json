@@ -1,8 +1,8 @@
 {
     "SchemaVersion": 1,
-    "ManifestVersion": "3.0.2",
-    "PackageVersion": "3.0.2",
-    "GeneratedUtc": "2026-10-07T15:38:00Z",
+    "ManifestVersion": "3.0.3",
+    "PackageVersion": "3.0.3",
+    "GeneratedUtc": "2026-10-08T20:10:21Z",
     "Files": [
         {
             "Name": "00_Update-Scripts-FromShare.ps1",
@@ -55,8 +55,8 @@
         {
             "Name": "08_System_Repair.ps1",
             "Role": "ManagedFile",
-            "Version": "4.7.0",
-            "SHA256": "22A91E8D2C15D155A2831C0E5527D5FC51A7A8B58C7EEFC4017369DB7A7BC330"
+            "Version": "4.9.2",
+            "SHA256": "D532291D45EAC87B18916EEC9378377353BC859F2743A09876581404DAB104DA"
         },
         {
             "Name": "09_Disable_Windows_Update_Services.ps1",
@@ -91,8 +91,8 @@
         {
             "Name": "Invoke-MaintenanceScript.ps1",
             "Role": "Launcher",
-            "Version": "2.0.0",
-            "SHA256": "D5115E48C531D8D64DC9B980BDA196BD36C7AB431EA3076E85144AB344E6DA99"
+            "Version": "2.1.0",
+            "SHA256": "13CE080832B96DD77C47EB2B8E5B0E8E1CE8F999E17C23BBD296E636FDDA7235"
         },
         {
             "Name": "Maintenance.Copilot.psm1",
@@ -133,8 +133,8 @@
         {
             "Name": "Register-Tasks_SYSTEM.ps1",
             "Role": "TaskRegistration",
-            "Version": "4.11.0",
-            "SHA256": "5442431A90788B201D29D4FCE3241479CA122FC55600978E95027C9829E1C660"
+            "Version": "4.12.0",
+            "SHA256": "F1D151CE729EB44C706AE726DC45BF3D516F16D18D4F39D5D7656EC78FF4326E"
         }
     ]
 }

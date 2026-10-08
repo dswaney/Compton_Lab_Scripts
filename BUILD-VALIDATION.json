@@ -1,5 +1,5 @@
 {
-  "PackageVersion": "3.0.2",
+  "PackageVersion": "3.0.3",
   "PowerShellParserExecuted": false,
   "StructuralChecks": [
     "Manifest hashes generated",
@@ -9,14 +9,26 @@
     "Retired standalone scripts excluded from active manifest and task rotation",
     "System Restore embedded in script 04 and standalone script 12 retired",
     "Public script 04 credential fields are blank or placeholders and credential-dependent sections are disabled",
-    "Public scripts and policies contain no production Fleet token, private IP address, or internal server/share name",
-    "Internal server names, private IP addresses, and installer shares replaced with public placeholders",
     "Elastic StartsWith prefixes in script 04 contain no wildcard characters and are documented in README",
     "Script 14 safely handles optional scheduled-task actions, adapter statistics, and single-item baseline collections",
     "Script 14 classifies and deduplicates WER records and separates Windows servicing failures from application crashes",
     "Script 08 includes .log retention by LastWriteTime, Old Logs pruning, guarded HP BIOS staging removal, and C:\\Temp contents cleanup",
     "Script 08 component-store escalation is opt-in and uses the approved Repair-Windows-ComponentStore helper",
-    "The component-store helper validates Deep Freeze, media compatibility, free space, and post-upgrade DISM/SFC state before restoring maintenance tasks"
+    "The component-store helper validates Deep Freeze, media compatibility, free space, and post-upgrade DISM/SFC state before restoring maintenance tasks",
+    "Script 08 escalation requires explicit opt-in and a matching unexpired n8n approval; unavailable lookups defer repair",
+    "Approval key is read from an external file; no key contents or permission changes are included",
+    "SystemRepairWeekly fixed launcher arguments and registration definitions agree",
+    "Targeted repair-task mode supports current and legacy task names, preserves schedule/principal, and supports WhatIf",
+    "README documents the n8n branches, data table, webhooks, deployment, validation limits, and supplied workflow screenshot",
+    "Package 3.0.3 changed-file manifest and checksum entries match the committed file bytes"
   ],
-  "RequiresWindowsPowerShellValidation": true
+  "RequiresWindowsPowerShellValidation": true,
+  "ValidationNotes": [
+    "User reported Windows PowerShell 5.1 syntax validation for the approval-integrated Script 08 before the final key-path change.",
+    "User verified the previous targeted registration copy with WhatIf and applied the direct SYSTEM task action.",
+    "User verified synthetic n8n approval and NotFound responses, plus shared-key/API lookup under SYSTEM.",
+    "Final merged registration v4.12.0 and launcher v2.1.0 were structurally reviewed here; Windows PowerShell parser and task execution were not available.",
+    "No real corruption repair or in-place Windows Setup lifecycle was executed.",
+    "Site-specific approval host, installer paths, and workflow image are intentionally documented; credential values remain external."
+  ]
 }

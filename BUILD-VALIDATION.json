@@ -1,5 +1,5 @@
 {
-  "PackageVersion": "3.0.3",
+  "PackageVersion": "3.0.4",
   "PowerShellParserExecuted": false,
   "StructuralChecks": [
     "Manifest hashes generated",
@@ -30,5 +30,16 @@
     "Final merged registration v4.12.0 and launcher v2.1.0 were structurally reviewed here; Windows PowerShell parser and task execution were not available.",
     "No real corruption repair or in-place Windows Setup lifecycle was executed.",
     "Site-specific approval host, installer paths, and workflow image are intentionally documented; credential values remain external."
-  ]
+  ],
+  "October12Update": {
+    "ChangedScripts": [
+      "00_Update-Scripts-FromShare.ps1",
+      "02_Remove_User_Profiles.ps1",
+      "04_Sunday_Lab_Application_Maintenance.ps1",
+      "10_Sync_System_Time.ps1"
+    ],
+    "Validation": "Static review and changed-file SHA256 verification only; no Windows runtime test.",
+    "Registrar": "Existing 4.12.0 retained; fixed launcher actions supported.",
+    "TemporaryFixScriptExcluded": true
+  }
 }

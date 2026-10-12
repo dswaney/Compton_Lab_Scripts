@@ -467,3 +467,15 @@ The following files are retained under [`Retired`](./Retired) for history only. 
 | `18_Install_Honorlock_Chrome_Extension.ps1` | Group Policy; embedded Script 04 section is disabled |
 | `19_Stellarium_Location_Services.ps1` | Script 04 Stellarium section |
 
+
+
+## October 12, 2026 maintenance update
+
+- Updater 4.12.0 fetches and verifies the current task registrar from the active share after synchronization and any self-relaunch. It reconciles tasks even when all files are current, then verifies the updater, Sunday application maintenance, and health inventory actions. Both direct script actions and the fixed launcher ActionIds are supported.
+- The existing registrar 4.12.0 is retained: Sunday application maintenance runs at 02:00 and endpoint health inventory at 09:00. Unrelated tasks and repair approval safeguards are preserved.
+- Profile cleanup 2.5.1 removes only ForceAutoLogon when enabled CC-Students autologon is detected; other autologon values are preserved.
+- Sunday application maintenance 1.18.0 replaces managed Edge startup with Chrome Incognito for CC-Student in SSB-122-*, SSB-114*, and SSB-171*. Chrome opens https://www.compton.edu; Chrome must already be installed.
+- Time synchronization 2.0.11 ensures Netlogon is Automatic and Running on domain-joined computers before synchronization.
+- Public deployment settings remain sanitized, and the Elastic enrollment section remains disabled until configured for production. Generate a production manifest after restoring site configuration; public hashes apply to repository bytes only.
+- Fix-Old-00-Script.ps1 is a temporary deployment aid and is excluded from this repository update.
+- Validation: static change review and manifest/checksum verification; Windows PowerShell parsing and endpoint execution were not performed for this update.

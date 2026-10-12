@@ -1,14 +1,14 @@
 {
     "SchemaVersion": 1,
-    "ManifestVersion": "3.0.3",
-    "PackageVersion": "3.0.3",
-    "GeneratedUtc": "2026-10-08T20:10:21Z",
+    "ManifestVersion": "3.0.4",
+    "PackageVersion": "3.0.4",
+    "GeneratedUtc": "2026-10-12T16:50:57Z",
     "Files": [
         {
             "Name": "00_Update-Scripts-FromShare.ps1",
             "Role": "Updater",
-            "Version": "4.11.2",
-            "SHA256": "F51BA87BEB8E04ACF50C9E08292F49D9E17EBE3FC0E6557D9325A2EBF074AAF4"
+            "Version": "4.12.0",
+            "SHA256": "CDC3BA2DB04505099087897A71830D1EE6DDD8F8DDFE4A0E92DBE7B331D3E419"
         },
         {
             "Name": "01_Enable_Windows_Update_Services.ps1",
@@ -19,8 +19,8 @@
         {
             "Name": "02_Remove_User_Profiles.ps1",
             "Role": "ManagedFile",
-            "Version": "2.5.0",
-            "SHA256": "899CD918DB20299C2B99BB73AAAB6460A8122B7DAF75EE2F46FC9A91C4755A32"
+            "Version": "2.5.1",
+            "SHA256": "9F689A08CE226590D183B08E2515FAB94E815BE093BC2E9C1AE46C12CA311CC7"
         },
         {
             "Name": "03_Weekend_Apps_Update.ps1",
@@ -31,8 +31,8 @@
         {
             "Name": "04_Sunday_Lab_Application_Maintenance.ps1",
             "Role": "MaintenanceScript",
-            "Version": "1.17.0",
-            "SHA256": "CBC5ABE8BC03485200803ED40E67C70720A7B635D96304990499816736077D0F"
+            "Version": "1.18.0",
+            "SHA256": "063595AC58A475028E5227E00BA1352EF659E87F8183849F4EFB26E4A727C536"
         },
         {
             "Name": "05_Weekend_HP_Drivers_Update.ps1",
@@ -67,8 +67,8 @@
         {
             "Name": "10_Sync_System_Time.ps1",
             "Role": "ManagedFile",
-            "Version": "2.0.10",
-            "SHA256": "2E86E56458BFAF1718E50C08AEFA2820B0CBF1433BEB252B6E5E0C881E700F51"
+            "Version": "2.0.11",
+            "SHA256": "68E32D5BBE3CB67B37FD74D0D8CFB1B42299E9E00104DFA112FBD12C3182AE7F"
         },
         {
             "Name": "14_Endpoint_Health_Inventory.ps1",

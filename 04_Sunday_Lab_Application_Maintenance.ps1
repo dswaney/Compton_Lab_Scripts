@@ -1,8 +1,8 @@
 #requires -Version 5.1
 #requires -RunAsAdministrator
 # ScriptName:    04_Sunday_Lab_Application_Maintenance.ps1
-# ScriptVersion: 1.17.0
-# LastUpdated:   2026-10-07
+# ScriptVersion: 1.18.0
+# LastUpdated:   2026-10-12
 <#
 .SYNOPSIS
     Runs the Sunday lab application and configuration maintenance in one script.
@@ -26,11 +26,14 @@
 
 .NOTES
     ScriptName:    04_Sunday_Lab_Application_Maintenance.ps1
-    ScriptVersion: 1.17.0
-    LastUpdated:   2026-10-07
+    ScriptVersion: 1.18.0
+    LastUpdated:   2026-10-12
     Requires:      64-bit Windows PowerShell 5.1, Administrator or SYSTEM
 
-    Changes:       v1.17.0 makes Script 04 the sole numbered-script owner of
+    Changes:       v1.18.0 replaces managed Edge startup with Chrome Incognito
+                   at CC-Student sign-in for SSB-122-*, SSB-114*, and SSB-171*.
+                   Preserves autologon and allows the guarded Chrome startup entry.
+                   v1.17.0 makes Script 04 the sole numbered-script owner of
                    Copilot cleanup and Edge InPrivate startup. Edge InPrivate
                    now has its own enabled runner switch and targeting list;
                    the embedded configuration explicitly leaves autologon off.
@@ -142,8 +145,7 @@
     This single file contains plain-text embedded copies of the seven source scripts.
     They are staged to temporary files only so each section can run in an isolated
     64-bit Windows PowerShell process. No compression or Base64 regeneration is
-    required when maintaining an embedded section. The Autologon password and
-    Elastic enrollment token remain sensitive; restrict access to the script/share.
+    required when maintaining an embedded section. The Elastic enrollment token remains sensitive; restrict access to the script/share.
 #>
 
 [CmdletBinding()]
@@ -158,7 +160,7 @@ $ErrorActionPreference = 'Stop'
 # ============================================================================
 # EASY-TO-EDIT COMPUTER TARGETING
 # ============================================================================
-# Use PowerShell wildcard patterns for Edge InPrivate, Honorlock, and Stellarium.
+# Use PowerShell wildcard patterns for Chrome Incognito, Honorlock, and Stellarium.
 # Examples: 'SSB-122-*', 'SSC-216*', or '*' for every computer.
 #
 # Elastic Agent uses computer-name PREFIXES, not wildcard patterns.
@@ -167,8 +169,8 @@ $ErrorActionPreference = 'Stop'
 # Add or remove quoted entries in the appropriate list. Keep the @(...)
 # structure and separate entries with commas.
 
-# --- Edge InPrivate startup targets (former script 13) ----------------------
-[string[]]$EdgeInPrivateComputerPatterns = @(
+# --- CC-Student Chrome Incognito startup targets (replaces Edge startup) ----------------------
+[string[]]$ChromeIncognitoComputerPatterns = @(
     'SSB-122-*',
     'SSB-114*',
     'SSB-171*'
@@ -211,6 +213,7 @@ $ErrorActionPreference = 'Stop'
 # considers both the startup value/display name and the executable or script
 # filename found in its command. Everything else is disabled, not uninstalled.
 [string[]]$AllowedStartupApplications = @(
+    'LaunchComptonChromeIncognito',
     'DWRCST.EXE',
     'initialise.bat',
     'OneDrive.exe',
@@ -225,7 +228,7 @@ $ErrorActionPreference = 'Stop'
 # Set a value to $false to retain the section in this combined file but skip it.
 [bool]$RunPrinterAndPaperCut = $true
 [bool]$RunSystemRestore     = $true
-[bool]$RunEdgeInPrivate     = $true
+[bool]$RunChromeIncognito     = $true
 [bool]$RunElasticAgent      = $false
 [bool]$RunBrowserHomepage   = $true
 # Honorlock is deployed by Group Policy. Keep the embedded section available for
@@ -245,7 +248,7 @@ $ErrorActionPreference = 'Stop'
 [string]$Office2024ConfigurationFile = 'office2024config.xml'
 [string]$LogDirectory = 'C:\Logs'
 [string]$RunnerScriptName = '04_Sunday_Lab_Application_Maintenance.ps1'
-[string]$RunnerVersion = '1.17.0'
+[string]$RunnerVersion = '1.18.0'
 [string]$CopilotModuleLocalPath = 'C:\Scripts\Maintenance.Copilot.psm1'
 [string]$CopilotModuleSharePath = '\\SERVER\DeploymentShare\Maintenance.Copilot.psm1'
 [string]$RunnerLogPath = Join-Path $LogDirectory '04_Sunday_Lab_Application_Maintenance.log'
@@ -2392,806 +2395,6 @@ finally {
 }
 
 exit $finalExitCode
-'@
-    }
-    EdgeInPrivate = [ordered]@{
-        FileName = 'Embedded_Configure_Edge_InPrivate.ps1'
-        # Plain-text source is intentionally embedded for maintainability.
-        Source = @'
-# =====================================================================
-# ScriptName: 04_Configure_Edge_InPrivate.ps1
-# ScriptVersion: 2.3.0
-# LastUpdated: 2026-10-07
-# Changes: v2.3.0 separates Edge InPrivate startup from autologon. Script 04
-#          invokes this payload with Edge enabled and autologon explicitly
-#          disabled, so no credential or Winlogon change is made.
-#          v2.2.0 removes ForceAutoLogon so Log off and Switch user remain available for administrator sign-in,
-#          while preserving normal CC-Student automatic sign-in at computer startup.
-#          v2.1.3 normalizes Windows 11 product naming, makes telemetry collections explicitly JSON-array safe,
-#          and adds a concise Elastic configuration summary while preserving password redaction.
-#          v2.1.2 uses Maintenance.Framework v2.4 staged text logging.
-# Purpose: Configure lab autologon and launch Microsoft Edge InPrivate
-#          for approved computer-name patterns, with verification and
-#          structured maintenance telemetry. The autologon password is Base64-obfuscated in the script and decoded only at runtime.
-# =====================================================================
-
-[CmdletBinding()]
-param(
-    [string[]]$ComputerNamePatterns = @(
-        'SSB-122-*',
-        'SSB-114*' ,
-	'SSB-171*'
-    ),
-
-    [string]$DefaultUserName = 'CC-Student',
-
-    [ValidateNotNullOrEmpty()]
-    [string]$DefaultPasswordBase64 = '',
-
-    [string]$DefaultDomainName = 'Compton.edu',
-
-    [ValidateNotNullOrEmpty()]
-    [string]$EdgeUrl = 'https://www.compton.edu',
-
-    [string]$LogDirectory = 'C:\Logs',
-
-    [bool]$ConfigureEdgeInPrivate = $true,
-
-    [bool]$ConfigureAutologon = $false,
-
-    [switch]$AllowHttpEdgeUrl
-)
-
-Set-StrictMode -Version 2.0
-$ErrorActionPreference = 'Stop'
-
-$ScriptName = '04_Configure_Edge_InPrivate.ps1'
-$ScriptVersion = '2.3.0'
-$RunId = [guid]::NewGuid().Guid
-$StartTime = Get-Date
-$ComputerName = $env:COMPUTERNAME
-$DomainName = $env:USERDOMAIN
-$RunningAccount = [Security.Principal.WindowsIdentity]::GetCurrent().Name
-$LogPath = $null
-$PublishedLogPath = $null
-$LogSession = $null
-$TelemetryPath = Join-Path $LogDirectory 'Maintenance-Telemetry.ndjson'
-$LatestTelemetryPath = Join-Path $LogDirectory '04_Configure_Edge_InPrivate.latest.json'
-$WinlogonPath = 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon'
-$RunKeyPath = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Run'
-$EdgeRunValueName = 'LaunchComptonEdge'
-$AllUsersStartupPath = Join-Path $env:ProgramData 'Microsoft\Windows\Start Menu\Programs\Startup'
-$LegacyChromeShortcutPath = Join-Path $AllUsersStartupPath 'Google Chrome.lnk'
-
-$script:WarningCount = 0
-$script:ErrorCount = 0
-$script:ExitCode = 0
-$script:FinalStatus = 'Success'
-$script:OverallResult = 'Unknown'
-$script:FailureMessage = $null
-$script:Targeted = $false
-$script:MatchedPattern = $null
-$script:ChangesMade = 0
-$script:VerificationFailures = New-Object System.Collections.Generic.List[string]
-$script:RegistryChanges = New-Object System.Collections.Generic.List[object]
-$script:EdgePath = $null
-$script:EdgeCommand = $null
-$script:LegacyShortcutRemoved = $false
-$script:LegacyShortcutPresentBefore = $false
-$script:LegacyShortcutPresentAfter = $false
-$script:BeforeState = $null
-$script:AfterState = $null
-$script:DecodedPassword = $null
-
-# Load the shared framework from the same directory as this script.
-$MaintenanceFrameworkPath = 'C:\Scripts\Maintenance.Framework.psm1'
-Import-Module -Name $MaintenanceFrameworkPath -Force -ErrorAction Stop
-$MaintenanceConfig = Initialize-MaintenanceEnvironment -ScriptRoot 'C:\Scripts' -LogRoot $LogDirectory
-
-$requiredFrameworkVersion = [version]'2.4.0'
-$currentFrameworkVersion = [version](Get-MaintenanceFrameworkVersion)
-
-if ($currentFrameworkVersion -lt $requiredFrameworkVersion) {
-    throw "Script 13 requires Maintenance.Framework.psm1 version $requiredFrameworkVersion or newer. Installed version: $currentFrameworkVersion"
-}
-
-Archive-MaintenanceLogs `
-    -ScriptName $ScriptName `
-    -LogRoot $LogDirectory `
-    -AdditionalPatterns @(
-        '04_Configure_Edge_InPrivate.log',
-        '*-04_Configure_Edge_InPrivate-*.log',
-        '13_Configure_Autologon_And_Edge.log',
-        '*-13_Configure_Autologon_And_Edge-*.log'
-    ) | Out-Null
-
-$LogSession = New-MaintenanceStagedLog `
-    -ScriptName $ScriptName `
-    -LogRoot $LogDirectory `
-    -StagingRoot $MaintenanceConfig.LogStagingRoot `
-    -ComputerName $ComputerName `
-    -Timestamp $StartTime
-
-$LogPath = [string]$LogSession.WorkingPath
-$PublishedLogPath = [string]$LogSession.PublishedPath
-
-function Initialize-LogDirectory {
-    if (-not (Test-Path -LiteralPath $LogDirectory)) {
-        New-Item -Path $LogDirectory -ItemType Directory -Force | Out-Null
-    }
-}
-
-function Write-Log {
-    param(
-        [Parameter(Mandatory)][string]$Message,
-        [ValidateSet('INFO','OK','WARN','ERROR')][string]$Level = 'INFO'
-    )
-
-    if ($Level -eq 'WARN') { $script:WarningCount++ }
-    if ($Level -eq 'ERROR') { $script:ErrorCount++ }
-
-    $normalizedLevel = switch ($Level) {
-        'OK'   { 'SUCCESS' }
-        'WARN' { 'WARNING' }
-        default { $Level }
-    }
-    $logComputerName = if ($ComputerName) { $ComputerName } else { 'UNKNOWN' }
-    $line = '{0} [{1}] [{2}] {3}' -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $logComputerName, $normalizedLevel, $Message
-
-    switch ($Level) {
-        'OK'    { Write-Host $line -ForegroundColor Green }
-        'WARN'  { Write-Host $line -ForegroundColor Yellow }
-        'ERROR' { Write-Host $line -ForegroundColor Red }
-        default { Write-Host $line }
-    }
-
-    try {
-        $activeLogDirectory = Split-Path -Parent $LogPath
-        if (-not (Test-Path -LiteralPath $activeLogDirectory -PathType Container)) {
-            New-Item -Path $activeLogDirectory -ItemType Directory -Force | Out-Null
-        }
-        Add-Content -LiteralPath $LogPath -Value $line -Encoding UTF8
-    }
-    catch {
-        Write-Warning "Unable to write to the log file: $($_.Exception.Message)"
-    }
-}
-
-function Test-IsAdministrator {
-    $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
-    $principal = New-Object Security.Principal.WindowsPrincipal($identity)
-    return $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
-}
-
-function Get-WindowsInformation {
-    try {
-        $os = Get-CimInstance -ClassName Win32_OperatingSystem -ErrorAction Stop
-        $currentVersion = Get-ItemProperty -LiteralPath 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion' -ErrorAction Stop
-
-        $productName = [string]$currentVersion.ProductName
-        $buildText = [string]$os.BuildNumber
-        $buildNumber = 0
-        [void][int]::TryParse($buildText, [ref]$buildNumber)
-
-        if ($buildNumber -ge 22000 -and $productName -match '^Windows 10') {
-            $productName = $productName -replace '^Windows 10', 'Windows 11'
-        }
-
-        [pscustomobject]@{
-            ProductName    = $productName
-            EditionId      = [string]$currentVersion.EditionID
-            DisplayVersion = [string]$currentVersion.DisplayVersion
-            Version        = [string]$os.Version
-            BuildNumber    = $buildText
-            UBR            = [int]$currentVersion.UBR
-            FullBuild      = '{0}.{1}' -f $buildText, $currentVersion.UBR
-        }
-    }
-    catch {
-        Write-Log "Unable to collect Windows version information: $($_.Exception.Message)" 'WARN'
-        [pscustomobject]@{
-            ProductName = $null; EditionId = $null; DisplayVersion = $null
-            Version = $null; BuildNumber = $null; UBR = $null; FullBuild = $null
-        }
-    }
-}
-
-function Get-MatchedComputerPattern {
-    param(
-        [Parameter(Mandatory)][string]$Name,
-        [Parameter(Mandatory)][string[]]$Patterns
-    )
-
-    foreach ($pattern in $Patterns) {
-        if (-not [string]::IsNullOrWhiteSpace($pattern) -and $Name -like $pattern) {
-            return $pattern
-        }
-    }
-    return $null
-}
-
-function Get-RegistryStringValue {
-    param(
-        [Parameter(Mandatory)][string]$Path,
-        [Parameter(Mandatory)][string]$Name
-    )
-
-    try {
-        $value = (Get-ItemProperty -LiteralPath $Path -Name $Name -ErrorAction Stop).$Name
-        return [string]$value
-    }
-    catch {
-        return $null
-    }
-}
-
-function Set-VerifiedRegistryString {
-    param(
-        [Parameter(Mandatory)][string]$Path,
-        [Parameter(Mandatory)][string]$Name,
-        [Parameter(Mandatory)][AllowEmptyString()][string]$Value,
-        [switch]$Sensitive
-    )
-
-    if (-not (Test-Path -LiteralPath $Path)) {
-        New-Item -Path $Path -Force | Out-Null
-    }
-
-    $before = Get-RegistryStringValue -Path $Path -Name $Name
-    $changed = ([string]$before -cne [string]$Value)
-
-    if ($changed) {
-        New-ItemProperty -LiteralPath $Path -Name $Name -Value $Value -PropertyType String -Force | Out-Null
-        $script:ChangesMade++
-        if ($Sensitive) {
-            Write-Log "Updated protected registry value: $Path\$Name" 'OK'
-        }
-        else {
-            Write-Log "Updated registry value: $Path\$Name" 'OK'
-        }
-    }
-    else {
-        Write-Log "Registry value is already correct: $Path\$Name"
-    }
-
-    $after = Get-RegistryStringValue -Path $Path -Name $Name
-    $verified = ([string]$after -ceq [string]$Value)
-
-    if (-not $verified) {
-        $script:VerificationFailures.Add("Registry verification failed: $Path\$Name")
-        throw "Registry value verification failed: $Path\$Name"
-    }
-
-    $script:RegistryChanges.Add([pscustomobject]@{
-        Path          = $Path
-        Name          = $Name
-        Changed       = $changed
-        Verified      = $verified
-        Sensitive     = [bool]$Sensitive
-        BeforePresent = ($null -ne $before)
-        AfterPresent  = ($null -ne $after)
-        BeforeValue   = $(if ($Sensitive) { $null } else { $before })
-        AfterValue    = $(if ($Sensitive) { $null } else { $after })
-    })
-}
-
-function Remove-VerifiedRegistryValue {
-    param(
-        [Parameter(Mandatory)][string]$Path,
-        [Parameter(Mandatory)][string]$Name
-    )
-
-    $before = Get-RegistryStringValue -Path $Path -Name $Name
-    $changed = ($null -ne $before)
-
-    if ($changed) {
-        Remove-ItemProperty -LiteralPath $Path -Name $Name -Force -ErrorAction Stop
-        $script:ChangesMade++
-        Write-Log "Removed registry value: $Path\$Name" 'OK'
-    }
-    else {
-        Write-Log "Registry value is already absent: $Path\$Name"
-    }
-
-    $after = Get-RegistryStringValue -Path $Path -Name $Name
-    $verified = ($null -eq $after)
-
-    if (-not $verified) {
-        $script:VerificationFailures.Add("Registry removal verification failed: $Path\$Name")
-        throw "Registry value removal verification failed: $Path\$Name"
-    }
-
-    $script:RegistryChanges.Add([pscustomobject]@{
-        Path          = $Path
-        Name          = $Name
-        Changed       = $changed
-        Verified      = $verified
-        Sensitive     = $false
-        BeforePresent = ($null -ne $before)
-        AfterPresent  = ($null -ne $after)
-        BeforeValue   = $before
-        AfterValue    = $after
-    })
-}
-
-function Get-DecodedAutologonPassword {
-    try {
-        $bytes = [Convert]::FromBase64String($DefaultPasswordBase64)
-        $password = [Text.Encoding]::UTF8.GetString($bytes)
-
-        if ([string]::IsNullOrWhiteSpace($password)) {
-            throw 'The decoded autologon password is blank.'
-        }
-
-        return $password
-    }
-    catch {
-        throw "Unable to decode the configured autologon password: $($_.Exception.Message)"
-    }
-    finally {
-        $bytes = $null
-    }
-}
-
-function Test-ConfigurationInput {
-    if (-not $ComputerNamePatterns -or @($ComputerNamePatterns | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }).Count -eq 0) {
-        throw 'At least one nonblank computer-name pattern is required.'
-    }
-    if (-not $ConfigureEdgeInPrivate -and -not $ConfigureAutologon) {
-        throw 'At least one configuration action must be enabled.'
-    }
-
-    if ($ConfigureAutologon) {
-        if ([string]::IsNullOrWhiteSpace($DefaultUserName)) {
-            throw 'DefaultUserName cannot be blank.'
-        }
-        if ([string]::IsNullOrWhiteSpace($DefaultPasswordBase64)) {
-            throw 'DefaultPasswordBase64 cannot be blank when autologon is enabled.'
-        }
-
-        try {
-            $decodedBytes = [Convert]::FromBase64String($DefaultPasswordBase64)
-            if ($decodedBytes.Length -eq 0) {
-                throw 'The decoded password is empty.'
-            }
-        }
-        catch {
-            throw 'DefaultPasswordBase64 is not valid Base64 or decodes to an empty value.'
-        }
-        finally {
-            $decodedBytes = $null
-        }
-        if ([string]::IsNullOrWhiteSpace($DefaultDomainName)) {
-            throw 'DefaultDomainName cannot be blank.'
-        }
-    }
-
-    if ($ConfigureEdgeInPrivate) {
-        $uri = $null
-        if (-not [uri]::TryCreate($EdgeUrl, [UriKind]::Absolute, [ref]$uri)) {
-            throw "EdgeUrl is not a valid absolute URL: $EdgeUrl"
-        }
-        if ($uri.Scheme -notin @('https','http')) {
-            throw "EdgeUrl must use HTTP or HTTPS: $EdgeUrl"
-        }
-        if ($uri.Scheme -eq 'http' -and -not $AllowHttpEdgeUrl) {
-            throw 'EdgeUrl uses HTTP. Use HTTPS or explicitly supply -AllowHttpEdgeUrl.'
-        }
-    }
-}
-
-function Get-AutologonState {
-    $autoAdmin = Get-RegistryStringValue -Path $WinlogonPath -Name 'AutoAdminLogon'
-    $user = Get-RegistryStringValue -Path $WinlogonPath -Name 'DefaultUserName'
-    $domain = Get-RegistryStringValue -Path $WinlogonPath -Name 'DefaultDomainName'
-    $force = Get-RegistryStringValue -Path $WinlogonPath -Name 'ForceAutoLogon'
-    $password = Get-RegistryStringValue -Path $WinlogonPath -Name 'DefaultPassword'
-
-    [pscustomobject]@{
-        AutoAdminLogonEnabled = ($autoAdmin -eq '1')
-        DefaultUserName       = $user
-        DefaultDomainName     = $domain
-        ForceAutoLogonPresent = ($null -ne $force)
-        ForceAutoLogonEnabled = ($force -eq '1')
-        PasswordPresent       = (-not [string]::IsNullOrEmpty($password))
-        PasswordMatches       = ($null -ne $script:DecodedPassword -and [string]$password -ceq [string]$script:DecodedPassword)
-        ConfigurationMatches  = (
-            $autoAdmin -eq '1' -and
-            $user -ceq $DefaultUserName -and
-            $domain -ceq $DefaultDomainName -and
-            $null -eq $force -and
-            [string]$password -ceq [string]$script:DecodedPassword
-        )
-    }
-}
-
-function Set-AutologonConfiguration {
-    Write-Log "Ensuring Windows autologon is configured for '$DefaultDomainName\$DefaultUserName'."
-
-    Set-VerifiedRegistryString -Path $WinlogonPath -Name 'AutoAdminLogon' -Value '1'
-    Set-VerifiedRegistryString -Path $WinlogonPath -Name 'DefaultUserName' -Value $DefaultUserName
-    Set-VerifiedRegistryString -Path $WinlogonPath -Name 'DefaultPassword' -Value $script:DecodedPassword -Sensitive
-    Set-VerifiedRegistryString -Path $WinlogonPath -Name 'DefaultDomainName' -Value $DefaultDomainName
-    # ForceAutoLogon=1 immediately signs the default user back in after Log off.
-    # Keep standard startup autologon, but remove this override so an administrator can sign in.
-    Remove-VerifiedRegistryValue -Path $WinlogonPath -Name 'ForceAutoLogon'
-
-    $state = Get-AutologonState
-    if (-not $state.ConfigurationMatches) {
-        throw 'Autologon registry values did not pass final verification.'
-    }
-    Write-Log "Autologon configuration verified for '$DefaultDomainName\$DefaultUserName'." 'OK'
-}
-
-function Remove-LegacyChromeStartupShortcut {
-    $script:LegacyShortcutPresentBefore = Test-Path -LiteralPath $LegacyChromeShortcutPath -PathType Leaf
-    Write-Log 'Checking for the legacy All Users Google Chrome startup shortcut.'
-
-    if ($script:LegacyShortcutPresentBefore) {
-        Remove-Item -LiteralPath $LegacyChromeShortcutPath -Force -ErrorAction Stop
-        $script:ChangesMade++
-        $script:LegacyShortcutRemoved = $true
-        Write-Log "Removed legacy Chrome startup shortcut: $LegacyChromeShortcutPath" 'OK'
-    }
-    else {
-        Write-Log 'Legacy Google Chrome startup shortcut is not present.'
-    }
-
-    $script:LegacyShortcutPresentAfter = Test-Path -LiteralPath $LegacyChromeShortcutPath -PathType Leaf
-    if ($script:LegacyShortcutPresentAfter) {
-        $script:VerificationFailures.Add('Legacy Chrome startup shortcut remains present.')
-        throw "The legacy Chrome startup shortcut could not be removed: $LegacyChromeShortcutPath"
-    }
-}
-
-function Get-EdgePath {
-    $candidatePaths = @()
-    if (-not [string]::IsNullOrWhiteSpace(${env:ProgramFiles(x86)})) {
-        $candidatePaths += (Join-Path ${env:ProgramFiles(x86)} 'Microsoft\Edge\Application\msedge.exe')
-    }
-    if (-not [string]::IsNullOrWhiteSpace($env:ProgramFiles)) {
-        $candidatePaths += (Join-Path $env:ProgramFiles 'Microsoft\Edge\Application\msedge.exe')
-    }
-
-    return $candidatePaths |
-        Select-Object -Unique |
-        Where-Object { Test-Path -LiteralPath $_ -PathType Leaf } |
-        Select-Object -First 1
-}
-
-function Get-EdgeRunState {
-    $configuredCommand = Get-RegistryStringValue -Path $RunKeyPath -Name $EdgeRunValueName
-    $edgePath = Get-EdgePath
-    $edgeVersion = $null
-    if ($edgePath) {
-        try { $edgeVersion = [Diagnostics.FileVersionInfo]::GetVersionInfo($edgePath).ProductVersion } catch { }
-    }
-    [pscustomobject]@{
-        EdgeInstalled      = [bool]$edgePath
-        EdgePath           = $edgePath
-        EdgeVersion        = $edgeVersion
-        RunValuePresent    = (-not [string]::IsNullOrWhiteSpace($configuredCommand))
-        RunCommand         = $configuredCommand
-        CommandMatches     = ($null -ne $script:EdgeCommand -and $configuredCommand -ceq $script:EdgeCommand)
-        UrlPresent         = (-not [string]::IsNullOrWhiteSpace($configuredCommand) -and $configuredCommand.Contains($EdgeUrl))
-        InPrivateEnabled   = (-not [string]::IsNullOrWhiteSpace($configuredCommand) -and $configuredCommand -match '(?i)--inprivate(?:\s|$)')
-        NewWindowEnabled   = (-not [string]::IsNullOrWhiteSpace($configuredCommand) -and $configuredCommand -match '(?i)--new-window(?:\s|$)')
-        MaximizedEnabled   = (-not [string]::IsNullOrWhiteSpace($configuredCommand) -and $configuredCommand -match '(?i)--start-maximized(?:\s|$)')
-    }
-}
-
-function Write-ConfigurationStateSummary {
-    param(
-        [Parameter(Mandatory)][string]$Label,
-        [Parameter(Mandatory)]$State
-    )
-
-    Write-Log ("Autologon {0}: Enabled={1}; User={2}; Domain={3}; ForceAutoLogonPresent={4}; ForceAutoLogonEnabled={5}; PasswordPresent={6}; PasswordMatches={7}; ConfigurationMatches={8}." -f `
-        $Label, $State.Autologon.AutoAdminLogonEnabled, $State.Autologon.DefaultUserName, `
-        $State.Autologon.DefaultDomainName, $State.Autologon.ForceAutoLogonPresent, $State.Autologon.ForceAutoLogonEnabled, `
-        $State.Autologon.PasswordPresent, $State.Autologon.PasswordMatches, $State.Autologon.ConfigurationMatches)
-
-    Write-Log ("Edge startup {0}: Installed={1}; Version={2}; RunValuePresent={3}; CommandMatches={4}; UrlPresent={5}; InPrivate={6}; NewWindow={7}; Maximized={8}." -f `
-        $Label, $State.Edge.EdgeInstalled, $State.Edge.EdgeVersion, $State.Edge.RunValuePresent, `
-        $State.Edge.CommandMatches, $State.Edge.UrlPresent, $State.Edge.InPrivateEnabled, `
-        $State.Edge.NewWindowEnabled, $State.Edge.MaximizedEnabled)
-}
-
-function Set-EdgeAutoLaunch {
-    $script:EdgePath = Get-EdgePath
-    if (-not $script:EdgePath) {
-        throw 'Microsoft Edge was not found in either Program Files location.'
-    }
-
-    $escapedUrl = $EdgeUrl.Replace('"','')
-    $script:EdgeCommand = '"{0}" --inprivate --new-window --start-maximized "{1}"' -f $script:EdgePath, $escapedUrl
-    Set-VerifiedRegistryString -Path $RunKeyPath -Name $EdgeRunValueName -Value $script:EdgeCommand
-
-    $edgeState = Get-EdgeRunState
-    if (-not $edgeState.CommandMatches -or -not $edgeState.EdgeInstalled) {
-        $script:VerificationFailures.Add('Edge auto-launch configuration verification failed.')
-        throw 'Edge auto-launch configuration did not pass final verification.'
-    }
-
-    Write-Log "Configured and verified Edge auto-launch for every user: $EdgeUrl" 'OK'
-}
-
-
-function New-StringArrayForJson {
-    [CmdletBinding()]
-    param([AllowNull()]$InputObject)
-
-    [string[]]$items = @(
-        $InputObject |
-        ForEach-Object { [string]$_ } |
-        Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
-    )
-
-    if ($items.Count -eq 0) {
-        return ,([object[]]@())
-    }
-
-    return ,([object[]]$items)
-}
-
-function New-ObjectArrayForJson {
-    [CmdletBinding()]
-    param([AllowNull()]$InputObject)
-
-    [object[]]$items = @(
-        $InputObject |
-        ForEach-Object { $_ }
-    )
-
-    if ($items.Count -eq 0) {
-        return ,([object[]]@())
-    }
-
-    return ,([object[]]$items)
-}
-
-function Write-Telemetry {
-    param([Parameter(Mandatory)][object]$WindowsInfo)
-
-    try {
-        Initialize-LogDirectory
-        $endTime = Get-Date
-        $duration = [math]::Round(($endTime - $StartTime).TotalSeconds, 3)
-
-        $event = [ordered]@{
-            '@timestamp'             = $endTime.ToUniversalTime().ToString('o')
-            EventType                = 'maintenance.execution'
-            ComputerName             = $ComputerName
-            Domain                   = $DomainName
-            ScriptName               = $ScriptName
-            ScriptVersion            = $ScriptVersion
-            RunId                    = $RunId
-            StartTime                = $StartTime.ToUniversalTime().ToString('o')
-            EndTime                  = $endTime.ToUniversalTime().ToString('o')
-            DurationSeconds          = $duration
-            Status                   = $script:FinalStatus
-            OverallResult            = $script:OverallResult
-            ExitCode                 = $script:ExitCode
-            ErrorCount               = $script:ErrorCount
-            WarningCount             = $script:WarningCount
-            FailureMessage           = $script:FailureMessage
-            TextLogPath              = $PublishedLogPath
-            RunningAccount           = $RunningAccount
-            RunningAsSystem          = ($RunningAccount -eq 'NT AUTHORITY\SYSTEM')
-            IsAdministrator          = (Test-IsAdministrator)
-            Targeted                 = $script:Targeted
-            MatchedPattern           = $script:MatchedPattern
-            ConfiguredPatterns       = New-StringArrayForJson -InputObject $ComputerNamePatterns
-            ChangesMade              = $script:ChangesMade
-            VerificationFailureCount = $script:VerificationFailures.Count
-            VerificationFailures     = New-StringArrayForJson -InputObject $script:VerificationFailures
-            Windows                  = $WindowsInfo
-            Configuration            = [ordered]@{
-                ConfigureEdgeInPrivate = [bool]$ConfigureEdgeInPrivate
-                ConfigureAutologon     = [bool]$ConfigureAutologon
-                DefaultUserName   = $DefaultUserName
-                DefaultDomainName = $DefaultDomainName
-                PasswordProvided  = ($ConfigureAutologon -and -not [string]::IsNullOrWhiteSpace($DefaultPasswordBase64))
-                PasswordStorage   = 'Base64ObfuscatedInScript'
-                PasswordValueLogged = $false
-                ForceAutoLogonDesired = $false
-                EdgeUrl           = $EdgeUrl
-                EdgeRunValueName  = $EdgeRunValueName
-            }
-            Before                   = $script:BeforeState
-            After                    = $script:AfterState
-            RegistryChanges          = New-ObjectArrayForJson -InputObject $script:RegistryChanges
-            LegacyChromeShortcut     = [ordered]@{
-                Path          = $LegacyChromeShortcutPath
-                PresentBefore = $script:LegacyShortcutPresentBefore
-                Removed       = $script:LegacyShortcutRemoved
-                PresentAfter  = $script:LegacyShortcutPresentAfter
-            }
-            Edge                     = [ordered]@{
-                ExecutablePath = $script:EdgePath
-                RunCommand     = $script:EdgeCommand
-            }
-        }
-
-        try {
-            $autologonVerified = $false
-            $edgeVerified = $false
-            if ($event.After) {
-                if ($event.After.Autologon) { $autologonVerified = [bool]$event.After.Autologon.ConfigurationMatches }
-                if ($event.After.Edge) { $edgeVerified = [bool]$event.After.Edge.CommandMatches }
-            }
-
-            Write-Log ("Elastic configuration summary: Targeted={0}; MatchedPattern={1}; ChangesMade={2}; VerificationFailures={3}; AutologonVerified={4}; EdgeVerified={5}; LegacyChromeRemoved={6}; Result={7}" -f `
-                $event.Targeted,
-                $event.MatchedPattern,
-                $event.ChangesMade,
-                $event.VerificationFailureCount,
-                $autologonVerified,
-                $edgeVerified,
-                $event.LegacyChromeShortcut.Removed,
-                $event.OverallResult) 'INFO'
-        }
-        catch { }
-
-        $compactJson = $event | ConvertTo-Json -Depth 10 -Compress
-        Write-MaintenanceTelemetryLine -Path $TelemetryPath -JsonLine $compactJson
-
-        $prettyJson = $event | ConvertTo-Json -Depth 10
-        $tempPath = "$LatestTelemetryPath.tmp.$RunId"
-        Set-Content -LiteralPath $tempPath -Value $prettyJson -Encoding UTF8
-        Move-Item -LiteralPath $tempPath -Destination $LatestTelemetryPath -Force
-    }
-    catch {
-        Write-Warning "Unable to write structured telemetry: $($_.Exception.Message)"
-    }
-}
-
-$windowsInfo = Get-WindowsInformation
-
-try {
-    Initialize-LogDirectory
-    Write-Log "===== Edge InPrivate and optional autologon configuration v$ScriptVersion started ====="
-    Write-Log "Text log: $LogPath"
-    Write-Log "Computer name: $ComputerName"
-    Write-Log "Configured computer-name patterns: $($ComputerNamePatterns -join ', ')"
-
-    if (-not (Test-IsAdministrator)) {
-        throw 'Please run this script as Administrator or through a SYSTEM scheduled task.'
-    }
-
-    Test-ConfigurationInput
-
-    $script:MatchedPattern = Get-MatchedComputerPattern -Name $ComputerName -Patterns $ComputerNamePatterns
-    $script:Targeted = (-not [string]::IsNullOrWhiteSpace($script:MatchedPattern))
-
-    if (-not $script:Targeted) {
-        $script:BeforeState = [pscustomobject]@{
-            Autologon = Get-AutologonState
-            Edge      = Get-EdgeRunState
-        }
-        $script:AfterState = $script:BeforeState
-        Write-ConfigurationStateSummary -Label 'unchanged (not targeted)' -State $script:BeforeState
-        $script:OverallResult = 'NotTargeted'
-        $script:FinalStatus = 'Success'
-        Write-Log "Computer '$ComputerName' does not match the configured pattern list. No changes were made."
-        Write-Log '===== Script completed: computer not targeted =====' 'OK'
-    }
-    else {
-        Write-Log "Computer '$ComputerName' matches pattern '$($script:MatchedPattern)'." 'OK'
-
-        $script:BeforeState = [pscustomobject]@{
-            Autologon = Get-AutologonState
-            Edge      = Get-EdgeRunState
-        }
-        Write-ConfigurationStateSummary -Label 'before' -State $script:BeforeState
-
-        if ($ConfigureAutologon) {
-            $script:DecodedPassword = Get-DecodedAutologonPassword
-            Set-AutologonConfiguration
-        }
-        else {
-            Write-Log 'Autologon configuration is disabled for this run; existing Winlogon settings will not be modified.'
-        }
-
-        if ($ConfigureEdgeInPrivate) {
-            Remove-LegacyChromeStartupShortcut
-            Set-EdgeAutoLaunch
-        }
-        else {
-            Write-Log 'Edge InPrivate startup configuration is disabled for this run.'
-        }
-
-        $script:AfterState = [pscustomobject]@{
-            Autologon = Get-AutologonState
-            Edge      = Get-EdgeRunState
-        }
-        Write-ConfigurationStateSummary -Label 'after' -State $script:AfterState
-        Write-Log ("Legacy Chrome startup shortcut: PresentBefore={0}; Removed={1}; PresentAfter={2}." -f `
-            $script:LegacyShortcutPresentBefore, $script:LegacyShortcutRemoved, $script:LegacyShortcutPresentAfter)
-
-        if ($ConfigureAutologon -and -not $script:AfterState.Autologon.ConfigurationMatches) {
-            $script:VerificationFailures.Add('Final autologon configuration does not match the requested values.')
-        }
-        if ($ConfigureEdgeInPrivate -and -not $script:AfterState.Edge.CommandMatches) {
-            $script:VerificationFailures.Add('Final Edge Run value does not match the requested command.')
-        }
-        if ($ConfigureEdgeInPrivate -and $script:LegacyShortcutPresentAfter) {
-            $script:VerificationFailures.Add('Legacy Chrome startup shortcut remains present.')
-        }
-
-        if ($script:VerificationFailures.Count -gt 0) {
-            throw "One or more final verification checks failed: $($script:VerificationFailures -join '; ')"
-        }
-
-        if ($script:ChangesMade -eq 0) {
-            $script:OverallResult = 'AlreadyCompliant'
-        }
-        else {
-            $script:OverallResult = 'ConfiguredAndVerified'
-        }
-        $script:FinalStatus = 'Success'
-        Write-Log ("Requested configuration was verified successfully. EdgeInPrivate={0}; Autologon={1}." -f $ConfigureEdgeInPrivate,$ConfigureAutologon) 'OK'
-        Write-Log '===== Script completed successfully =====' 'OK'
-    }
-}
-catch {
-    $script:ExitCode = 1
-    $script:FinalStatus = 'Failed'
-    $script:OverallResult = 'Failed'
-    $script:FailureMessage = $_.Exception.Message
-    Write-Log "Configuration failed: $($_.Exception.Message)" 'ERROR'
-
-    try {
-        $script:AfterState = [pscustomobject]@{
-            Autologon = Get-AutologonState
-            Edge      = Get-EdgeRunState
-        }
-    }
-    catch {
-        Write-Log "Unable to collect final configuration state: $($_.Exception.Message)" 'WARN'
-    }
-
-    Write-Log '===== Script completed with errors =====' 'ERROR'
-}
-finally {
-    # Clear the decoded credential before final telemetry/log publication.
-    $script:DecodedPassword = $null
-    [GC]::Collect()
-
-    try {
-        Write-Telemetry -WindowsInfo $windowsInfo
-    }
-    catch {
-        Write-Log "Telemetry write failed: $($_.Exception.Message)" 'ERROR'
-        if ($script:ExitCode -eq 0) {
-            $script:FinalStatus = 'TelemetryFailure'
-            $script:OverallResult = 'TelemetryFailure'
-            $script:ExitCode = 4
-        }
-    }
-
-    # Final text-log append before the immutable completed file enters C:\Logs.
-    Write-Log ("Finalizing {0}. Status={1}; Result={2}; ExitCode={3}; Warnings={4}; Errors={5}" -f `
-        $ScriptName,
-        $script:FinalStatus,
-        $script:OverallResult,
-        $script:ExitCode,
-        $script:WarningCount,
-        $script:ErrorCount) $(if ($script:ExitCode -eq 0) { 'OK' } else { 'ERROR' })
-
-    if ($null -ne $LogSession) {
-        $publishResult = Publish-MaintenanceLog -LogSession $LogSession
-
-        if ($publishResult.Published) {
-            Write-Host ("Published completed script 13 text log for Elastic: {0}" -f $PublishedLogPath) -ForegroundColor Green
-        }
-        else {
-            Write-Warning ("Script 13 completed text log remains in staging because publication failed: {0}" -f $publishResult.Path)
-        }
-    }
-}
-
-exit $script:ExitCode
 '@
     }
     ElasticAgent = [ordered]@{
@@ -5410,16 +4613,6 @@ function New-SectionBootstrap {
     param([Parameter(Mandatory)][string]$SectionId)
 
     switch ($SectionId) {
-        'EdgeInPrivate' {
-            return @'
-$settings = $env:COMPTON_SECTION_SETTINGS | ConvertFrom-Json
-[string[]]$patterns = @($settings.Patterns | ForEach-Object { [string]$_ })
-& $env:COMPTON_SECTION_SCRIPT `
-    -ComputerNamePatterns $patterns `
-    -ConfigureEdgeInPrivate ([bool]$settings.ConfigureEdgeInPrivate) `
-    -ConfigureAutologon ([bool]$settings.ConfigureAutologon)
-'@
-        }
         'ElasticAgent' {
             return @'
 $settings = $env:COMPTON_SECTION_SETTINGS | ConvertFrom-Json
@@ -6538,6 +5731,131 @@ function Invoke-MaintenanceSection {
     }
 }
 
+function Invoke-ChromeIncognitoStartupSection {
+    [CmdletBinding()]
+    param([string[]]$Patterns)
+
+    $started = Get-Date
+    $success = $true
+    $notTargeted = -not (Test-ComputerMatchesAnyPattern -ComputerName $env:COMPUTERNAME -Patterns $Patterns)
+    $failure = ''
+    try {
+        if ($notTargeted) {
+            Write-RunnerLog -Message 'Chrome Incognito startup: computer is not targeted; startup settings unchanged.'
+        }
+        else {
+            $chromePaths = @(
+                (Join-Path $env:ProgramFiles 'Google\Chrome\Application\chrome.exe'),
+                (Join-Path ${env:ProgramFiles(x86)} 'Google\Chrome\Application\chrome.exe')
+            )
+            if (-not @($chromePaths | Where-Object { Test-Path -LiteralPath $_ -PathType Leaf }).Count) {
+                throw 'Google Chrome is not installed machine-wide. Install Chrome before applying student startup configuration.'
+            }
+
+            # The machine Run entry invokes a guarded launcher at user sign-in.
+            # Only the exact CC-Student account launches a browser; administrator
+            # and other user accounts immediately return without opening Chrome.
+            $launcherRoot = Join-Path $env:ProgramData 'Compton\BrowserStartup'
+            New-Item -Path $launcherRoot -ItemType Directory -Force | Out-Null
+            $launcherPath = Join-Path $launcherRoot 'Launch-CCStudent-ChromeIncognito.ps1'
+            $launcherLines = @(
+                "# ScriptVersion: 1.0.0",
+                "if (`$env:USERNAME -ine 'CC-Student') { exit 0 }",
+                "`$ErrorActionPreference = 'Stop'",
+                "`$paths = @(",
+                "    (Join-Path `$env:ProgramFiles 'Google\Chrome\Application\chrome.exe'),",
+                "    (Join-Path `${env:ProgramFiles(x86)} 'Google\Chrome\Application\chrome.exe')",
+                ")",
+                "`$chrome = `$paths | Where-Object { Test-Path -LiteralPath `$_ -PathType Leaf } | Select-Object -First 1",
+                "if (-not `$chrome) { exit 1 }",
+                "Start-Process -FilePath `$chrome -ArgumentList '--incognito --new-window --start-maximized https://www.compton.edu'"
+            )
+            $launcherSource = ($launcherLines -join "`r`n") + "`r`n"
+            [IO.File]::WriteAllText($launcherPath, $launcherSource, [Text.UTF8Encoding]::new($true))
+
+            $runPath = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Run'
+            $entryName = 'LaunchComptonChromeIncognito'
+            $psExe = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+            $command = '"{0}" -NoLogo -NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File "{1}"' -f $psExe, $launcherPath
+            New-Item -Path $runPath -Force | Out-Null
+            New-ItemProperty -LiteralPath $runPath -Name $entryName -PropertyType String -Value $command -Force | Out-Null
+            $verified = Get-ItemPropertyValue -LiteralPath $runPath -Name $entryName -ErrorAction Stop
+            if ($verified -cne $command) { throw 'Chrome startup Run value failed verification.' }
+
+            # Remove the exact managed Edge entry, not unrelated Edge policies.
+            function Remove-ManagedEdgeRunValue {
+                param([string]$HiveRoot)
+                $path = "$HiveRoot\Software\Microsoft\Windows\CurrentVersion\Run"
+                if (Test-Path -LiteralPath $path) {
+                    $key = Get-Item -LiteralPath $path -ErrorAction Stop
+                    if ($key.GetValueNames() -icontains 'LaunchComptonEdge') {
+                        $key.Close()
+                        Remove-ItemProperty -LiteralPath $path -Name 'LaunchComptonEdge' -ErrorAction Stop
+                        Write-RunnerLog -Message "Removed deprecated managed Edge startup entry from $HiveRoot."
+                    }
+                    else { $key.Close() }
+                }
+            }
+            Remove-ManagedEdgeRunValue -HiveRoot 'Registry::HKEY_LOCAL_MACHINE'
+            $profiles = @(Get-CimInstance Win32_UserProfile -ErrorAction Stop | Where-Object { -not $_.Special -and $_.LocalPath })
+            foreach ($profile in $profiles) {
+                $sid = [string]$profile.SID
+                if (Test-Path "Registry::HKEY_USERS\$sid") {
+                    Remove-ManagedEdgeRunValue -HiveRoot "Registry::HKEY_USERS\$sid"
+                    continue
+                }
+                $hive = Join-Path $profile.LocalPath 'NTUSER.DAT'
+                if (-not (Test-Path -LiteralPath $hive -PathType Leaf)) { continue }
+                $mount = 'ComptonChrome_' + [guid]::NewGuid().ToString('N')
+                & reg.exe load "HKU\$mount" $hive 2>&1 | Out-Null
+                if ($LASTEXITCODE -ne 0) { throw "Unable to load user hive for Edge startup cleanup: $($profile.LocalPath)" }
+                try { Remove-ManagedEdgeRunValue -HiveRoot "Registry::HKEY_USERS\$mount" }
+                finally {
+                    [gc]::Collect(); [gc]::WaitForPendingFinalizers()
+                    & reg.exe unload "HKU\$mount" 2>&1 | Out-Null
+                    if ($LASTEXITCODE -ne 0) { Write-RunnerLog -Message "Unable to unload temporary user hive $mount." -Level 'ERROR'; $success = $false }
+                }
+            }
+
+            # The old all-users Chrome shortcut could open a normal browser
+            # for every account. Replace its behavior with the guarded launcher.
+            $legacyShortcut = Join-Path $env:ProgramData 'Microsoft\Windows\Start Menu\Programs\Startup\Google Chrome.lnk'
+            if (Test-Path -LiteralPath $legacyShortcut -PathType Leaf) {
+                Remove-Item -LiteralPath $legacyShortcut -Force -ErrorAction Stop
+                Write-RunnerLog -Message 'Removed legacy all-users Google Chrome startup shortcut.'
+            }
+            Write-RunnerLog -Message 'Configured Chrome Incognito at CC-Student sign-in: https://www.compton.edu. Autologon settings unchanged.' -Level 'SUCCESS'
+        }
+    }
+    catch {
+        $success = $false
+        $failure = $_.Exception.Message
+        Write-RunnerLog -Message "Chrome Incognito startup configuration failed: $failure" -Level 'ERROR'
+    }
+    $duration = [math]::Round(((Get-Date) - $started).TotalSeconds,2)
+    $event = [pscustomobject][ordered]@{
+        EventType='maintenance.chrome_incognito_startup'; ComputerName=$env:COMPUTERNAME
+        ScriptName=$RunnerScriptName; ScriptVersion=$RunnerVersion; RunId=$RunnerRunId
+        TimestampUtc=(Get-Date).ToUniversalTime().ToString('o')
+        Status=$(if ($notTargeted) { 'NotTargeted' } elseif ($success) { 'Success' } else { 'Failed' })
+        TargetAccount='CC-Student'; Url='https://www.compton.edu'; FailureMessage=$failure
+        DurationSeconds=$duration
+    }
+    try {
+        Write-RunnerTelemetryLine -Path $RunnerTelemetryPath -JsonLine ($event | ConvertTo-Json -Depth 5 -Compress)
+        Write-RunnerJsonAtomically -Path (Join-Path $LogDirectory '04_Chrome_Incognito_Startup.latest.json') -Json ($event | ConvertTo-Json -Depth 5)
+    }
+    catch {
+        $success = $false
+        Write-RunnerLog -Message "Chrome startup telemetry failed: $($_.Exception.Message)" -Level 'ERROR'
+    }
+    return [pscustomobject]@{
+        SectionId='ChromeIncognito'; DisplayName='CC-Student Chrome Incognito startup'
+        ExitCode=$(if ($success) {0} else {1}); Success=$success
+        RebootRequired=$false; DurationSeconds=$duration; FailureMessage=$failure
+    }
+}
+
 function Get-StartupCommandFileName {
     [CmdletBinding()]
     param([AllowEmptyString()][string]$Command)
@@ -7247,7 +6565,7 @@ try {
         [pscustomobject]@{ Id='SystemRestore'; Name='System Restore and verified restore point'; Enabled=$RunSystemRestore; Settings=[ordered]@{} }
         [pscustomobject]@{ Id='PrinterAndPaperCut'; Name='SHARP driver, PaperCut, and printer'; Enabled=$RunPrinterAndPaperCut; Settings=[ordered]@{} }
         [pscustomobject]@{ Id='Office2024Maintenance'; Name='Office LTSC detection, Office 2024 migration, and activation'; Enabled=$RunOffice2024Maintenance; Settings=[ordered]@{} }
-        [pscustomobject]@{ Id='EdgeInPrivate'; Name='Microsoft Edge InPrivate startup'; Enabled=$RunEdgeInPrivate; Settings=[ordered]@{ Patterns=@($EdgeInPrivateComputerPatterns); ConfigureEdgeInPrivate=$true; ConfigureAutologon=$false } }
+        [pscustomobject]@{ Id='ChromeIncognito'; Name='CC-Student Chrome Incognito startup'; Enabled=$RunChromeIncognito; Settings=[ordered]@{ Patterns=@($ChromeIncognitoComputerPatterns) } }
         [pscustomobject]@{ Id='ElasticAgent'; Name='Elastic Agent installation'; Enabled=$RunElasticAgent; Settings=[ordered]@{ Prefixes=@($ElasticAgentComputerPrefixes); ForceReinstall=[bool]$ForceElasticAgentReinstall } }
         [pscustomobject]@{ Id='BrowserHomepage'; Name='Browser homepage policies'; Enabled=$RunBrowserHomepage; Settings=[ordered]@{ HomepageUrl=$HomepageUrl } }
         [pscustomobject]@{ Id='AdobeReaderPolicy'; Name='Adobe Reader local-only lab policy'; Enabled=$RunAdobeReaderPolicy; Settings=[ordered]@{} }
@@ -7274,6 +6592,11 @@ try {
 
         if ($section.Id -eq 'Office2024Maintenance') {
             [void]$results.Add((Invoke-Office2024MaintenanceSection))
+            continue
+        }
+
+        if ($section.Id -eq 'ChromeIncognito') {
+            [void]$results.Add((Invoke-ChromeIncognitoStartupSection -Patterns @($section.Settings.Patterns)))
             continue
         }
 

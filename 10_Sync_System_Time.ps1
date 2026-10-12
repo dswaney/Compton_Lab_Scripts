@@ -1,4 +1,5 @@
 #requires -Version 5.1
+# ScriptVersion: 2.0.11
 <#
 .SYNOPSIS
     Configures and verifies Windows Time synchronization.
@@ -13,9 +14,10 @@
 
 .NOTES
     ScriptName: 10_Sync_System_Time.ps1
-    Version:    2.0.10
-    LastUpdated: 2026-08-17
-    Changes: v2.0.10 fixes telemetry finalization parameter binding introduced in v2.0.9; New-TelemetryEvent now receives all parameters before the summary log is written.
+    Version:    2.0.11
+    LastUpdated: 2026-10-12
+    Changes: v2.0.11 ensures Netlogon is Automatic and Running on domain-joined computers before time synchronization.
+             v2.0.10 fixes telemetry finalization parameter binding introduced in v2.0.9; New-TelemetryEvent now receives all parameters before the summary log is written.
              v2.0.9 makes Script 10 telemetry mapping-safe by normalizing Changes.Before/After into scalar or JSON-string fields
              and forces ManualNtpServers to serialize as a true JSON array when empty.
              v2.0.8 moves Script 10-specific telemetry under a dedicated time_synchronization namespace,
@@ -59,7 +61,7 @@ Set-StrictMode -Version 2.0
 $ErrorActionPreference = 'Stop'
 
 $script:ScriptName = '10_Sync_System_Time.ps1'
-$script:ScriptVersion = '2.0.10'
+$script:ScriptVersion = '2.0.11'
 $script:RunId = [guid]::NewGuid().Guid
 $script:StartTime = Get-Date
 $script:Warnings = @()
@@ -525,6 +527,39 @@ function Stop-W32TimeSafely {
     }
 }
 
+function Ensure-DomainNetlogonService {
+    param([Parameter(Mandatory)]$DomainInfo)
+
+    if (-not $DomainInfo.PartOfDomain) {
+        Write-Log -Message 'Netlogon enforcement skipped: this computer is not domain joined.'
+        return
+    }
+
+    $before = Get-CimInstance -ClassName Win32_Service -Filter "Name='Netlogon'" -ErrorAction Stop
+    if ($null -eq $before) { throw 'Netlogon service is missing on this domain-joined computer.' }
+    Write-Log -Message ('Netlogon before: State={0}; StartMode={1}.' -f $before.State, $before.StartMode)
+
+    if ($before.StartMode -ne 'Auto') {
+        Set-Service -Name 'Netlogon' -StartupType Automatic -ErrorAction Stop
+    }
+    $service = Get-Service -Name 'Netlogon' -ErrorAction Stop
+    if ($service.Status -ne 'Running') {
+        Start-Service -Name 'Netlogon' -ErrorAction Stop
+    }
+    $service.WaitForStatus([System.ServiceProcess.ServiceControllerStatus]::Running, [timespan]::FromSeconds(30))
+    $after = Get-CimInstance -ClassName Win32_Service -Filter "Name='Netlogon'" -ErrorAction Stop
+    $verified = ($after.StartMode -eq 'Auto' -and $after.State -eq 'Running')
+    $script:Changes += [pscustomobject]@{
+        Component = 'NetlogonService'
+        Before = ('StartMode={0}; State={1}' -f $before.StartMode, $before.State)
+        After = ('StartMode={0}; State={1}' -f $after.StartMode, $after.State)
+        Changed = ($before.StartMode -ne $after.StartMode -or $before.State -ne $after.State)
+        Verified = $verified
+    }
+    if (-not $verified) { throw 'Netlogon did not reach the required Automatic and Running state.' }
+    Write-Log -Message 'Netlogon verified: Automatic and Running.' -Level SUCCESS
+}
+
 function Set-TimeServiceStartup {
     $before = Get-ServiceSnapshot
     $changed = $false
@@ -966,6 +1001,8 @@ try {
     if ($resolvedMode -eq 'DomainHierarchy' -and -not $domainInfo.PartOfDomain) {
         throw 'DomainHierarchy mode was requested, but this computer is not joined to a domain.'
     }
+
+    Ensure-DomainNetlogonService -DomainInfo $domainInfo
 
     Write-Log -Message ('Resolved synchronization mode: {0}.' -f $resolvedMode)
 

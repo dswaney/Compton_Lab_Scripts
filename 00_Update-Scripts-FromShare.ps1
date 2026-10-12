@@ -1,8 +1,10 @@
 #requires -version 5.1
 # =====================================================================
 # ScriptName: 00_Update-Scripts-FromShare.ps1
-# ScriptVersion: 4.11.2
-# LastUpdated: 2026-10-07
+# ScriptVersion: 4.12.0
+# LastUpdated: 2026-10-12
+# Changes: v4.12.0 verifies the current share registrar after updater self-relaunch,
+#          reconciles every successful sync and verifies direct or fixed launcher actions.
 # Changes: v4.11.2 approves the component-store repair helper used by Script 08
 #          for source-WIM repair and guarded Windows in-place repair escalation.
 # Changes: v4.11.0 approves and supplementally deploys SoftwareInventory.Policy.json
@@ -41,7 +43,7 @@ $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 
 $ScriptName = '00_Update-Scripts-FromShare.ps1'
-$ScriptVersion = '4.11.1'
+$ScriptVersion = '4.12.0'
 $DefaultPreferredSourceRoot = '\\SERVER\DeploymentShare'
 $DefaultFallbackSourceRoot = '\\FALLBACK-SERVER\DeploymentShare'
 $SourceConfigurationPath = Join-Path $env:ProgramData 'ComptonMaintenance\Updater.Source.json'
@@ -656,12 +658,68 @@ function Write-ExecutionRecord {
 }
 
 function Invoke-TaskReconciliation {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][string]$SourceRoot)
+
+    # Recheck the authoritative registrar after self-update/relaunch. This also
+    # handles deployment manifests that do not yet list the registrar.
+    $sourcePath = Join-Path $SourceRoot $RegisterTasksName
+    if (-not (Test-Path -LiteralPath $sourcePath -PathType Leaf)) {
+        throw "Current task-registration script is missing from the source share: $sourcePath"
+    }
+    $entry = [pscustomobject]@{
+        Name = $RegisterTasksName
+        Role = 'TaskRegistrar'
+        Version = (Get-FileVersionText -Path $sourcePath)
+        SHA256 = ''
+    }
+    [void](Install-ManifestEntry -Entry $entry -SourceRoot $SourceRoot)
     $path = Join-Path $LocalRoot $RegisterTasksName
-    if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { throw "Task-registration script is missing: $path" }
-    Write-UpdaterStatus 'Reconciling scheduled maintenance tasks.' 'ACTION'
-    $process = Start-Process -FilePath $PowerShellExe -ArgumentList "-NoProfile -ExecutionPolicy Bypass -File `"$path`"" -Wait -PassThru -WindowStyle Hidden
-    if ($process.ExitCode -ne 0) { throw "Task reconciliation returned exit code $($process.ExitCode)." }
-    Write-UpdaterStatus 'Scheduled task reconciliation completed.' 'OK'
+    if ((Get-Sha256 -Path $path) -ne (Get-Sha256 -Path $sourcePath)) {
+        throw 'Task registrar does not match the current source share. Task reconciliation was not started.'
+    }
+    $parserResult = Test-PowerShellFile -Path $path
+    if (-not $parserResult.Valid) { throw "Task registrar parser validation failed: $path" }
+
+    Write-UpdaterStatus "Reconciling scheduled maintenance tasks with $RegisterTasksName version $($entry.Version)." 'ACTION'
+    $arguments = "-NoProfile -NonInteractive -ExecutionPolicy Bypass -File `"$path`" -ScriptsRoot `"$LocalRoot`""
+    $process = Start-Process -FilePath $PowerShellExe -ArgumentList $arguments -Wait -PassThru -WindowStyle Hidden
+    if ($process.ExitCode -ne 0) { throw "Task reconciliation returned exit code $($process.ExitCode). Review the registrar log in C:\Temp." }
+
+    $requiredScripts = @(
+        [pscustomobject]@{ Script=$ScriptName; ActionId='UpdateScripts' },
+        [pscustomobject]@{ Script=$CombinedSundayScriptName; ActionId='SundayLabApplicationMaintenance' },
+        [pscustomobject]@{ Script='14_Endpoint_Health_Inventory.ps1'; ActionId='EndpointHealthInventory' }
+    )
+    $tasks = @(Get-ScheduledTask -TaskPath '\' -ErrorAction Stop)
+    foreach ($definition in $requiredScripts) {
+        $requiredScript = $definition.Script
+        $launcherPath = Join-Path $LocalRoot 'Invoke-MaintenanceScript.ps1'
+        $expectedPath = Join-Path $LocalRoot $requiredScript
+        $matches = @($tasks | Where-Object {
+            $task = $_
+            $correctActions = @($task.Actions | Where-Object {
+                ([string]$_.Execute -ieq $PowerShellExe) -and
+                (
+                    ([string]$_.Arguments -match ('(?i)-File\s+"' + [regex]::Escape($expectedPath) + '"(?:\s|$)')) -or
+                    (
+                        ([string]$_.Arguments -match ('(?i)-File\s+"' + [regex]::Escape($launcherPath) + '"(?:\s|$)')) -and
+                        ([string]$_.Arguments -match ('(?i)-ActionId\s+"?' + [regex]::Escape($definition.ActionId) + '"?(?:\s|$)'))
+                    )
+                )
+            })
+            $task.Settings.Enabled -and $correctActions.Count -gt 0
+        })
+        if ($matches.Count -eq 0) {
+            throw "Task reconciliation verification failed: no enabled root task runs $expectedPath."
+        }
+        Write-UpdaterStatus "Verified task action for $requiredScript : $($matches.TaskName -join ', ')" 'OK'
+    }
+    $updaterTask = Get-ScheduledTask -TaskName '01. Check for Updated Scripts' -TaskPath '\' -ErrorAction Stop
+    if (($updaterTask.Actions.Arguments -join ' ') -match '00_Update-Scripts-FromGitHub\.ps1') {
+        throw 'The updater task still references the retired GitHub updater.'
+    }
+    Write-UpdaterStatus 'Scheduled task reconciliation completed and required actions verified. Tasks were not started.' 'OK'
 }
 
 try {
@@ -729,7 +787,7 @@ try {
         exit $childExit
     }
 
-    Invoke-TaskReconciliation
+    Invoke-TaskReconciliation -SourceRoot $sourceRoot
     Write-UpdaterStatus 'Manifest synchronization completed successfully.' 'OK'
     Write-ExecutionRecord -Status 'Success' -ExitCode 0 -FailureMessage $null
     exit 0
@@ -755,3 +813,4 @@ finally {
         }
     } catch { }
 }
+

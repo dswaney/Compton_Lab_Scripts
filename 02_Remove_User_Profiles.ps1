@@ -1,8 +1,10 @@
 # =====================================================================
 # ScriptName: 02_Remove_User_Profiles.ps1
-# ScriptVersion: 2.5.0
-# LastUpdated: 2026-10-07
-# Changes: v2.5.0 removes Copilot removal/policies and Edge InPrivate startup
+# ScriptVersion: 2.5.1
+# LastUpdated: 2026-10-12
+# Changes: v2.5.1 removes only ForceAutoLogon for enabled CC-Students autologon.
+#          All other Winlogon/autologon values remain unchanged.
+#          v2.5.0 removes Copilot removal/policies and Edge InPrivate startup
 #          configuration from Script 02. Those functions are now owned by
 #          04_Sunday_Lab_Application_Maintenance.ps1; Script 02 is limited to
 #          profile cleanup and standard user-environment preferences.
@@ -59,7 +61,7 @@ $script:BaseFileName = "{0}-RemoveUserProfiles-{1}" -f $script:ComputerName, $sc
 $script:YamlLogPath = Join-Path $LogDirectory ($script:BaseFileName + '.yaml')
 $script:RunId = [guid]::NewGuid().ToString('N')
 $script:ScriptName = '02_Remove_User_Profiles.ps1'
-$script:ScriptVersion = '2.5.0'
+$script:ScriptVersion = '2.5.1'
 $script:Domain = $env:USERDNSDOMAIN
 $script:TextLogPath = $null
 $script:PublishedTextLogPath = $null
@@ -463,6 +465,44 @@ function Write-Log {
         'SUCCESS' { Write-Host $line -ForegroundColor Green }
         'WARNING' { Write-Host $line -ForegroundColor Yellow }
         'ERROR'   { Write-Host $line -ForegroundColor Red }
+    }
+}
+
+function Remove-CCStudentsForceAutoLogon {
+    [CmdletBinding(SupportsShouldProcess = $true, ConfirmImpact = 'Low')]
+    param()
+
+    $winlogonPath = 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon'
+    try {
+        if (-not (Test-Path -LiteralPath $winlogonPath)) {
+            Write-Log 'ForceAutoLogon cleanup skipped: Winlogon registry key is absent.' 'INFO'
+            return
+        }
+
+        # Read only account/enabled state, never the autologon password.
+        $key = Get-Item -LiteralPath $winlogonPath -ErrorAction Stop
+        $autoAdminLogon = [string]$key.GetValue('AutoAdminLogon', '')
+        $defaultUserName = ([string]$key.GetValue('DefaultUserName', '')).Trim()
+
+        # Accept the exact account, DOMAIN\CC-Students, or CC-Students@domain.
+        if ($autoAdminLogon -ne '1' -or
+            $defaultUserName -notmatch '^(?:[^\\]+\\)?CC-Students(?:@[^@\\]+)?$') {
+            Write-Log 'ForceAutoLogon cleanup skipped: enabled CC-Students autologon is not configured.' 'INFO'
+            return
+        }
+
+        if ($key.GetValueNames() -inotcontains 'ForceAutoLogon') {
+            Write-Log 'CC-Students autologon: ForceAutoLogon is already absent.' 'OK'
+            return
+        }
+
+        if ($PSCmdlet.ShouldProcess("$winlogonPath\ForceAutoLogon", 'Remove forced CC-Students logon registry value')) {
+            Remove-ItemProperty -LiteralPath $winlogonPath -Name 'ForceAutoLogon' -ErrorAction Stop
+            Write-Log 'Removed ForceAutoLogon for CC-Students. AutoAdminLogon and all other autologon settings were preserved.' 'OK'
+        }
+    }
+    catch {
+        Write-Log "Failed to remove CC-Students ForceAutoLogon: $($_.Exception.Message)" 'ERROR'
     }
 }
 
@@ -1407,6 +1447,7 @@ if (-not (Test-IsAdministrator)) {
 }
 
 Ensure-LogDirectory
+Remove-CCStudentsForceAutoLogon
 $script:DiskBefore = Get-SystemDriveSpace
 if ($script:DiskBefore) { $script:Summary.DiskFreeGBBefore = $script:DiskBefore.FreeGB }
 Write-YamlLog

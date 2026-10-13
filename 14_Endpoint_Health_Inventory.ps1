@@ -41,8 +41,11 @@
 
 .NOTES
     ScriptName:    14_Endpoint_Health_Inventory.ps1
-    ScriptVersion: 1.9.0
-    LastUpdated:   2026-10-06
+    ScriptVersion: 1.9.1
+    Audit scope:   Registry Success / service SetValue auditing applies only to SSC* hosts.
+                   Requires Administrator/SYSTEM and a thawed system for persistence.
+                   Elastic System/Security event collection must be configured separately.
+    LastUpdated:   2026-10-13
     Changes:       v1.9.0 adds Dell TechDirect warranty collection with a serial-bound,
                    persistent local snapshot. HP and Dell now publish the same normalized
                    warranty fields, while Dell API credentials remain outside logs,
@@ -260,7 +263,7 @@ Set-StrictMode -Version 2.0
 $ErrorActionPreference = 'Stop'
 
 $script:ScriptName       = '14_Endpoint_Health_Inventory.ps1'
-$script:ScriptVersion    = '1.9.0'
+$script:ScriptVersion    = '1.9.1'
 $script:RunId            = [guid]::NewGuid().Guid
 $script:StartTime        = Get-Date
 $script:WarningCount     = 0
@@ -4948,12 +4951,129 @@ function Write-RemediationCandidateTelemetry {
     Write-MaintenanceTelemetryLine -Path $script:NdjsonPath -JsonLine $jsonCompact
 }
 
+function Get-RegistrySuccessAuditPolicy {
+    # GUID and numeric CSV field avoid localized subcategory/setting names.
+    $guid = '{0CCE921E-69AE-11D9-BED3-505054503030}'
+    $auditpol = Join-Path $env:SystemRoot 'System32\auditpol.exe'
+    $output = @(& $auditpol /get "/subcategory:$guid" /r 2>&1)
+    $nativeExitCode = $LASTEXITCODE
+    if ($nativeExitCode -ne 0) { throw "auditpol query failed ($nativeExitCode): $($output -join ' ')" }
+    $lines = @($output | ForEach-Object { [string]$_ } | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+    $headers = @('Machine','Target','Subcategory','Guid','Inclusion','Exclusion','SettingValue')
+    $rows = @($lines | Select-Object -Skip 1 | ConvertFrom-Csv -Header $headers)
+    $row = @($rows | Where-Object { $_.Guid -ieq $guid })
+    if ($row.Count -ne 1 -or $row[0].SettingValue -notmatch '^[0-3]$') {
+        throw 'Unable to verify the numeric Registry audit policy.'
+    }
+    return [pscustomobject]@{
+        SettingValue = [int]$row[0].SettingValue
+        SuccessEnabled = (([int]$row[0].SettingValue -band 1) -ne 0)
+    }
+}
+
+function Test-ServiceRegistryAuditRule {
+    param([Parameter(Mandatory)]$Acl)
+    $rules = @($Acl.GetAuditRules($true, $true, [Security.Principal.SecurityIdentifier]))
+    return (@($rules | Where-Object {
+        $_.IdentityReference.Value -eq 'S-1-1-0' -and
+        ($_.RegistryRights -band [Security.AccessControl.RegistryRights]::SetValue) -ne 0 -and
+        ($_.AuditFlags -band [Security.AccessControl.AuditFlags]::Success) -ne 0 -and
+        ($_.PropagationFlags -band [Security.AccessControl.PropagationFlags]::InheritOnly) -eq 0
+    }).Count -gt 0)
+}
+
+function Initialize-UpdateServiceRegistryAuditing {
+    # This gate precedes all audit policy and registry mutations.
+    $computerName = [string]$env:COMPUTERNAME
+    if ($computerName -notlike 'SSC*') {
+        Write-Log -Level 'INFO' -Message "Update service auditing skipped: hostname '$computerName' does not begin with SSC."
+        return [pscustomobject]@{ Status = 'SkippedHostname'; Scope = 'SSC*'; ComputerName = $computerName; FailedCount = 0; Services = [object[]]@() }
+    }
+
+    $result = [ordered]@{
+        Status = 'Running'; Scope = 'SSC*'; ComputerName = $computerName
+        AuditPolicySuccessEnabled = $false; AuditPolicyChanged = $false
+        AuditPolicyBefore = $null; AuditPolicyAfter = $null
+        Services = [object[]]@(); FailedCount = 0
+        CollectionRequired = 'Elastic System integration: System 7040 and Security 4657'
+    }
+    try {
+        $beforePolicy = Get-RegistrySuccessAuditPolicy
+        $result.AuditPolicyBefore = $beforePolicy.SettingValue
+        if (-not $beforePolicy.SuccessEnabled) {
+            $auditpol = Join-Path $env:SystemRoot 'System32\auditpol.exe'
+            # Preserve the existing Failure setting and all other subcategories.
+            $output = @(& $auditpol /set '/subcategory:{0CCE921E-69AE-11D9-BED3-505054503030}' /success:enable 2>&1)
+            $nativeExitCode = $LASTEXITCODE
+            if ($nativeExitCode -ne 0) { throw "auditpol enable failed ($nativeExitCode): $($output -join ' ')" }
+            $result.AuditPolicyChanged = $true
+        }
+        $afterPolicy = Get-RegistrySuccessAuditPolicy
+        $result.AuditPolicyAfter = $afterPolicy.SettingValue
+        $result.AuditPolicySuccessEnabled = $afterPolicy.SuccessEnabled
+        if (-not $afterPolicy.SuccessEnabled) { throw 'Registry Success auditing did not verify; check domain audit policy.' }
+    }
+    catch {
+        $result.Status = 'FailedPolicy'; $result.FailedCount = 1
+        Write-Log -Level 'WARN' -Message "Update service registry audit policy failed: $($_.Exception.Message)"
+        Add-Finding -Severity 'Warning' -Category 'Auditing' -Check 'UpdateServiceAuditPolicy' -Message $_.Exception.Message
+        return [pscustomobject]$result
+    }
+
+    $items = New-Object System.Collections.Generic.List[object]
+    $everyone = New-Object Security.Principal.SecurityIdentifier('S-1-1-0')
+    foreach ($serviceName in @('wuauserv','WaaSMedicSvc','UsoSvc','uhssvc','BITS','DoSvc')) {
+        $path = "HKLM:\SYSTEM\CurrentControlSet\Services\$serviceName"
+        $entry = [ordered]@{ Name = $serviceName; Path = $path; Status = 'NotFound'; Changed = $false; Start = $null; Error = $null }
+        try {
+            if (-not (Test-Path -LiteralPath $path -ErrorAction Stop)) {
+                Write-Log -Level 'INFO' -Message "Service audit key not installed; skipped: $serviceName"
+                $items.Add([pscustomobject]$entry)
+                continue
+            }
+            # Read the existing security descriptor; add only one non-inherited
+            # SetValue/Success audit rule. Preserve ownership, DACL and other SACL entries.
+            $acl = Get-Acl -LiteralPath $path -Audit -ErrorAction Stop
+            $accessSections = [Security.AccessControl.AccessControlSections]::Access -bor [Security.AccessControl.AccessControlSections]::Owner -bor [Security.AccessControl.AccessControlSections]::Group
+            $accessBefore = $acl.GetSecurityDescriptorSddlForm($accessSections)
+            if (-not (Test-ServiceRegistryAuditRule -Acl $acl)) {
+                $rule = New-Object Security.AccessControl.RegistryAuditRule(
+                    $everyone,
+                    [Security.AccessControl.RegistryRights]::SetValue,
+                    [Security.AccessControl.InheritanceFlags]::None,
+                    [Security.AccessControl.PropagationFlags]::None,
+                    [Security.AccessControl.AuditFlags]::Success)
+                $acl.AddAuditRule($rule)
+                Set-Acl -LiteralPath $path -AclObject $acl -ErrorAction Stop
+                $entry.Changed = $true
+            }
+            $verifiedAcl = Get-Acl -LiteralPath $path -Audit -ErrorAction Stop
+            if (-not (Test-ServiceRegistryAuditRule -Acl $verifiedAcl)) { throw 'SetValue Success auditing rule did not verify.' }
+            if ($verifiedAcl.GetSecurityDescriptorSddlForm($accessSections) -ne $accessBefore) { throw 'Registry ownership/access permissions changed unexpectedly during auditing setup.' }
+            $entry.Start = Get-ItemPropertyValue -LiteralPath $path -Name Start -ErrorAction Stop
+            $entry.Status = 'Verified'
+            Write-Log -Level 'INFO' -Message "Service registry auditing verified: $serviceName; Changed=$($entry.Changed); Start=$($entry.Start)"
+        }
+        catch {
+            $entry.Status = 'Failed'; $entry.Error = $_.Exception.Message
+            $result.FailedCount++
+            Write-Log -Level 'WARN' -Message "Service registry auditing failed for $serviceName : $($entry.Error)"
+            Add-Finding -Severity 'Warning' -Category 'Auditing' -Check 'UpdateServiceRegistryAudit' -Message "Registry auditing failed for $serviceName : $($entry.Error)" -FingerprintComponents @($serviceName)
+        }
+        $items.Add([pscustomobject]$entry)
+    }
+    $result.Services = [object[]]@($items | ForEach-Object { $_ })
+    $result.Status = if ($result.FailedCount -gt 0) { 'CompletedWithWarnings' } else { 'Verified' }
+    return [pscustomobject]$result
+}
+
 Ensure-Directory -Path $LogDirectory
 Write-Log -Message ("Starting {0} version {1}. RunId={2}" -f
     $script:ScriptName, $script:ScriptVersion, $script:RunId)
 Write-Log -Message ("Active staged text log: {0}" -f $script:LogPath)
 Write-Log -Message ("Completed text log publish path: {0}" -f $script:PublishedLogPath)
 
+$updateServiceAuditing = Invoke-Collector -Name 'UpdateServiceRegistryAuditing' -ScriptBlock { Initialize-UpdateServiceRegistryAuditing }
 $healthBaseline  = Get-OptionalHealthBaseline
 $remoteAccess    = Invoke-Collector -Name 'RestrictedWinRM' -ScriptBlock { Initialize-RestrictedWinRM }
 $autopilotHash   = Invoke-Collector -Name 'LocalAutopilotHardwareHash' -ScriptBlock { Save-LocalAutopilotHardwareHash }
@@ -5124,6 +5244,8 @@ $event = [ordered]@{
         SoftwareInstalledSincePreviousCount = if ($softwareInventory) { $softwareInventory.Summary.InstalledCount } else { $null }
         SoftwareUpdatedSincePreviousCount = if ($softwareInventory) { $softwareInventory.Summary.UpdatedCount } else { $null }
         SoftwareRemovedSincePreviousCount = if ($softwareInventory) { $softwareInventory.Summary.RemovedCount } else { $null }
+        UpdateServiceAuditStatus = if ($updateServiceAuditing) { $updateServiceAuditing.Status } else { 'CollectorFailed' }
+        UpdateServiceAuditFailureCount = if ($updateServiceAuditing) { $updateServiceAuditing.FailedCount } else { $null }
         BIOSSettingsCollectionStatus = if ($biosSettings) { $biosSettings.Status } else { $null }
         BIOSSettingsCount = if ($biosSettings) { $biosSettings.SettingsCount } else { $null }
         BIOSUpdateAvailable = if ($biosUpdateEvidence) { $biosUpdateEvidence.UpdateAvailable } else { $null }
@@ -5135,6 +5257,7 @@ $event = [ordered]@{
     Hardware      = $hardware
     RemoteAccess  = $remoteAccess
     AutopilotHash = $autopilotHash
+    UpdateServiceAuditing = $updateServiceAuditing
     Lifecycle     = [ordered]@{
         Warranty = $warranty
     }
@@ -5242,3 +5365,4 @@ if ($null -ne $script:LogSession) {
 }
 
 exit $exitCode
+

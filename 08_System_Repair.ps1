@@ -1,8 +1,26 @@
-﻿# =====================================================================
+# =====================================================================
 # ScriptName: 08_System_Repair.ps1
-# ScriptVersion: 4.9.2
-# LastUpdated: 2026-10-08
-# Changes: v4.9.2 reads approval-key.txt from the central Installers share.
+# ScriptVersion: 4.13.0
+# LastUpdated: 2026-10-12
+# Changes: v4.13.0 adds read-only shell handler/server validation, thumbnail
+#          and preview inventories, and Explorer fault-module correlation.
+#          Machine registry scope and unavailable/truncated checks are explicit.
+#          No handler deletion, permission edits or Explorer restarts.
+# Previous: v4.12.0 adds crash-dump readiness, retained memory-test evidence,
+#          and phase-aware update-service configuration/change reporting.
+#          New checks are observation-only; no tests, reboots or services changed.
+# Previous: v4.11.0 adds observation-only performance, power, hardware, device,
+#          boot/startup and reboot initiator diagnostics before repair and cleanup.
+#          Compatible with Windows PowerShell 5.1; structured results include
+#          partial/unavailable states. No new automatic repair actions.
+# Previous: v4.10.0 separates disk repair from AutoRepairOnDetection.
+#          Disk repairs require AllowDiskRepair; offline repair also requires
+#          AllowOfflineDiskRepair. Deep Freeze systems must report Thawed and
+#          ConfirmThawedMaintenanceWindow must be supplied for disk operations.
+#          Frozen/unknown states defer disk operations and script-owned reboot.
+#          The thawed-window switch is an administrator confirmation, not control
+#          of the external Deep Freeze schedule. Existing boot repair is not cleared.
+# Previous: v4.9.2 reads approval-key.txt from the central Installers share.
 #          File permissions are managed separately by the administrator.
 # Previous: v4.9.0 requires a matching, unexpired n8n approval in addition to
 #          AllowComponentStoreEscalation; lookup failures defer escalation.
@@ -60,11 +78,17 @@
 
 [CmdletBinding()]
 param(
+    [ValidateRange(2,30)][int]$PerformanceSampleSeconds = 10,
+    [ValidateRange(1,30)][int]$DiagnosticDaysBack = 7,
     [switch]$AutoRepairOnDetection = $false,
     [switch]$AllowWmiRepair = $true,
     [switch]$AllowNetworkReset = $false,
     [switch]$AllowWindowsUpdateReset = $false,
+    # General automatic repair does not authorize filesystem repairs.
+    [switch]$AllowDiskRepair = $false,
     [switch]$AllowOfflineDiskRepair = $false,
+    # Confirm a thawed window through repair reboots and post-reboot verification.
+    [switch]$ConfirmThawedMaintenanceWindow = $false,
     [switch]$AllowFirewallReset = $false,
     [switch]$AllowIconCacheRebuild = $false,
     [switch]$AllowExplorerHealthRepair = $true,
@@ -96,7 +120,7 @@ param(
 $ErrorActionPreference = 'Stop'
 
 $script:ScriptName = '08_System_Repair.ps1'
-$script:ScriptVersion = '4.9.2'
+$script:ScriptVersion = '4.13.0'
 $script:RunId = [guid]::NewGuid().Guid
 $script:TelemetryNdjsonPath = Join-Path $LogDirectory 'Maintenance-Telemetry.ndjson'
 $script:LatestTelemetryPath = Join-Path $LogDirectory '08_System_Repair.latest.json'
@@ -110,6 +134,7 @@ $script:TelemetryWritten = $false
 $script:FinalExitCode = 0
 $script:FinalStatus = 'Running'
 $script:FailureMessage = $null
+$script:ObservationDiagnostics = [ordered]@{}
 $script:PendingRebootBefore = $null
 $script:PendingRebootAfter = $null
 $script:DiskSpaceBefore = $null
@@ -134,6 +159,9 @@ $script:Summary = [ordered]@{
     PendingRebootReasonsBefore   = New-Object System.Collections.Generic.List[string]
     PendingRebootReasonsAfter    = New-Object System.Collections.Generic.List[string]
     DiskCorruptionSuspected      = $false
+    DiskScanStatus               = 'NotRun'
+    DiskMaintenanceDeferred      = $false
+    DeepFreezeDiskState          = 'NotChecked' 
     DismCorruptionDetected       = $false
     SfcIntegrityViolations       = $false
     SfcRepairAttempted           = $false
@@ -310,6 +338,8 @@ function Write-YamlLog {
         $lines.Add("  allow_wmi_repair: $(ConvertTo-YamlScalar $AllowWmiRepair)") | Out-Null
         $lines.Add("  allow_network_reset: $(ConvertTo-YamlScalar $AllowNetworkReset)") | Out-Null
         $lines.Add("  allow_windows_update_reset: $(ConvertTo-YamlScalar $AllowWindowsUpdateReset)") | Out-Null
+        $lines.Add("  allow_disk_repair: $(ConvertTo-YamlScalar $AllowDiskRepair)") | Out-Null
+        $lines.Add("  confirm_thawed_maintenance_window: $(ConvertTo-YamlScalar $ConfirmThawedMaintenanceWindow)") | Out-Null
         $lines.Add("  allow_offline_disk_repair: $(ConvertTo-YamlScalar $AllowOfflineDiskRepair)") | Out-Null
         $lines.Add("  allow_firewall_reset: $(ConvertTo-YamlScalar $AllowFirewallReset)") | Out-Null
         $lines.Add("  allow_icon_cache_rebuild: $(ConvertTo-YamlScalar $AllowIconCacheRebuild)") | Out-Null
@@ -339,6 +369,9 @@ function Write-YamlLog {
         $lines.Add("  warnings: $(ConvertTo-YamlScalar $script:Summary.Warnings)") | Out-Null
         $lines.Add("  reboot_required: $(ConvertTo-YamlScalar $script:Summary.RebootRequired)") | Out-Null
         $lines.Add("  pending_reboot_detected: $(ConvertTo-YamlScalar $script:Summary.PendingRebootDetected)") | Out-Null
+        $lines.Add("  disk_scan_status: $(ConvertTo-YamlScalar $script:Summary.DiskScanStatus)") | Out-Null
+        $lines.Add("  disk_maintenance_deferred: $(ConvertTo-YamlScalar $script:Summary.DiskMaintenanceDeferred)") | Out-Null
+        $lines.Add("  deep_freeze_disk_state: $(ConvertTo-YamlScalar $script:Summary.DeepFreezeDiskState)") | Out-Null
         $lines.Add("  disk_corruption_suspected: $(ConvertTo-YamlScalar $script:Summary.DiskCorruptionSuspected)") | Out-Null
         $lines.Add("  dism_corruption_detected: $(ConvertTo-YamlScalar $script:Summary.DismCorruptionDetected)") | Out-Null
         $lines.Add("  sfc_integrity_violations: $(ConvertTo-YamlScalar $script:Summary.SfcIntegrityViolations)") | Out-Null
@@ -2840,6 +2873,122 @@ function Test-RepairVolumeScanIndicatesCorruption {
     return $false
 }
 
+function Invoke-SystemRepairDeepFreezeQuery {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][string]$Path)
+    $process = $null
+    try {
+        # Faronics documents this password-free query: 0=Thawed, 1=Frozen.
+        $process = Start-Process -FilePath $Path -ArgumentList @('get','/ISFROZEN') -PassThru -NoNewWindow -ErrorAction Stop
+        $null = $process.Handle
+        if (-not $process.WaitForExit(10000)) {
+            try { $process.Kill() } catch {}
+            return [pscustomobject]@{State='Unknown';ExitCode=$null;Reason='DFC state query timed out.'}
+        }
+        $process.WaitForExit()
+        $exitCode = $process.ExitCode
+        $state = if ($null -eq $exitCode) { 'Unknown' } elseif ($exitCode -eq 0) { 'Thawed' } elseif ($exitCode -eq 1) { 'Frozen' } else { 'Unknown' }
+        return [pscustomobject]@{State=$state;ExitCode=$exitCode;Reason='DFC get /ISFROZEN state query.'}
+    }
+    catch { return [pscustomobject]@{State='Unknown';ExitCode=$null;Reason="DFC query failed: $($_.Exception.Message)"} }
+    finally { if ($null -ne $process) { $process.Dispose() } }
+}
+
+function Get-SystemRepairDeepFreezeState {
+    [CmdletBinding()]
+    param()
+    $installed = $false
+    $reliable = $true
+    $reasons = New-Object 'System.Collections.Generic.List[string]'
+    try {
+        $services = @(Get-CimInstance -ClassName Win32_Service -Filter "Name='DFServ'" -ErrorAction Stop)
+        $drivers = @(Get-CimInstance -ClassName Win32_SystemDriver -Filter "Name='DeepFrz' OR Name='DfDiskLo'" -ErrorAction Stop)
+        if ($services.Count -gt 0 -or $drivers.Count -gt 0) { $installed = $true }
+    }
+    catch { $reliable = $false; $reasons.Add('Deep Freeze service/driver detection was unavailable.') | Out-Null }
+    foreach ($name in @('DFServ','DeepFrz','DfDiskLo')) {
+        try {
+            $key = Get-Item -LiteralPath "HKLM:\SYSTEM\CurrentControlSet\Services\$name" -ErrorAction Stop
+            if ($null -ne $key) { $installed = $true }
+        }
+        catch {
+            if ($_.CategoryInfo.Category -ne [Management.Automation.ErrorCategory]::ObjectNotFound) {
+                $reliable = $false
+                $reasons.Add("Deep Freeze registry detection failed for $name.") | Out-Null
+            }
+        }
+    }
+    $candidates = New-Object 'System.Collections.Generic.List[string]'
+    if ($env:WINDIR) {
+        $candidates.Add((Join-Path $env:WINDIR 'SysWOW64\DFC.exe')) | Out-Null
+        $candidates.Add((Join-Path $env:WINDIR 'System32\DFC.exe')) | Out-Null
+    }
+    foreach ($root in @($env:ProgramFiles,${env:ProgramFiles(x86)})) {
+        if (-not [string]::IsNullOrWhiteSpace($root)) {
+            foreach ($relative in @('Faronics\Deep Freeze\DFC.exe','Faronics\Deep Freeze\Install C-0\DFC.exe')) {
+                try {
+                    if (Test-Path -LiteralPath (Join-Path $root 'Faronics\Deep Freeze\Install C-0\DFServ.exe') -PathType Leaf -ErrorAction Stop) { $installed = $true }
+                    $candidates.Add((Join-Path $root $relative)) | Out-Null
+                } catch { $reliable = $false }
+            }
+        }
+    }
+    $dfc = $null
+    foreach ($candidate in $candidates) {
+        try {
+            if (Test-Path -LiteralPath $candidate -PathType Leaf -ErrorAction Stop) { $dfc = $candidate; break }
+        } catch { $reliable = $false }
+    }
+    if ($dfc) {
+        $installed = $true
+        $query = Invoke-SystemRepairDeepFreezeQuery -Path $dfc
+        return [pscustomobject]@{Installed=$true;State=$query.State;DfcPath=$dfc;ExitCode=$query.ExitCode;Reason=$query.Reason}
+    }
+    $state = if (-not $installed -and $reliable) { 'NotInstalled' } else { 'Unknown' }
+    $reason = if ($installed) { 'Deep Freeze detected, but DFC.exe was not available in a supported local path.' } elseif (-not $reliable) { $reasons -join ' ' } else { 'No Deep Freeze service, driver, installation file or DFC was detected.' }
+    return [pscustomobject]@{Installed=$installed;State=$state;DfcPath=$null;ExitCode=$null;Reason=$reason}
+}
+
+function Test-SystemRepairDiskOperationAllowed {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][ValidateSet('Scan','SpotFix','OfflineScanAndFix')][string]$Operation)
+    # Never cache state: check immediately before every scan or repair.
+    try { $state = Get-SystemRepairDeepFreezeState }
+    catch { $state = [pscustomobject]@{State='Unknown';Reason='Deep Freeze state detection failed.'} }
+    if ($null -eq $state -or [string]::IsNullOrWhiteSpace([string]$state.State)) {
+        $state = [pscustomobject]@{State='Unknown';Reason='Deep Freeze state detection returned no state.'}
+    }
+    $script:Summary.DeepFreezeDiskState = [string]$state.State
+    $reason = $null
+    if ($Operation -ne 'Scan' -and -not $AllowDiskRepair) {
+        $reason = 'AllowDiskRepair is disabled; AutoRepairOnDetection alone does not permit filesystem repair.'
+    }
+    elseif ($Operation -eq 'OfflineScanAndFix' -and -not $AllowOfflineDiskRepair) {
+        $reason = 'AllowOfflineDiskRepair is disabled.'
+    }
+    elseif ($state.State -notin @('NotInstalled','Thawed')) {
+        $reason = "Deep Freeze state is $($state.State); disk maintenance requires a verified Thawed state or reliable absence of Deep Freeze. $($state.Reason)"
+    }
+    elseif ($state.State -eq 'Thawed' -and -not $ConfirmThawedMaintenanceWindow) {
+        $reason = 'ConfirmThawedMaintenanceWindow is required: keep the machine thawed through disk maintenance, repair reboots and post-reboot verification.'
+    }
+    if ($reason) {
+        $script:Summary.DiskMaintenanceDeferred = $true
+        if ($Operation -eq 'Scan') { $script:Summary.DiskScanStatus = 'Deferred' }
+        Write-Log "DISK_MAINTENANCE_DEFERRED|Operation=$Operation|DeepFreezeState=$($state.State)|Reason=$reason" 'WARN'
+        Warn-Step -Name "DiskGuard-$Operation" -Reason $reason
+        Add-DetailedResult -Step "DiskGuard-$Operation" -Status 'Skipped' -Message $reason -Data @{
+            Operation=$Operation;DeepFreezeState=[string]$state.State
+            AllowDiskRepair=[bool]$AllowDiskRepair
+            AllowOfflineDiskRepair=[bool]$AllowOfflineDiskRepair
+            ThawedWindowConfirmed=[bool]$ConfirmThawedMaintenanceWindow
+        }
+        return $false
+    }
+    Write-Log "DISK_MAINTENANCE_ALLOWED|Operation=$Operation|DeepFreezeState=$($state.State)|DiskRepairOptIn=$([bool]$AllowDiskRepair)|ThawedWindowConfirmed=$([bool]$ConfirmThawedMaintenanceWindow)" 'INFO'
+    return $true
+}
+
 function Invoke-RepairVolumeScan {
     [CmdletBinding()]
     param(
@@ -2847,6 +2996,8 @@ function Invoke-RepairVolumeScan {
         [switch]$UpdateSummary = $true
     )
 
+    if (-not (Test-SystemRepairDiskOperationAllowed -Operation Scan)) { return $null }
+    $script:Summary.DiskScanStatus = 'Started'
     $systemDrive = $env:SystemDrive.TrimEnd(':')
     Write-Log "Running Repair-Volume scan on $($env:SystemDrive)" 'INFO'
     $result = Repair-Volume -DriveLetter $systemDrive -Scan -ErrorAction Stop
@@ -2874,6 +3025,7 @@ function Invoke-RepairVolumeScan {
         Write-Log "Repair-Volume scan did not report actionable file system corruption on $($env:SystemDrive)." 'OK'
     }
 
+    $script:Summary.DiskScanStatus = if ($corruptionDetected) { 'CorruptionDetected' } else { 'NoCorruptionReported' }
     Add-DetailedResult -Step $StepName -Status 'Info' -Message 'Repair-Volume scan completed.' -Data @{
         Output             = $resultText
         CorruptionDetected = $corruptionDetected
@@ -2886,21 +3038,22 @@ function Invoke-RepairVolumeScan {
 }
 
 function Invoke-RepairVolumeSpotFix {
+    if (-not (Test-SystemRepairDiskOperationAllowed -Operation SpotFix)) { return $false }
     $systemDrive = $env:SystemDrive.TrimEnd(':')
-    Write-Log "Attempting online spot fix on $($env:SystemDrive) with Repair-Volume -SpotFix." 'WARN'
+    Write-Log "Attempting a brief-offline spot fix on $($env:SystemDrive) with Repair-Volume -SpotFix." 'WARN'
 
     try {
         Repair-Volume -DriveLetter $systemDrive -SpotFix -ErrorAction Stop | Out-Null
         $script:Summary.RepairVolumeSpotFixSucceeded = $true
         Add-RepairAttempt 'Repair-Volume -SpotFix'
         Add-DetailedResult -Step 'RepairVolumeSpotFix' -Status 'Success' -Message 'Repair-Volume -SpotFix completed successfully.'
-        Write-Log 'Repair-Volume spot fix completed successfully without scheduling an offline repair.' 'OK'
+        Write-Log 'Repair-Volume spot fix completed; verify filesystem health and any pending repair/reboot before freezing.' 'OK'
         return $true
     }
     catch {
         $script:Summary.RepairVolumeSpotFixSucceeded = $false
-        Warn-Step -Name 'RepairVolumeSpotFix' -Reason "Repair-Volume -SpotFix could not complete online: $($_.Exception.Message)"
-        Add-DetailedResult -Step 'RepairVolumeSpotFix' -Status 'Warning' -Message 'Repair-Volume -SpotFix could not complete online.' -Data @{
+        Warn-Step -Name 'RepairVolumeSpotFix' -Reason "Repair-Volume -SpotFix could not complete: $($_.Exception.Message)"
+        Add-DetailedResult -Step 'RepairVolumeSpotFix' -Status 'Warning' -Message 'Repair-Volume -SpotFix could not complete.' -Data @{
             Error = $_.Exception.Message
         }
         return $false
@@ -2908,6 +3061,7 @@ function Invoke-RepairVolumeSpotFix {
 }
 
 function Invoke-RepairVolumeOfflineFix {
+    if (-not (Test-SystemRepairDiskOperationAllowed -Operation OfflineScanAndFix)) { return }
     $systemDrive = $env:SystemDrive.TrimEnd(':')
     Write-Log "Running offline disk repair on $($env:SystemDrive)" 'WARN'
     Repair-Volume -DriveLetter $systemDrive -OfflineScanAndFix -ErrorAction Stop | Out-Null
@@ -4995,6 +5149,311 @@ function Invoke-ScheduledTaskHealthCheck {
     }
 }
 
+# Additional observation-only diagnostics. No repairs, policy edits or benchmarks.
+function Get-SystemRepairEventData {
+    param($Event)
+    $data = @{}
+    $xml = [xml]$Event.ToXml()
+    foreach ($item in @($xml.Event.EventData.Data)) {
+        if ($item.Name) { $data[[string]$item.Name] = [string]$item.'#text' }
+    }
+    return $data
+}
+
+function Get-SystemRepairDiagnosticEvents {
+    param([string]$LogName = 'System', [string]$ProviderName, [int[]]$Ids, [int]$Limit = 100)
+    $filter = @{ LogName=$LogName; StartTime=(Get-Date).AddDays(-$DiagnosticDaysBack) }
+    if ($ProviderName) { $filter.ProviderName = $ProviderName }
+    if ($Ids) { $filter.Id = $Ids }
+    try {
+        $events = @(Get-WinEvent -FilterHashtable $filter -MaxEvents $Limit -ErrorAction Stop)
+        [pscustomobject]@{ Status='Collected'; Limit=$Limit; PossiblyTruncated=($events.Count -eq $Limit); Events=$events; Error=$null }
+    } catch {
+        $state = if ($_.FullyQualifiedErrorId -like 'NoMatchingEventsFound*') { 'NoEvents' } else { 'Unavailable' }
+        [pscustomobject]@{ Status=$state; Limit=$Limit; PossiblyTruncated=$false; Events=@(); Error=if ($state -eq 'Unavailable') { $_.Exception.Message } else { $null } }
+    }
+}
+
+function Add-SystemRepairDiagnostic {
+    param([string]$Name, [scriptblock]$Collect)
+    try {
+        $data = & $Collect
+        $script:ObservationDiagnostics[$Name] = [ordered]@{ Status='Collected'; Data=$data; Error=$null }
+        Add-DetailedResult -Step $Name -Status 'Info' -Message 'Observation-only diagnostics collected; measurements are not automatic repair triggers.' -Data $data
+    } catch {
+        $script:ObservationDiagnostics[$Name] = [ordered]@{ Status='Unavailable'; Data=$null; Error=$_.Exception.Message }
+        Add-DetailedResult -Step $Name -Status 'Info' -Message ('Diagnostics unavailable: ' + $_.Exception.Message)
+        Write-Log "$Name unavailable: $($_.Exception.Message)" 'INFO'
+    }
+}
+
+function Invoke-SystemRepairObservationDiagnostics {
+    $script:ObservationDiagnostics = [ordered]@{
+        CollectedAt=(Get-Date).ToUniversalTime().ToString('o')
+        Context='Before maintenance repairs and cleanup; a short sample cannot establish sustained slowness.'
+        DaysBack=$DiagnosticDaysBack
+    }
+    Add-SystemRepairDiagnostic -Name 'PerformanceSample' -Collect {
+        # Independent counter paths permit partial results, including localized hosts.
+        $paths = @('\Processor(_Total)\% Processor Time','\Processor(_Total)\% DPC Time','\Processor(_Total)\% Interrupt Time',
+            '\Processor Information(_Total)\% Processor Performance','\System\Processor Queue Length',
+            '\Memory\Available MBytes','\Memory\Pages/sec','\Memory\% Committed Bytes In Use',
+            '\PhysicalDisk(_Total)\Avg. Disk sec/Read','\PhysicalDisk(_Total)\Avg. Disk sec/Write','\PhysicalDisk(_Total)\Avg. Disk Queue Length',
+            '\Process(*)\% Processor Time','\Process(*)\ID Process')
+        $counterErrors = @()
+        $sets = @(Get-Counter -Counter $paths -SampleInterval 1 -MaxSamples $PerformanceSampleSeconds -ErrorAction SilentlyContinue -ErrorVariable counterErrors)
+        $good = @($sets | ForEach-Object { $_.CounterSamples } | Where-Object { $_.Status -eq 0 })
+        $metrics = @($good | Where-Object { $_.Path -notmatch '\\process\(' } | Group-Object Path | ForEach-Object {
+            $m = $_.Group | Measure-Object CookedValue -Average -Minimum -Maximum
+            [pscustomobject]@{ Counter=$_.Name; SampleCount=$_.Count; Average=[math]::Round($m.Average,4); Minimum=[math]::Round($m.Minimum,4); Maximum=[math]::Round($m.Maximum,4) }
+        })
+        $logical = (Get-CimInstance Win32_ComputerSystem -ErrorAction Stop).NumberOfLogicalProcessors
+        if ($logical -lt 1) { throw 'Logical processor count unavailable.' }
+        $cpu = @($good | Where-Object { $_.Path -match '\\process\(' -and $_.Path -match '% processor time$' -and $_.InstanceName -notin @('_total','idle') } | Group-Object InstanceName | ForEach-Object {
+            [pscustomobject]@{ Instance=$_.Name; MachineCpuPercent=[math]::Round((($_.Group | Measure-Object CookedValue -Average).Average / $logical),2) }
+        } | Sort-Object MachineCpuPercent -Descending | Select-Object -First 10)
+        $os = Get-CimInstance Win32_OperatingSystem -ErrorAction Stop
+        $memory = @(Get-Process -ErrorAction Stop | Group-Object ProcessName | ForEach-Object {
+            [pscustomobject]@{ Process=$_.Name; Count=$_.Count; PrivateMB=[math]::Round(($_.Group | Measure-Object PrivateMemorySize64 -Sum).Sum/1MB,2) }
+        } | Sort-Object PrivateMB -Descending | Select-Object -First 10)
+        $pages = @(Get-CimInstance Win32_PageFileUsage -ErrorAction Stop | Select-Object Name,AllocatedBaseSize,CurrentUsage,PeakUsage)
+        [ordered]@{ CounterStatus=if ($good.Count -eq 0) { 'Unavailable' } elseif ($counterErrors.Count -gt 0) { 'Partial' } else { 'Collected' }
+            CounterErrors=@($counterErrors | Select-Object -First 5 | ForEach-Object { $_.Exception.Message }); SampleSeconds=$PerformanceSampleSeconds
+            Metrics=$metrics; TopCpuInstances=$cpu; TopPrivateMemory=$memory; AvailableMemoryMB=[math]::Round($os.FreePhysicalMemory/1024,2); PageFiles=$pages
+            Note='English performance counter names may be unavailable on localized Windows. Process instance names may be reused; CPU ranking is advisory. Disk values are seconds, not milliseconds.' }
+    }
+    Add-SystemRepairDiagnostic -Name 'PowerDiagnostics' -Collect {
+        $scheme = @(powercfg.exe /getactivescheme 2>&1)
+        if ($LASTEXITCODE -ne 0) { throw "powercfg failed: $($scheme -join ' ')" }
+        $limits = @(powercfg.exe /query SCHEME_CURRENT SUB_PROCESSOR 2>&1)
+        $limitExit = $LASTEXITCODE
+        $cpu = @(Get-CimInstance Win32_Processor -ErrorAction Stop | Select-Object Name,MaxClockSpeed,CurrentClockSpeed,NumberOfCores,NumberOfLogicalProcessors)
+        $throttle = Get-SystemRepairDiagnosticEvents -ProviderName 'Microsoft-Windows-Kernel-Processor-Power' -Ids @(37)
+        [ordered]@{ ActiveScheme=($scheme -join "`n"); ProcessorSettings=($limits -join "`n"); ProcessorSettingsExitCode=$limitExit; Processors=$cpu
+            FirmwareThrottleQuery=$throttle.Status; FirmwareThrottleEvents=@($throttle.Events | Select-Object TimeCreated,Id,RecordId)
+            Note='Idle downclocking is normal. Clock snapshots and power settings alone do not establish throttling.' }
+    }
+    Add-SystemRepairDiagnostic -Name 'HardwareEventDiagnostics' -Collect {
+        $rows = @(); $queries = @()
+        foreach ($provider in @('disk','storahci','stornvme','Ntfs','volmgr','Microsoft-Windows-WHEA-Logger','Microsoft-Windows-Resource-Exhaustion-Detector')) {
+            $q = Get-SystemRepairDiagnosticEvents -ProviderName $provider -Limit 100
+            $queries += [pscustomobject]@{ Provider=$provider; Status=$q.Status; PossiblyTruncated=$q.PossiblyTruncated; Error=$q.Error }
+            $rows += @($q.Events | Where-Object { $_.Level -in @(1,2,3) } | Group-Object Id | ForEach-Object {
+                [pscustomobject]@{ Provider=$provider; EventId=$_.Group[0].Id; Count=$_.Count; LatestTime=$_.Group[0].TimeCreated; Example=$_.Group[0].Message }
+            })
+        }
+        [ordered]@{ Queries=$queries; Groups=$rows; Note='Counts reflect the bounded retrieved records; correlation is not proof of failed hardware.' }
+    }
+    Add-SystemRepairDiagnostic -Name 'DeviceProblemDiagnostics' -Collect {
+        $devices = @(Get-CimInstance Win32_PnPEntity -Filter 'ConfigManagerErrorCode <> 0' -ErrorAction Stop | Where-Object { $_.Present -ne $false })
+        $drivers = @(Get-CimInstance Win32_PnPSignedDriver -ErrorAction Stop)
+        $rows = @($devices | Select-Object -First 100 | ForEach-Object {
+            $device = $_; $driver = $drivers | Where-Object { $_.DeviceID -eq $device.PNPDeviceID } | Select-Object -First 1
+            [pscustomobject]@{ Name=$device.Name; DeviceId=$device.PNPDeviceID; ProblemCode=$device.ConfigManagerErrorCode
+                Assessment=if ($device.ConfigManagerErrorCode -eq 22) { 'Disabled; may be intentional' } else { 'Review device status; not necessarily a missing driver' }
+                DriverVersion=$driver.DriverVersion; DriverDate=$driver.DriverDate; DriverProvider=$driver.DriverProviderName }
+        })
+        [ordered]@{ ProblemDeviceCount=$devices.Count; PossiblyTruncated=($devices.Count -gt 100); Devices=$rows }
+    }
+    Add-SystemRepairDiagnostic -Name 'BootStartupDiagnostics' -Collect {
+        $boot = Get-SystemRepairDiagnosticEvents -LogName 'Microsoft-Windows-Diagnostics-Performance/Operational' -Ids @(100) -Limit 10
+        $durations = @($boot.Events | ForEach-Object {
+            $fields = Get-SystemRepairEventData $_
+            [pscustomobject]@{ Time=$_.TimeCreated; BootTimeMilliseconds=$fields['BootTime']; MainPathBootMilliseconds=$fields['MainPathBootTime']; PostBootMilliseconds=$fields['BootPostBootTime'] }
+        })
+        $services = Get-SystemRepairDiagnosticEvents -ProviderName 'Service Control Manager' -Ids @(7000,7009,7011,7022,7023,7024,7026,7031,7034) -Limit 100
+        $rows = @($services.Events | Group-Object Id | ForEach-Object { [pscustomobject]@{ EventId=$_.Group[0].Id; Count=$_.Count; LatestTime=$_.Group[0].TimeCreated; Example=$_.Group[0].Message } })
+        $startup = @(Get-CimInstance Win32_StartupCommand -ErrorAction Stop | Select-Object -First 100 Name,Location,User)
+        [ordered]@{ BootQueryStatus=$boot.Status; BootQueryError=$boot.Error; BootDurations=$durations; ServiceQueryStatus=$services.Status
+            ServiceEventsPossiblyTruncated=$services.PossiblyTruncated; ServiceFailures=$rows; StartupEntries=$startup
+            Note='Startup entries reflect the execution account visibility. No fixed boot-time rule classifies service timeouts as harmless or deletes services. Startup command lines are omitted to avoid exposing credentials.' }
+    }
+}
+
+function Get-SystemRepairRegistryDefault {
+    param([string]$Path)
+    try {
+        $key = Get-Item -LiteralPath $Path -ErrorAction Stop
+        [pscustomobject]@{ Status='Collected'; Value=[string]$key.GetValue(''); Error=$null }
+    } catch {
+        [pscustomobject]@{ Status=if ($_.CategoryInfo.Category -eq 'ObjectNotFound') { 'NotFound' } else { 'Unavailable' }; Value=$null; Error=$_.Exception.Message }
+    }
+}
+
+function Resolve-SystemRepairShellHandler {
+    param([string]$RegistrationPath,[string]$ClassesRoot,[string]$Kind,[string]$CLSIDOverride)
+    $registration = Get-SystemRepairRegistryDefault -Path $RegistrationPath
+    $clsid = if ($CLSIDOverride) { $CLSIDOverride } else { $registration.Value }
+    if ([string]::IsNullOrWhiteSpace($clsid)) { $clsid = ($RegistrationPath -split '[\\/]')[-1] }
+    $status='ReviewRegistration'; $dll=$null; $signer=$null
+    if ($registration.Status -eq 'Unavailable') { $status='Unavailable' }
+    elseif ($clsid -match '^\{[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\}$') {
+        $server = Get-SystemRepairRegistryDefault -Path ($ClassesRoot+'\CLSID\'+$clsid+'\InprocServer32')
+        if ($server.Status -eq 'Unavailable') { $status='Unavailable' }
+        elseif ($server.Status -eq 'NotFound') { $status='NoInProcessServerInThisView' }
+        elseif ([string]::IsNullOrWhiteSpace($server.Value)) { $status='EmptyInProcessServer_Review' }
+        else {
+            $dll=[Environment]::ExpandEnvironmentVariables($server.Value).Trim().Trim('"')
+            # Do not probe network paths or guess relative DLL search resolution.
+            if ($dll -notmatch '^[A-Za-z]:\\') { $status='NonLocalOrRelativePath_NotProbed' }
+            else {
+                try {
+                    $file=Get-Item -LiteralPath $dll -ErrorAction Stop
+                    if ($file.PSIsContainer) { $status='ServerPathIsDirectory_Review' }
+                    else {
+                        $status='ServerFilePresent'
+                        try { $signature=Get-AuthenticodeSignature -LiteralPath $dll -ErrorAction Stop; $signer=$signature.SignerCertificate.Subject } catch {}
+                    }
+                } catch { $status=if ($_.CategoryInfo.Category -eq 'ObjectNotFound') { 'ServerFileMissing_Review' } else { 'ServerFileUnavailable' } }
+            }
+        }
+    }
+    [pscustomobject]@{ Kind=$Kind; RegistrationPath=$RegistrationPath; ClassesRoot=$ClassesRoot; CLSID=$clsid; ServerFile=$dll; Status=$status; Signer=$signer }
+}
+
+function Invoke-SystemRepairShellRegistrationDiagnostics {
+    Add-SystemRepairDiagnostic -Name 'ShellRegistrationDiagnostics' -Collect {
+        $handlers=@();$queries=@();$limit=250
+        foreach ($root in @('Registry::HKEY_LOCAL_MACHINE\SOFTWARE\Classes','Registry::HKEY_LOCAL_MACHINE\SOFTWARE\WOW6432Node\Classes')) {
+            foreach ($kind in @('*','Directory','Directory\Background','Drive','Folder','AllFilesystemObjects')) {
+                $path=$root+'\'+$kind+'\shellex\ContextMenuHandlers'
+                try {
+                    $keys=@(Get-ChildItem -LiteralPath $path -ErrorAction Stop | Select-Object -First ($limit+1))
+                    $queries += [pscustomobject]@{ Path=$path; Status='Collected'; PossiblyTruncated=($keys.Count -gt $limit) }
+                    foreach ($key in @($keys | Select-Object -First $limit)) {
+                        $handlers += Resolve-SystemRepairShellHandler -RegistrationPath $key.PSPath -ClassesRoot $root -Kind 'ContextMenu'
+                    }
+                } catch { $queries += [pscustomobject]@{ Path=$path; Status=if ($_.CategoryInfo.Category -eq 'ObjectNotFound') { 'NotFound' } else { 'Unavailable' }; PossiblyTruncated=$false } }
+            }
+            $preview=$root+'\..\Microsoft\Windows\CurrentVersion\PreviewHandlers'
+            # PreviewHandlers is outside Classes; use the corresponding registry view.
+            $preview=if ($root -match 'WOW6432Node') { 'Registry::HKEY_LOCAL_MACHINE\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\PreviewHandlers' } else { 'Registry::HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Windows\CurrentVersion\PreviewHandlers' }
+            try {
+                $key=Get-Item -LiteralPath $preview -ErrorAction Stop
+                $names=@($key.GetValueNames() | Select-Object -First ($limit+1))
+                foreach ($id in @($names | Select-Object -First $limit)) {
+                    # CLSID itself can be used to resolve a server; no description required.
+                    $handlers += Resolve-SystemRepairShellHandler -RegistrationPath ($root+'\CLSID\'+$id) -ClassesRoot $root -Kind 'Preview' -CLSIDOverride $id
+                }
+                $queries += [pscustomobject]@{ Path=$preview; Status='Collected'; PossiblyTruncated=($names.Count -gt $limit) }
+            } catch { $queries += [pscustomobject]@{ Path=$preview; Status=if ($_.CategoryInfo.Category -eq 'ObjectNotFound') { 'NotFound' } else { 'Unavailable' }; PossiblyTruncated=$false } }
+            try {
+                $extensions=@(Get-ChildItem -LiteralPath $root -ErrorAction Stop | Where-Object { $_.PSChildName -like '.*' } | Select-Object -First 1001)
+                foreach ($extension in @($extensions | Select-Object -First 1000)) {
+                    foreach ($category in @('{e357fccd-a995-4576-b01f-234630154e96}','{8895b1c6-b41f-4c1c-a562-0d564250836f}')) {
+                        $path=$extension.PSPath+'\shellex\'+$category
+                        $registration=Get-SystemRepairRegistryDefault -Path $path
+                        if ($registration.Status -eq 'Collected') {
+                            $handlers += Resolve-SystemRepairShellHandler -RegistrationPath $path -ClassesRoot $root -Kind $(if ($category -eq '{e357fccd-a995-4576-b01f-234630154e96}') { 'Thumbnail' } else { 'PreviewAssociation' })
+                        } elseif ($registration.Status -eq 'Unavailable') { $queries += [pscustomobject]@{ Path=$path; Status='Unavailable'; PossiblyTruncated=$false } }
+                    }
+                }
+                $queries += [pscustomobject]@{ Path=$root+' [file-extension associations]'; Status='Collected'; PossiblyTruncated=($extensions.Count -gt 1000) }
+            } catch { $queries += [pscustomobject]@{ Path=$root+' [file-extension associations]'; Status='Unavailable'; PossiblyTruncated=$false } }
+        }
+        $crashes=Get-SystemRepairDiagnosticEvents -LogName 'Application' -ProviderName 'Application Error' -Ids @(1000) -Limit 200
+        $correlations=@($crashes.Events | ForEach-Object {
+            $data=Get-SystemRepairEventData $_
+            if ($data['AppName'] -ieq 'explorer.exe') {
+                $module=$data['ModuleName'];$modulePath=$data['ModulePath']
+                $matches=@($handlers | Where-Object { $_.ServerFile -and (($modulePath -and $_.ServerFile -ieq $modulePath) -or ($module -and (Split-Path $_.ServerFile -Leaf) -ieq $module)) } | Select-Object -First 20 RegistrationPath,CLSID,ServerFile,Kind)
+                [pscustomobject]@{ Time=$_.TimeCreated; RecordId=$_.RecordId; FaultingModule=$module; FaultingModulePath=$modulePath; ExceptionCode=$data['ExceptionCode']; CandidateHandlers=$matches }
+            }
+        })
+        [ordered]@{ Scope='Machine registrations, native and WOW6432Node views; user overrides and ProgID/SystemFileAssociations registrations are not exhaustively covered.'
+            Queries=$queries; Handlers=$handlers; CrashQueryStatus=$crashes.Status; CrashQueryError=$crashes.Error; CrashQueryPossiblyTruncated=$crashes.PossiblyTruncated
+            ExplorerCrashCorrelations=$correlations; Note='Missing in-process servers may use another COM activation method. Empty CLSID descriptions are valid. Matching module filenames are candidates, not proof of causation. No registrations deleted, permissions changed, or Explorer processes stopped.' }
+    }
+}
+
+function Invoke-SystemRepairReadinessDiagnostics {
+    Add-SystemRepairDiagnostic -Name 'CrashDumpReadiness' -Collect {
+        $key = Get-ItemProperty -LiteralPath 'HKLM:\SYSTEM\CurrentControlSet\Control\CrashControl' -ErrorAction Stop
+        $dumpType = $key.CrashDumpEnabled
+        $labels = @{0='Disabled';1='Complete';2='Kernel';3='Small';7='Automatic';10='Active'}
+        $label = if ($null -eq $dumpType) { 'NotExplicitlyConfigured' } elseif ($labels.ContainsKey([int]$dumpType)) { $labels[[int]$dumpType] } else { 'UnknownValue' }
+        $files = @(); $queries = @()
+        $targets = @([Environment]::ExpandEnvironmentVariables([string]$key.DumpFile))
+        if ($key.MinidumpDir) { $targets += [Environment]::ExpandEnvironmentVariables([string]$key.MinidumpDir) }
+        foreach ($target in @($targets | Where-Object { $_ } | Select-Object -Unique)) {
+            try {
+                $item = Get-Item -LiteralPath $target -ErrorAction Stop
+                if ($item.PSIsContainer) {
+                    $files += @(Get-ChildItem -LiteralPath $target -Filter '*.dmp' -File -ErrorAction Stop | Sort-Object LastWriteTime -Descending | Select-Object -First 10 FullName,Length,LastWriteTime)
+                } else { $files += $item | Select-Object FullName,Length,LastWriteTime }
+                $queries += [pscustomobject]@{ Path=$target; Status='Collected'; Error=$null }
+            } catch {
+                $missing = $_.CategoryInfo.Category -eq 'ObjectNotFound'
+                $queries += [pscustomobject]@{ Path=$target; Status=if ($missing) { 'NotFound' } else { 'Unavailable' }; Error=if ($missing) { $null } else { $_.Exception.Message } }
+            }
+        }
+        $cs = Get-CimInstance Win32_ComputerSystem -ErrorAction Stop
+        $pagefiles = @(Get-CimInstance Win32_PageFileUsage -ErrorAction Stop | Select-Object Name,AllocatedBaseSize,CurrentUsage,PeakUsage)
+        [ordered]@{ CrashDumpEnabled=$dumpType; DumpType=$label; AutoReboot=$key.AutoReboot; LogEvent=$key.LogEvent
+            DumpFile=[string]$key.DumpFile; MinidumpDirectory=[string]$key.MinidumpDir; DedicatedDumpFile=[string]$key.DedicatedDumpFile
+            AutomaticManagedPagefile=$cs.AutomaticManagedPagefile; Pagefiles=$pagefiles; DumpPathQueries=$queries; ExistingDumpFiles=$files
+            Assessment=if ($dumpType -eq 0 -and $null -ne $dumpType) { 'Crash dumps disabled; review for reboot investigation' } else { 'Configuration recorded; dump creation not verified' }
+            Note='Configuration alone cannot guarantee a dump. Dump files are not opened, copied or deleted; pending processing and frozen rollback can affect evidence retention.' }
+    }
+    Add-SystemRepairDiagnostic -Name 'MemoryDiagnosticHistory' -Collect {
+        $history = Get-SystemRepairDiagnosticEvents -ProviderName 'Microsoft-Windows-MemoryDiagnostics-Results' -Limit 20
+        $scheduler = Get-SystemRepairDiagnosticEvents -ProviderName 'Microsoft-Windows-MemoryDiagnostics-Schedule' -Limit 20
+        # Query only: never change bootsequence or launch mdsched.
+        $bootOutput = @(bcdedit.exe /enum '{bootmgr}' 2>&1)
+        $bootExit = $LASTEXITCODE
+        $pending = if ($bootExit -eq 0) { [bool](($bootOutput -join "`n") -match '(?i)\{memdiag\}') } else { $null }
+        [ordered]@{ ResultQueryStatus=$history.Status; ResultQueryError=$history.Error; Results=@($history.Events | Select-Object TimeCreated,Id,RecordId,Message)
+            ResultsPossiblyTruncated=$history.PossiblyTruncated; ScheduleQueryStatus=$scheduler.Status; ScheduleQueryError=$scheduler.Error
+            ScheduleEvents=@($scheduler.Events | Select-Object TimeCreated,Id,RecordId,Message)
+            BootQueryStatus=if ($bootExit -eq 0) { 'Collected' } else { 'Unavailable' }; BootQueryExitCode=$bootExit; MemoryDiagnosticBootEntryReferenced=$pending
+            Note='A boot manager reference is evidence to review, not proof a test will run. No results means no retained test evidence, not a passed RAM test. No test scheduled and no boot configuration changed.' }
+    }
+    Add-SystemRepairDiagnostic -Name 'UpdateServiceConfiguration' -Collect {
+        $rows = @()
+        # Expectations are for the post-09 frozen closeout, not the thawed update window.
+        foreach ($name in @('wuauserv','UsoSvc','BITS','WaaSMedicSvc')) {
+            try {
+                $service = Get-CimInstance Win32_Service -Filter "Name='$name'" -ErrorAction Stop
+                if (-not $service) {
+                    $rows += [pscustomobject]@{ Name=$name; QueryStatus='NotInstalled'; StartMode=$null; State=$null; ExpectedAfterCloseout=if ($name -eq 'WaaSMedicSvc') { 'ReportOnly' } else { 'Disabled' }; Comparison='NotApplicable'; Error=$null }
+                    continue
+                }
+                $comparison = if ($name -eq 'WaaSMedicSvc') { 'ReportOnly' } elseif ($service.StartMode -eq 'Disabled') { 'MatchesCloseoutExpectation' } else { 'EnabledForUpdatesOrDiffersFromCloseout' }
+                $rows += [pscustomobject]@{ Name=$name; QueryStatus='Collected'; StartMode=$service.StartMode; State=$service.State
+                    ExpectedAfterCloseout=if ($name -eq 'WaaSMedicSvc') { 'ReportOnly' } else { 'Disabled' }; Comparison=$comparison; Error=$null }
+            } catch {
+                $rows += [pscustomobject]@{ Name=$name; QueryStatus='Unavailable'; StartMode=$null; State=$null; ExpectedAfterCloseout=if ($name -eq 'WaaSMedicSvc') { 'ReportOnly' } else { 'Disabled' }; Comparison='Unknown'; Error=$_.Exception.Message }
+            }
+        }
+        $changes = Get-SystemRepairDiagnosticEvents -ProviderName 'Service Control Manager' -Ids @(7040) -Limit 500
+        $relevant = @($changes.Events | ForEach-Object {
+            $d = Get-SystemRepairEventData $_
+            if ($d['param4'] -in @('wuauserv','UsoSvc','BITS','WaaSMedicSvc')) {
+                [pscustomobject]@{ Time=$_.TimeCreated; RecordId=$_.RecordId; Service=$d['param4']; PreviousStartType=$d['param2']; NewStartType=$d['param3'] }
+            }
+        })
+        $freeze = Get-SystemRepairDeepFreezeState
+        [ordered]@{ DeepFreezeState=$freeze.State; Services=$rows; StartupChangeQueryStatus=$changes.Status; StartupChangeError=$changes.Error
+            StartupChangeQueryPossiblyTruncated=$changes.PossiblyTruncated; RecentStartupChanges=$relevant
+            Note='08 normally runs before 09 disables services. Enabled services during thawed maintenance are expected and are not an automatic fault. Comparison is against the post-09 closeout only. 7040 records the change, not the API caller. No service settings changed.' }
+    }
+}
+
+function Invoke-SystemRepairRebootInvestigation {
+    Add-SystemRepairDiagnostic -Name 'RebootInvestigation' -Collect {
+        $q = Get-SystemRepairDiagnosticEvents -ProviderName 'User32' -Ids @(1074) -Limit 100
+        $requests = @($q.Events | ForEach-Object {
+            $d = Get-SystemRepairEventData $_
+            [pscustomobject]@{ Time=$_.TimeCreated; RecordId=$_.RecordId; InitiatingProcess=$d['param1']; Computer=$d['param2']; Reason=$d['param3']; ReasonCode=$d['param4']; ShutdownType=$d['param5']; Account=$d['param7'] }
+        })
+        $unplanned = Get-SystemRepairDiagnosticEvents -Ids @(41,6008,1001) -Limit 100
+        $crashes = @($unplanned.Events | Where-Object { ($_.Id -eq 41 -and $_.ProviderName -eq 'Microsoft-Windows-Kernel-Power') -or ($_.Id -eq 6008 -and $_.ProviderName -eq 'EventLog') -or ($_.Id -eq 1001 -and $_.ProviderName -in @('Microsoft-Windows-WER-SystemErrorReporting','BugCheck')) } | Select-Object TimeCreated,Id,ProviderName,RecordId,Message)
+        [ordered]@{ PlannedRequestQueryStatus=$q.Status; PlannedRequestError=$q.Error; PlannedRequests=$requests; PlannedRequestsPossiblyTruncated=$q.PossiblyTruncated
+            UnplannedQueryStatus=$unplanned.Status; UnplannedQueryError=$unplanned.Error; UnplannedEvents=$crashes; UnplannedEventsPossiblyTruncated=$unplanned.PossiblyTruncated
+            Note='1074 identifies the requesting process, not necessarily its original trigger. 41/6008 do not establish root cause and can be recorded at the following boot. Missing records do not prove no reboot occurred; frozen rollback or retention can remove evidence. No events are cleared.' }
+    }
+}
+
 function Invoke-EventLogSummary {
     Write-Log "Collecting recent system health events..." 'INFO'
 
@@ -5768,6 +6227,7 @@ function New-SystemRepairTelemetryEvent {
     [string[]]$healthIssues = @()
     if ($script:Summary.DismCorruptionDetected) { $healthIssues += 'DISM component store corruption detected' }
     if ($script:Summary.SfcIntegrityViolations) { $healthIssues += 'SFC integrity violations detected' }
+    if ($script:Summary.DiskMaintenanceDeferred) { $healthIssues += 'Disk maintenance deferred; see disk scan status and Deep Freeze state' }
     if ($script:Summary.DiskCorruptionSuspected) { $healthIssues += 'Disk corruption suspected' }
     if ($script:Summary.WmiRepositoryInconsistent) { $healthIssues += 'WMI repository inconsistent' }
     if ($script:Summary.StorageFailurePredicted) { $healthIssues += 'Storage failure predicted' }
@@ -5817,6 +6277,7 @@ function New-SystemRepairTelemetryEvent {
                     $script:TextLogPath
                 }
             }
+            observation_diagnostics = $script:ObservationDiagnostics
             system_repair = [ordered]@{
                 AutoRepairOnDetection = [bool]$AutoRepairOnDetection
 
@@ -5852,6 +6313,11 @@ function New-SystemRepairTelemetryEvent {
                     SfcIntegrityViolations      = [bool]$script:Summary.SfcIntegrityViolations
                     SfcRepairAttempted          = [bool]$script:Summary.SfcRepairAttempted
                     SfcRepairSucceeded          = [bool]$script:Summary.SfcRepairSucceeded
+                    DiskScanStatus              = [string]$script:Summary.DiskScanStatus
+                    DiskMaintenanceDeferred     = [bool]$script:Summary.DiskMaintenanceDeferred
+                    DeepFreezeDiskState         = [string]$script:Summary.DeepFreezeDiskState
+                    AllowDiskRepair             = [bool]$AllowDiskRepair
+                    ThawedMaintenanceWindowConfirmed = [bool]$ConfirmThawedMaintenanceWindow
                     DiskCorruptionSuspected     = [bool]$script:Summary.DiskCorruptionSuspected
                     WmiHealthy                  = $wmiHealthy
                     StorageHealthy              = $storageHealthy
@@ -6033,7 +6499,19 @@ if (-not (Test-IsAdministrator)) {
 try {
     Ensure-LogDirectory
     $script:DiskSpaceBefore = Get-SystemDriveTelemetry
+    if ($AutoRebootIfNeeded) {
+        $rebootProtection = Get-SystemRepairDeepFreezeState
+        if ($rebootProtection.State -notin @('NotInstalled','Thawed') -or
+            ($rebootProtection.State -eq 'Thawed' -and -not $ConfirmThawedMaintenanceWindow)) {
+            $AutoRebootIfNeeded = $false
+            Warn-Step -Name 'DeepFreezeRebootGuard' -Reason "Script-owned automatic reboot deferred: DeepFreezeState=$($rebootProtection.State); confirmed thawed window required."
+        }
+    }
     Write-Log 'Initializing automated system health and repair script...' 'INFO'
+    Write-Log "DISK_REPAIR_POLICY|AllowDiskRepair=$([bool]$AllowDiskRepair)|AllowOfflineDiskRepair=$([bool]$AllowOfflineDiskRepair)|ThawedWindowConfirmed=$([bool]$ConfirmThawedMaintenanceWindow)|ExternalFreezeScheduleControlled=False" 'INFO'
+    if ($ConfirmThawedMaintenanceWindow) {
+        Write-Log 'Administrator confirmed that the computer will remain thawed through disk maintenance, any repair reboots, and post-reboot verification. This script does not change the Deep Freeze freeze schedule or clear pre-existing boot repairs.' 'INFO'
+    }
     Write-Log "Starting $($script:ScriptName) version $($script:ScriptVersion)." 'INFO'
     Write-Log "Active staged text log path: $($script:TextLogPath)" 'INFO'
     Write-Log "Dedicated staging root: $($script:DedicatedStagingRoot)" 'INFO'
@@ -6045,6 +6523,11 @@ try {
         Write-Log 'Detection-only mode is enabled. Automatic repair actions are disabled unless their independent opt-in switches are enabled.' 'INFO'
     }
     Write-Log "Detailed YAML log will be written to $($script:YamlLogPath)" 'INFO'
+
+    Invoke-Safely -Name 'ObservationDiagnostics' -ScriptBlock { Invoke-SystemRepairObservationDiagnostics } -WarnOnly | Out-Null
+    Invoke-Safely -Name 'ShellRegistrationDiagnostics' -ScriptBlock { Invoke-SystemRepairShellRegistrationDiagnostics } -WarnOnly | Out-Null
+    Invoke-Safely -Name 'ReadinessDiagnostics' -ScriptBlock { Invoke-SystemRepairReadinessDiagnostics } -WarnOnly | Out-Null
+    Invoke-Safely -Name 'RebootInvestigation' -ScriptBlock { Invoke-SystemRepairRebootInvestigation } -WarnOnly | Out-Null
 
     Invoke-Safely -Name 'Action1AgentValidation' -ScriptBlock { Ensure-Action1Agent } -WarnOnly | Out-Null
     Invoke-Safely -Name 'DiskSpaceCheck' -ScriptBlock { Invoke-DiskSpaceCheck } -WarnOnly | Out-Null
@@ -6096,7 +6579,7 @@ try {
         }
         if ($script:Summary.WmiRepositoryInconsistent -and $AllowWmiRepair) { Invoke-Safely -Name 'WMIRepair' -ScriptBlock { Invoke-WmiRepair } -WarnOnly | Out-Null }
 
-        if ($script:Summary.DiskCorruptionSuspected) {
+        if ($script:Summary.DiskCorruptionSuspected -and $AllowDiskRepair) {
             $script:RepairVolumeSpotFixResult = $false
             Invoke-Safely -Name 'RepairVolumeSpotFix' -ScriptBlock { $script:RepairVolumeSpotFixResult = Invoke-RepairVolumeSpotFix } -WarnOnly | Out-Null
             if ([bool]$script:RepairVolumeSpotFixResult) {
@@ -6106,10 +6589,14 @@ try {
             }
             if ($script:Summary.DiskCorruptionSuspected -and $AllowOfflineDiskRepair) { Invoke-Safely -Name 'OfflineDiskRepair' -ScriptBlock { Invoke-RepairVolumeOfflineFix } -WarnOnly | Out-Null }
             elseif ($script:Summary.DiskCorruptionSuspected) {
-                Write-Log 'REPAIR_VOLUME_OFFLINE_RECOMMENDED|Reason=Repair-Volume scan still indicates possible file system corruption after SpotFix or SpotFix did not complete. Re-run script with -AllowOfflineDiskRepair to allow Repair-Volume -OfflineScanAndFix.' 'WARN'
+                Write-Log 'REPAIR_VOLUME_OFFLINE_RECOMMENDED|Reason=Repair-Volume scan still indicates possible file system corruption after SpotFix or SpotFix did not complete. Offline repair additionally requires -AllowDiskRepair -AllowOfflineDiskRepair; Deep Freeze must be verified Thawed with -ConfirmThawedMaintenanceWindow, including repair reboots and verification.' 'WARN'
                 Add-DetailedResult -Step 'OfflineDiskRepair' -Status 'Skipped' -Message 'Offline disk repair skipped because AllowOfflineDiskRepair is disabled, but post-repair scan still indicates possible corruption.'
             }
         }
+    }
+
+    if ($script:Summary.DiskCorruptionSuspected -and -not $AllowDiskRepair) {
+        Test-SystemRepairDiskOperationAllowed -Operation SpotFix | Out-Null
     }
 
     if ($AllowNetworkReset) { Invoke-Safely -Name 'NetworkReset' -ScriptBlock { Invoke-NetworkReset } -WarnOnly | Out-Null }
@@ -6152,9 +6639,17 @@ try {
     }
 
     if ($AutoRebootIfNeeded -and ($script:Summary.RebootRequired -or $script:Summary.PendingRebootDetected)) {
-        Invoke-RebootIfNeeded -DelaySeconds $AutoRebootDelaySeconds
-        $script:FinalStatus = 'SuccessRebootInitiated'
-        $script:FinalExitCode = 3010
+        $rebootProtection = Get-SystemRepairDeepFreezeState
+        if ($rebootProtection.State -eq 'NotInstalled' -or
+            ($rebootProtection.State -eq 'Thawed' -and $ConfirmThawedMaintenanceWindow)) {
+            Invoke-RebootIfNeeded -DelaySeconds $AutoRebootDelaySeconds
+            $script:FinalStatus = 'SuccessRebootInitiated'
+            $script:FinalExitCode = 3010
+        }
+        else {
+            Warn-Step -Name 'DeepFreezeRebootGuard' -Reason "Script-owned automatic reboot deferred: DeepFreezeState=$($rebootProtection.State)."
+            if ($script:FinalExitCode -eq 0) { $script:FinalStatus = 'SuccessWithWarnings' }
+        }
         Write-YamlLog
     }
 }

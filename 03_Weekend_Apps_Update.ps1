@@ -1,6 +1,9 @@
-# ScriptVersion: 2.2.0
-# LastUpdated: 2026-09-23
-# Changes: v2.2.0 adds application inventory for maintenance planning.
+# ScriptVersion: 2.3.0
+# LastUpdated: 2026-10-12
+# Changes: v2.3.0 adds SYSTEM-aware WinGet preflight, native executable selection,
+#          numeric package version ordering, bounded execution and diagnostic telemetry.
+#          No user alias/PATH edits or automatic App Installer repairs.
+# Previous: v2.2.0 adds application inventory for maintenance planning.
 #          v2.1.8 fixes Windows PowerShell 5.1 generic-list array conversion in telemetry.
 #          v2.1.7 fixes telemetry parameter binding for ordered dictionaries and
 #          routes NDJSON writes through Maintenance.Framework to avoid file-lock issues.
@@ -11,6 +14,9 @@
 
 [CmdletBinding()]
 param(
+    [ValidateRange(5,120)][int]$WingetPreflightTimeoutSeconds = 20,
+    [ValidateRange(10,600)][int]$WingetQueryTimeoutSeconds = 120,
+    [ValidateRange(1,120)][int]$WingetUpgradeTimeoutMinutes = 45,
     [switch]$IncludeUnknown = $true,
     [switch]$IncludePinned = $false,
 
@@ -29,13 +35,18 @@ $SpecialHandlingPackageIds = @(
 
 $ErrorActionPreference = 'Stop'
 
-$ScriptVersion = '2.2.0'
+$ScriptVersion = '2.3.0'
 $ScriptName = '03_Weekend_Apps_Update.ps1'
 $ComputerName = $env:COMPUTERNAME
 $ExecutionStart = Get-Date
 $RunId = [guid]::NewGuid().Guid
 $WarningCount = 0
 $ErrorCount = 0
+$script:WingetSelectedPath = $null
+$script:WingetPreflightComplete = $false
+$script:WingetPreflight = [ordered]@{ Status='NotRun' }
+$script:WingetInvocations = New-Object System.Collections.Generic.List[object]
+$script:WingetExecutionBlocked = $false
 $ApplicationResults = New-Object System.Collections.Generic.List[object]
 $TelemetryDirectory = Join-Path $env:SystemDrive 'Logs'
 $TelemetryNdjsonPath = Join-Path $TelemetryDirectory 'Maintenance-Telemetry.ndjson'
@@ -124,27 +135,109 @@ function Test-IsAdministrator {
 }
 
 # Finds winget.exe from the PATH first, then falls back to the common App Installer locations.
-function Get-WingetPath {
-    $cmd = Get-Command winget.exe -ErrorAction SilentlyContinue
-    if ($cmd) {
-        return $cmd.Source
-    }
-
-    $paths = @(
-        "$env:ProgramFiles\WindowsApps\Microsoft.DesktopAppInstaller_*_x64__8wekyb3d8bbwe\winget.exe",
-        "$env:LOCALAPPDATA\Microsoft\WindowsApps\winget.exe"
-    )
-
-    foreach ($pattern in $paths) {
-        $match = Get-ChildItem -Path $pattern -ErrorAction SilentlyContinue |
-            Sort-Object FullName -Descending |
-            Select-Object -First 1
-        if ($match) {
-            return $match.FullName
+function Get-WingetCandidates {
+    $native = if ($env:PROCESSOR_ARCHITEW6432) { $env:PROCESSOR_ARCHITEW6432 } else { $env:PROCESSOR_ARCHITECTURE }
+    $architecture = switch ($native) { 'ARM64' {'arm64'} 'AMD64' {'x64'} default {'x86'} }
+    $paths = @()
+    $programRoot = if ($env:ProgramW6432) { $env:ProgramW6432 } else { $env:ProgramFiles }
+    $pattern = Join-Path $programRoot 'WindowsApps\Microsoft.DesktopAppInstaller_*'
+    foreach ($folder in @(Get-ChildItem -Path $pattern -Directory -ErrorAction SilentlyContinue)) {
+        if ($folder.Name -match '^Microsoft\.DesktopAppInstaller_([0-9.]+)_(x64|x86|arm64)__8wekyb3d8bbwe$') {
+            $version = [version]$Matches[1]; $arch = $Matches[2]
+            if ($arch -eq $architecture) {
+                $exe = Join-Path $folder.FullName 'winget.exe'
+                if (Test-Path -LiteralPath $exe -PathType Leaf) { $paths += [pscustomobject]@{ Path=$exe; PackageVersion=$version; Origin='NativeAppInstaller'; Architecture=$arch } }
+            }
         }
     }
+    $ordered = @($paths | Sort-Object PackageVersion -Descending)
+    foreach ($command in @(Get-Command winget.exe -CommandType Application -All -ErrorAction SilentlyContinue)) {
+        $ordered += [pscustomobject]@{ Path=$command.Source; PackageVersion=[version]'0.0'; Origin='PATH'; Architecture='Unknown' }
+    }
+    $seen = @{}
+    foreach ($item in $ordered) { if ($item.Path -and -not $seen.ContainsKey($item.Path.ToLowerInvariant())) { $seen[$item.Path.ToLowerInvariant()]=$true; $item } }
+}
 
+function Get-WingetPath {
+    if ($script:WingetSelectedPath) { return $script:WingetSelectedPath }
+    if ($script:WingetPreflightComplete) { return $null }
+    $candidate = Get-WingetCandidates | Select-Object -First 1
+    if ($candidate) { return $candidate.Path }
     return $null
+}
+
+function ConvertTo-WingetNativeArgument {
+    param([AllowEmptyString()][string]$Argument)
+    # Windows CommandLineToArgvW quoting; arguments are not sent through a shell.
+    if ($Argument -notmatch '[\s"]' -and $Argument.Length -gt 0) { return $Argument }
+    return '"' + (($Argument -replace '(\\*)"', '$1$1\"') -replace '(\\+)$', '$1$1') + '"'
+}
+
+function Invoke-WingetNativeProcess {
+    param([string]$Path,[string[]]$Arguments,[int]$TimeoutSeconds)
+    $p = New-Object System.Diagnostics.Process
+    $p.StartInfo = New-Object System.Diagnostics.ProcessStartInfo
+    $p.StartInfo.FileName=$Path
+    $p.StartInfo.Arguments=(@($Arguments | ForEach-Object { ConvertTo-WingetNativeArgument $_ }) -join ' ')
+    $p.StartInfo.UseShellExecute=$false; $p.StartInfo.CreateNoWindow=$true
+    $p.StartInfo.RedirectStandardOutput=$true; $p.StartInfo.RedirectStandardError=$true
+    try {
+        if (-not $p.Start()) { throw 'Process did not start.' }
+        $stdout=$p.StandardOutput.ReadToEndAsync(); $stderr=$p.StandardError.ReadToEndAsync()
+        $exited=$p.WaitForExit($TimeoutSeconds*1000)
+        if (-not $exited) {
+            try { $p.Kill() } catch {}
+            $null=$p.WaitForExit(5000)
+            return [pscustomobject]@{ Status='TimedOut'; ExitCode=$null; RawOutput=@(); Error='WinGet time limit exceeded. Child installers may still be running; inspect before retrying.' }
+        }
+        # Installer children can retain inherited pipe handles after winget exits.
+        if (-not $stdout.Wait(5000) -or -not $stderr.Wait(5000)) {
+            return [pscustomobject]@{ Status='OutputTimedOut'; ExitCode=$p.ExitCode; RawOutput=@(); Error='WinGet output streams did not close; inspect child installers before retrying.' }
+        }
+        [pscustomobject]@{ Status='Completed'; ExitCode=$p.ExitCode; RawOutput=@(($stdout.Result+"`n"+$stderr.Result) -split "`r?`n"); Error=$null }
+    } catch {
+        [pscustomobject]@{ Status='LaunchFailed'; ExitCode=$null; RawOutput=@(); Error=$_.Exception.Message }
+    } finally { $p.Dispose() }
+}
+
+function Initialize-WingetPreflight {
+    $identity=[Security.Principal.WindowsIdentity]::GetCurrent()
+    $candidates=@(Get-WingetCandidates); $attempts=@()
+    $script:WingetPreflight=[ordered]@{ Status='ExecutableNotFound'; Identity=$identity.Name; IsSystem=$identity.IsSystem; Is64BitProcess=[Environment]::Is64BitProcess
+        SelectedPath=$null; Version=$null; Candidates=$candidates; LaunchAttempts=@(); AppInstallerStatus='NotChecked'; Packages=@(); DeclaredDependencies=@(); SourceRefreshStatus='NotRun' }
+    foreach ($candidate in $candidates) {
+        $result=Invoke-WingetNativeProcess -Path $candidate.Path -Arguments @('--version') -TimeoutSeconds $WingetPreflightTimeoutSeconds
+        $version=($result.RawOutput -join ' ').Trim()
+        $attempts += [pscustomobject]@{ Path=$candidate.Path; Status=$result.Status; ExitCode=$result.ExitCode; Output=$version; Error=$result.Error }
+        if ($result.Status -eq 'Completed' -and $result.ExitCode -eq 0 -and $version -match '^v?\d+\.\d+') {
+            $script:WingetSelectedPath=$candidate.Path; $script:WingetPreflight.SelectedPath=$candidate.Path; $script:WingetPreflight.Version=$version; $script:WingetPreflight.Status='Ready'; break
+        }
+        $script:WingetPreflight.Status=if ($result.Status -eq 'Completed') { 'VersionCheckFailed' } else { $result.Status }
+    }
+    $script:WingetPreflight.LaunchAttempts=$attempts
+    $script:WingetPreflightComplete=$true
+    try {
+        $packages=@(Get-AppxPackage -AllUsers -Name Microsoft.DesktopAppInstaller -ErrorAction Stop)
+        $script:WingetPreflight.Packages=@($packages | Select-Object Name,Version,Architecture,Status,InstallLocation)
+        $script:WingetPreflight.AppInstallerStatus=if ($packages.Count) { 'Collected' } else { 'NotFound' }
+        $dependencies=@()
+        foreach ($package in $packages) {
+            $manifest=Join-Path $package.InstallLocation 'AppxManifest.xml'
+            try {
+                $xml=[xml](Get-Content -LiteralPath $manifest -Raw -ErrorAction Stop)
+                foreach ($dep in @($xml.Package.Dependencies.PackageDependency)) {
+                    if ($dep.Name) {
+                        $installed=@(Get-AppxPackage -AllUsers -Name ([string]$dep.Name) -ErrorAction Stop)
+                        $dependencies += [pscustomobject]@{ AppInstallerVersion=[string]$package.Version; Name=[string]$dep.Name; RequiredMinimumVersion=[string]$dep.MinVersion
+                            InstalledVersions=@($installed | ForEach-Object { [string]$_.Version }); Status=if ($installed.Count) { 'PresentForOneOrMoreUsers_VerifyContextAndVersion' } else { 'NotFound' } }
+                    }
+                }
+            } catch { $dependencies += [pscustomobject]@{ AppInstallerVersion=[string]$package.Version; Name='ManifestQuery'; Status='Unavailable'; Error=$_.Exception.Message } }
+        }
+        $script:WingetPreflight.DeclaredDependencies=$dependencies
+    } catch { $script:WingetPreflight.AppInstallerStatus='Unavailable'; $script:WingetPreflight['AppInstallerError']=$_.Exception.Message }
+    Write-Log "WinGet preflight: $($script:WingetPreflight.Status); SYSTEM=$($identity.IsSystem); selected=$($script:WingetPreflight.SelectedPath)" 'INFO'
+    if ($script:WingetPreflight.Status -ne 'Ready') { throw "WinGet preflight failed: $($script:WingetPreflight.Status). See launch attempts in telemetry." }
 }
 
 # Filters out progress bars, separators, and other noisy winget output that does not help with logging or parsing.
@@ -192,6 +285,7 @@ function Invoke-Winget {
         [switch]$IgnoreExitCode
     )
 
+    if ($script:WingetExecutionBlocked) { throw 'WinGet execution blocked after a timeout; inspect remaining installer processes before retrying.' }
     $wingetPath = Get-WingetPath
     if (-not $wingetPath) {
         throw "winget.exe was not found on this system."
@@ -200,8 +294,15 @@ function Invoke-Winget {
     $display = $Arguments -join ' '
     Write-Log "Running: winget $display" 'INFO'
 
-    $rawOutput = & $wingetPath @Arguments 2>&1
-    $exitCode = $LASTEXITCODE
+    $timeout = if ($Arguments[0] -in @('upgrade','install') -and ($Arguments -contains '--all' -or $Arguments -contains '--id')) { $WingetUpgradeTimeoutMinutes * 60 } else { $WingetQueryTimeoutSeconds }
+    $processResult = Invoke-WingetNativeProcess -Path $wingetPath -Arguments $Arguments -TimeoutSeconds $timeout
+    $script:WingetInvocations.Add([pscustomobject]@{ Arguments=$display; Status=$processResult.Status; ExitCode=$processResult.ExitCode; TimeoutSeconds=$timeout; Error=$processResult.Error }) | Out-Null
+    if ($processResult.Status -ne 'Completed') {
+        $script:WingetExecutionBlocked = $true
+        throw "WinGet $($processResult.Status): $($processResult.Error)"
+    }
+    $rawOutput = $processResult.RawOutput
+    $exitCode = $processResult.ExitCode
     $cleanOutput = Get-CleanWingetOutput -RawOutput @($rawOutput)
 
     foreach ($line in $cleanOutput) {
@@ -314,6 +415,8 @@ function Get-UpgradeInventoryIncludingPinned {
 
 # Refreshes winget package sources before inventory collection and upgrades are attempted.
 function Update-WingetSources {
+    Initialize-WingetPreflight
+
     Write-Log "Refreshing WinGet sources..." 'INFO'
     $null = Invoke-Winget -Arguments @('source', 'update') -IgnoreExitCode
     Write-Log "WinGet source refresh completed." 'OK'
@@ -698,16 +801,7 @@ function Remove-PackagesById {
 }
 
 
-function Get-WingetVersion {
-    try {
-        $path = Get-WingetPath
-        if (-not $path) { return $null }
-        $output = & $path --version 2>$null
-        if ($LASTEXITCODE -eq 0) { return ([string]$output).Trim() }
-    }
-    catch {}
-    return $null
-}
+function Get-WingetVersion { return $script:WingetPreflight.Version }
 
 # Read-only inventory of installed desktop applications. A WinGet list match is
 # evidence of catalog recognition, not a promise of an available update.
@@ -853,13 +947,14 @@ try {
 
     Initialize-NetworkDefaults
     Write-Log "Initializing application update script..." 'INFO'
-    Write-Log "Script version: $ScriptVersion | Last updated: 2026-09-23" 'INFO'
+    Write-Log "Script version: $ScriptVersion | Last updated: 2026-10-12" 'INFO'
     Write-Log "Active staged text log path: $LogPath" 'INFO'
     Write-Log "Completed text log publish path: $PublishedLogPath" 'INFO'
 
     Write-Log "Refreshing WinGet sources..." 'INFO'
     $sourceResult = Invoke-Winget -Arguments @('source', 'update') -IgnoreExitCode
     $sourceRefreshExitCode = $sourceResult.ExitCode
+    $script:WingetPreflight.SourceRefreshStatus = if ($sourceRefreshExitCode -eq 0) { 'Ready' } else { 'SourceRefreshFailed' }
     if ($sourceRefreshExitCode -eq 0) { Write-Log "WinGet source refresh completed." 'OK' }
     else { Write-Log "WinGet source refresh completed with exit code $sourceRefreshExitCode." 'WARN' }
 
@@ -1101,6 +1196,9 @@ finally {
     )
 
     $details = [ordered]@{
+        WingetPreflight           = $script:WingetPreflight
+        WingetInvocations         = [object[]]@(foreach ($invocation in $script:WingetInvocations) { $invocation })
+        WingetExecutionBlocked    = $script:WingetExecutionBlocked
         WingetAvailable           = [bool](Get-WingetPath)
         WingetVersion             = $(Get-WingetVersion)
         ApplicationInventoryPath  = if ($applicationInventory) { $ApplicationInventoryPath } else { $null }
@@ -1138,6 +1236,7 @@ finally {
         RemainingPackages         = @($remainingPackages)
     }
 
+    if ($script:WingetExecutionBlocked) { $finalExitCode = 1; $finalStatus = 'FailedWingetExecutionBlocked' }
     Write-TelemetryEvent -ExitCode $finalExitCode -Status $finalStatus -Details $details
 
     # Final append before the completed file enters C:\Logs.

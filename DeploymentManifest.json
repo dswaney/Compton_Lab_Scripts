@@ -1,8 +1,8 @@
 {
     "SchemaVersion": 1,
-    "ManifestVersion": "3.0.4",
-    "PackageVersion": "3.0.4",
-    "GeneratedUtc": "2026-10-12T16:50:57Z",
+    "ManifestVersion": "3.0.5",
+    "PackageVersion": "3.0.5",
+    "GeneratedUtc": "2026-10-13T01:04:06.608Z",
     "Files": [
         {
             "Name": "00_Update-Scripts-FromShare.ps1",
@@ -25,8 +25,8 @@
         {
             "Name": "03_Weekend_Apps_Update.ps1",
             "Role": "ManagedFile",
-            "Version": "2.2.0",
-            "SHA256": "9B4A041165236ACBC629841698BF914FA2F75C0B0CCD0B54391475FB16A8527F"
+            "Version": "2.3.0",
+            "SHA256": "3F2B878277F716549BE8283DF7E336EC6C7CA4F5BE280A8834E730F520C1E473"
         },
         {
             "Name": "04_Sunday_Lab_Application_Maintenance.ps1",
@@ -55,8 +55,8 @@
         {
             "Name": "08_System_Repair.ps1",
             "Role": "ManagedFile",
-            "Version": "4.9.2",
-            "SHA256": "D532291D45EAC87B18916EEC9378377353BC859F2743A09876581404DAB104DA"
+            "Version": "4.13.0",
+            "SHA256": "60FBAC6FA251C04B5F70054BADEFA4EA87B23F266B906B51F254176A68928B7E"
         },
         {
             "Name": "09_Disable_Windows_Update_Services.ps1",

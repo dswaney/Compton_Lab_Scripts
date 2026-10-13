@@ -10,9 +10,10 @@
 
 .NOTES
     ScriptName:    09_Disable_Windows_Update_Services.ps1
-    ScriptVersion: 2.0.7
-    LastUpdated:   2026-09-16
-    Changes:       v2.0.7 treats a stopped Delivery Optimization service
+    ScriptVersion: 2.0.8
+    LastUpdated:   2026-10-13
+    Changes:       v2.0.8 adds a verified Medic registry fallback and SIH task controls.
+                   v2.0.7 treats a stopped Delivery Optimization service
                    (DoSvc) as successfully controlled even when Windows keeps
                    its startup mode at Auto or Manual. The script no longer
                    generates a false service-disable error for that state.
@@ -34,7 +35,7 @@ Set-StrictMode -Version 2.0
 $ErrorActionPreference = 'Stop'
 
 $ScriptName = '09_Disable_Windows_Update_Services.ps1'
-$ScriptVersion = '2.0.7'
+$ScriptVersion = '2.0.8'
 $RunId = [guid]::NewGuid().Guid
 $StartTime = Get-Date
 $UtcTimestamp = $StartTime.ToUniversalTime().ToString('o')
@@ -342,6 +343,24 @@ function Set-ServiceStartupDisabledWithRetry {
         if ($snapshot.Exists -and $snapshot.StartMode -eq 'Disabled') {
             $succeeded = $true
             break
+        }
+    }
+
+    # Medic may deny SCM startup changes. Try the active control set only;
+    # do not change ownership or ACLs. Registry success alone is not SCM success.
+    if (-not $succeeded -and $Name -eq 'WaaSMedicSvc') {
+        try {
+            $path = 'HKLM:\SYSTEM\CurrentControlSet\Services\WaaSMedicSvc'
+            if (-not (Test-Path $path)) { throw 'Medic service registry key is missing.' }
+            Set-ItemProperty -Path $path -Name Start -Value 4 -Type DWord -ErrorAction Stop
+            $startValue = Get-ItemPropertyValue -Path $path -Name Start -ErrorAction Stop
+            if ($startValue -ne 4) { throw "Medic registry Start readback was $startValue, expected 4." }
+            $messages.Add('Medic registry Start=4 verified. A maintenance reboot may be needed for SCM to reload the setting.')
+            $snapshot = @(Get-ServiceSnapshot -Names @($Name))[0]
+            $succeeded = $snapshot.Exists -and $snapshot.StartMode -eq 'Disabled'
+        }
+        catch {
+            $messages.Add("Medic registry fallback failed: $($_.Exception.Message)")
         }
     }
 
@@ -721,11 +740,12 @@ try {
     }
 
     $servicesToDisable = New-Object System.Collections.Generic.List[string]
+    # Stop remediation before disabling the components it can repair.
+    $servicesToDisable.Add('WaaSMedicSvc')
     $servicesToDisable.Add('wuauserv')
     if (-not $KeepBITSAvailable) { $servicesToDisable.Add('bits') }
     $servicesToDisable.Add('dosvc')
     $servicesToDisable.Add('UsoSvc')
-    $servicesToDisable.Add('WaaSMedicSvc')
 
     $servicesBefore = @(Get-ServiceSnapshot -Names @($servicesToDisable))
 
@@ -752,6 +772,8 @@ try {
 
     $tasks = @(
         @{ Path = '\Microsoft\Windows\WindowsUpdate\';      Name = 'Scheduled Start' },
+        @{ Path = '\Microsoft\Windows\WindowsUpdate\';      Name = 'sihboot' },
+        @{ Path = '\Microsoft\Windows\WindowsUpdate\';      Name = 'sih' },
         @{ Path = '\Microsoft\Windows\UpdateOrchestrator\'; Name = 'Schedule Scan' },
         @{ Path = '\Microsoft\Windows\UpdateOrchestrator\'; Name = 'Schedule Scan Static Task' },
         @{ Path = '\Microsoft\Windows\UpdateOrchestrator\'; Name = 'USO_UxBroker' },

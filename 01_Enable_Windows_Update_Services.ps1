@@ -1,13 +1,14 @@
 # =====================================================================
 # ScriptName: 01_Enable_Windows_Update_Services.ps1
-# ScriptVersion: 2.8.5
-# LastUpdated: 2026-09-03
+# ScriptVersion: 2.8.6
+# LastUpdated: 2026-10-13
 # Purpose: Restore Windows Update services, tasks, policy settings,
 #          Windows 11 UI preferences, and classic right-click context menu behavior for all users;
 #          verify required services are running, retry startup failures
 #          up to 4 total attempts, and force a reboot if critical
 #          services still refuse to start.
-# Changes:  v2.8.5 aligns updater-task validation and repair with the 01:00 Sunday master schedule.
+# Changes:  v2.8.6 verifies Medic native exit codes and restores SIH healing tasks.
+#           v2.8.5 aligns updater-task validation and repair with the 01:00 Sunday master schedule.
 #           v2.8.4 guarantees structured failure telemetry for bootstrap/framework/privilege/runtime failures.
 #           Adds FailureStage and FailureMessage fields and ensures service-recovery reboot failures pass through finally.
 #           v2.8.3 uses Maintenance.Framework v2.4 staged text logging so Elastic only sees the completed immutable log.
@@ -20,7 +21,7 @@ param()
 $ErrorActionPreference = 'Stop'
 
 $script:ScriptName       = '01_Enable_Windows_Update_Services.ps1'
-$script:ScriptVersion    = '2.8.5'
+$script:ScriptVersion    = '2.8.6'
 $script:ExecutionStart   = Get-Date
 $script:WarningCount     = 0
 $script:ErrorCount       = 0
@@ -1125,21 +1126,34 @@ Set-ServiceStartupAndStart -Name 'bits'     -StartupType Manual
 Set-ServiceStartupAndStart -Name 'dosvc'    -StartupType Automatic
 Set-ServiceStartupAndStart -Name 'UsoSvc'   -StartupType Automatic
 
-# WaaSMedicSvc can be protected; set registry above, then try starting via sc.exe
+# Medic is Manual/trigger-start; being stopped while idle is valid.
+# Native failures do not throw in Windows PowerShell 5.1: check exit codes.
 try {
-    & sc.exe config WaaSMedicSvc start= demand | Out-Null
-    Write-Status "Configured WaaSMedicSvc startup via sc.exe" 'OK'
+    $medicConfigOutput = & sc.exe config WaaSMedicSvc start= demand 2>&1
+    $medicConfigExitCode = $LASTEXITCODE
+    if ($medicConfigExitCode -ne 0) {
+        Write-Status "Medic SCM configuration returned $medicConfigExitCode : $($medicConfigOutput -join ' ')" 'WARN'
+    }
+    $medicPath = 'HKLM:\SYSTEM\CurrentControlSet\Services\WaaSMedicSvc'
+    $medicStart = Get-ItemPropertyValue -Path $medicPath -Name Start -ErrorAction Stop
+    $medicSnapshot = @(Get-ServiceTelemetrySnapshot -Names @('WaaSMedicSvc'))[0]
+    if ($medicStart -eq 3 -and $medicSnapshot.StartMode -eq 'Manual') {
+        Write-Status 'Medic Manual startup verified in registry and Service Control Manager.' 'OK'
+    }
+    else {
+        Write-Status "Medic startup not fully verified. Registry Start=$medicStart; SCM StartMode=$($medicSnapshot.StartMode). Check permissions and reboot during maintenance if needed." 'WARN'
+    }
+    $medicStartOutput = & sc.exe start WaaSMedicSvc 2>&1
+    $medicStartExitCode = $LASTEXITCODE
+    if ($medicStartExitCode -in @(0, 1056)) {
+        Write-Status 'Medic start request succeeded or service was already running.' 'INFO'
+    }
+    else {
+        Write-Status "Medic start request returned $medicStartExitCode : $($medicStartOutput -join ' '). Manual/trigger-start services need not remain running when idle." 'WARN'
+    }
 }
 catch {
-    Write-Status "Could not configure WaaSMedicSvc via sc.exe" 'WARN'
-}
-
-try {
-    & sc.exe start WaaSMedicSvc | Out-Null
-    Write-Status "Attempted to start WaaSMedicSvc" 'INFO'
-}
-catch {
-    Write-Status "Could not start WaaSMedicSvc directly" 'WARN'
+    Write-Status "Medic restoration could not be verified: $($_.Exception.Message)" 'WARN'
 }
 
 # Restore Automatic Updates policy
@@ -1160,6 +1174,8 @@ Remove-RegistryValueSafe -Path $auPolicyPath -Name 'UseWUServer'
 # Re-enable common update scheduled tasks
 $tasks = @(
     @{ Path = '\Microsoft\Windows\WindowsUpdate\';      Name = 'Scheduled Start' },
+    @{ Path = '\Microsoft\Windows\WindowsUpdate\';      Name = 'sihboot' },
+    @{ Path = '\Microsoft\Windows\WindowsUpdate\';      Name = 'sih' },
     @{ Path = '\Microsoft\Windows\UpdateOrchestrator\'; Name = 'Schedule Scan' },
     @{ Path = '\Microsoft\Windows\UpdateOrchestrator\'; Name = 'Schedule Scan Static Task' },
     @{ Path = '\Microsoft\Windows\UpdateOrchestrator\'; Name = 'USO_UxBroker' },

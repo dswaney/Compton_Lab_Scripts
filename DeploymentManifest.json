@@ -1,8 +1,8 @@
 {
     "SchemaVersion": 1,
-    "ManifestVersion": "3.0.6",
-    "PackageVersion": "3.0.6",
-    "GeneratedUtc": "2026-10-13T23:12:23.366Z",
+    "ManifestVersion": "3.0.7",
+    "PackageVersion": "3.0.7",
+    "GeneratedUtc": "2026-10-13T23:18:14.448Z",
     "Files": [
         {
             "Name": "00_Update-Scripts-FromShare.ps1",
@@ -13,8 +13,8 @@
         {
             "Name": "01_Enable_Windows_Update_Services.ps1",
             "Role": "ManagedFile",
-            "Version": "2.8.6",
-            "SHA256": "6CE9590E533F06EBE8A4EBDA132A786339C1300F8BB9B236FE03065F8E88C0E5"
+            "Version": "2.8.7",
+            "SHA256": "C5975130F42837E3E53FC2AFA1A497B88CEC4053A2AB53EFC1FB6C5C2997A36C"
         },
         {
             "Name": "02_Remove_User_Profiles.ps1",
@@ -61,8 +61,8 @@
         {
             "Name": "09_Disable_Windows_Update_Services.ps1",
             "Role": "ManagedFile",
-            "Version": "2.0.8",
-            "SHA256": "54FEFC257F7B0DB1EF4880267531D707847991A66A1C1626AA9BBEEC1C18A7FB"
+            "Version": "2.0.9",
+            "SHA256": "EF87737B620259BBCBD3A73526A567027BC00223C6EA6F133808B5C6A1AC42DA"
         },
         {
             "Name": "10_Sync_System_Time.ps1",

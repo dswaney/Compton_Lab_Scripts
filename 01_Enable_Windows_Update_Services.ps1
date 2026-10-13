@@ -1,13 +1,14 @@
 # =====================================================================
 # ScriptName: 01_Enable_Windows_Update_Services.ps1
-# ScriptVersion: 2.8.6
+# ScriptVersion: 2.8.7
 # LastUpdated: 2026-10-13
 # Purpose: Restore Windows Update services, tasks, policy settings,
 #          Windows 11 UI preferences, and classic right-click context menu behavior for all users;
 #          verify required services are running, retry startup failures
 #          up to 4 total attempts, and force a reboot if critical
 #          services still refuse to start.
-# Changes:  v2.8.6 verifies Medic native exit codes and restores SIH healing tasks.
+# Changes:  v2.8.7 restores the optional Microsoft Update Health service.
+#           v2.8.6 verifies Medic native exit codes and restores SIH healing tasks.
 #           v2.8.5 aligns updater-task validation and repair with the 01:00 Sunday master schedule.
 #           v2.8.4 guarantees structured failure telemetry for bootstrap/framework/privilege/runtime failures.
 #           Adds FailureStage and FailureMessage fields and ensures service-recovery reboot failures pass through finally.
@@ -21,7 +22,7 @@ param()
 $ErrorActionPreference = 'Stop'
 
 $script:ScriptName       = '01_Enable_Windows_Update_Services.ps1'
-$script:ScriptVersion    = '2.8.6'
+$script:ScriptVersion    = '2.8.7'
 $script:ExecutionStart   = Get-Date
 $script:WarningCount     = 0
 $script:ErrorCount       = 0
@@ -30,7 +31,7 @@ $script:FinalStatus      = 'Running'
 $script:RebootInitiated  = $false
 $script:RebootReason     = $null
 $script:TaskReconcileStatus = 'NotRun'
-$script:ServiceNames     = @('wuauserv','bits','dosvc','UsoSvc','WaaSMedicSvc','CryptSvc','msiserver')
+$script:ServiceNames     = @('wuauserv','bits','dosvc','UsoSvc','WaaSMedicSvc','CryptSvc','msiserver','uhssvc')
 $script:ServiceStateBefore = @()
 $script:ServiceStateAfter  = @()
 $script:PolicyConflictsBefore = @()
@@ -1125,6 +1126,41 @@ Set-ServiceStartupAndStart -Name 'wuauserv' -StartupType Manual
 Set-ServiceStartupAndStart -Name 'bits'     -StartupType Manual
 Set-ServiceStartupAndStart -Name 'dosvc'    -StartupType Automatic
 Set-ServiceStartupAndStart -Name 'UsoSvc'   -StartupType Automatic
+
+# Restore the optional update health service only when installed.
+# Script 09 preserves their original startup value before disabling them.
+foreach ($repairServiceName in @('uhssvc')) {
+    $repairPath = "HKLM:\SYSTEM\CurrentControlSet\Services\$repairServiceName"
+    $repairService = Get-Service -Name $repairServiceName -ErrorAction SilentlyContinue
+    if ($null -eq $repairService) {
+        Write-Status "Optional update repair service is not installed: $repairServiceName" 'INFO'
+        continue
+    }
+    try {
+        $savedStart = Get-ItemProperty -Path $repairPath -Name MaintenanceOriginalStart -ErrorAction SilentlyContinue
+        $restoreStart = 2
+        if ($null -ne $savedStart -and $savedStart.MaintenanceOriginalStart -in @(2, 3)) {
+            $restoreStart = [int]$savedStart.MaintenanceOriginalStart
+        }
+        $restoreType = if ($restoreStart -eq 3) { 'Manual' } else { 'Automatic' }
+        Set-ServiceStartRegistry -ServiceName $repairServiceName -StartValue $restoreStart
+        Set-ServiceStartupAndStart -Name $repairServiceName -StartupType $restoreType
+        $repairAfter = @(Get-ServiceTelemetrySnapshot -Names @($repairServiceName))[0]
+        $expectedMode = if ($restoreStart -eq 3) { 'Manual' } else { 'Auto' }
+        if ($repairAfter.StartMode -ne $expectedMode) {
+            Write-Status "Optional repair service startup restoration did not verify: $repairServiceName; StartMode=$($repairAfter.StartMode)" 'WARN'
+        }
+        elseif ($restoreStart -eq 2 -and $repairAfter.State -ne 'Running') {
+            Write-Status "Optional automatic repair service is not running: $repairServiceName" 'WARN'
+        }
+        else {
+            Write-Status "Optional repair service restored: $repairServiceName; StartMode=$($repairAfter.StartMode); State=$($repairAfter.State)" 'OK'
+        }
+    }
+    catch {
+        Write-Status "Could not restore optional repair service $repairServiceName : $($_.Exception.Message)" 'WARN'
+    }
+}
 
 # Medic is Manual/trigger-start; being stopped while idle is valid.
 # Native failures do not throw in Windows PowerShell 5.1: check exit codes.

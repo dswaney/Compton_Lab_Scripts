@@ -10,9 +10,10 @@
 
 .NOTES
     ScriptName:    09_Disable_Windows_Update_Services.ps1
-    ScriptVersion: 2.0.8
+    ScriptVersion: 2.0.9
     LastUpdated:   2026-10-13
-    Changes:       v2.0.8 adds a verified Medic registry fallback and SIH task controls.
+    Changes:       v2.0.9 controls the optional Microsoft Update Health service.
+                   v2.0.8 adds a verified Medic registry fallback and SIH task controls.
                    v2.0.7 treats a stopped Delivery Optimization service
                    (DoSvc) as successfully controlled even when Windows keeps
                    its startup mode at Auto or Manual. The script no longer
@@ -35,7 +36,7 @@ Set-StrictMode -Version 2.0
 $ErrorActionPreference = 'Stop'
 
 $ScriptName = '09_Disable_Windows_Update_Services.ps1'
-$ScriptVersion = '2.0.8'
+$ScriptVersion = '2.0.9'
 $RunId = [guid]::NewGuid().Guid
 $StartTime = Get-Date
 $UtcTimestamp = $StartTime.ToUniversalTime().ToString('o')
@@ -259,30 +260,30 @@ function Stop-ServiceProcessSafely {
 
     try {
         $svc = Get-CimInstance Win32_Service -Filter ("Name='{0}'" -f $Name.Replace("'","''")) -ErrorAction Stop
-        $pid = [int]$svc.ProcessId
-        $result.ProcessId = $pid
+        $serviceProcessId = [int]$svc.ProcessId
+        $result.ProcessId = $serviceProcessId
 
-        if ($pid -le 0) {
+        if ($serviceProcessId -le 0) {
             $result.Skipped = $true
             $result.Reason = 'Service has no active process ID.'
             return [pscustomobject]$result
         }
 
         $hosted = @(
-            Get-CimInstance Win32_Service -Filter ("ProcessId={0}" -f $pid) -ErrorAction Stop |
-            Where-Object { [int]$_.ProcessId -eq $pid } |
+            Get-CimInstance Win32_Service -Filter ("ProcessId={0}" -f $serviceProcessId) -ErrorAction Stop |
+            Where-Object { [int]$_.ProcessId -eq $serviceProcessId } |
             Select-Object -ExpandProperty Name
         )
         $result.HostedServices = @($hosted)
 
         if ($hosted.Count -gt 1) {
             $result.Skipped = $true
-            $result.Reason = "PID $pid is shared by services: $($hosted -join ', '). Process kill was skipped."
+            $result.Reason = "PID $serviceProcessId is shared by services: $($hosted -join ', '). Process kill was skipped."
             return [pscustomobject]$result
         }
 
         $result.Attempted = $true
-        Stop-Process -Id $pid -Force -ErrorAction Stop
+        Stop-Process -Id $serviceProcessId -Force -ErrorAction Stop
 
         $deadline = (Get-Date).AddSeconds($WaitSeconds)
         do {
@@ -290,12 +291,12 @@ function Stop-ServiceProcessSafely {
             $snapshot = @(Get-ServiceSnapshot -Names @($Name))[0]
             if (-not $snapshot.Exists -or $snapshot.State -eq 'Stopped') {
                 $result.Succeeded = $true
-                $result.Reason = "Force-terminated exclusive service process PID $pid."
+                $result.Reason = "Force-terminated exclusive service process PID $serviceProcessId."
                 return [pscustomobject]$result
             }
         } while ((Get-Date) -lt $deadline)
 
-        $result.Reason = "PID $pid was terminated, but service state did not verify as Stopped within $WaitSeconds second(s)."
+        $result.Reason = "PID $serviceProcessId was terminated, but service state did not verify as Stopped within $WaitSeconds second(s)."
     }
     catch {
         $result.Reason = "Safe process termination failed: $($_.Exception.Message)"
@@ -742,6 +743,7 @@ try {
     $servicesToDisable = New-Object System.Collections.Generic.List[string]
     # Stop remediation before disabling the components it can repair.
     $servicesToDisable.Add('WaaSMedicSvc')
+    $servicesToDisable.Add('uhssvc')
     $servicesToDisable.Add('wuauserv')
     if (-not $KeepBITSAvailable) { $servicesToDisable.Add('bits') }
     $servicesToDisable.Add('dosvc')
@@ -750,6 +752,20 @@ try {
     $servicesBefore = @(Get-ServiceSnapshot -Names @($servicesToDisable))
 
     foreach ($serviceName in $servicesToDisable) {
+        if ($serviceName -in @('uhssvc')) {
+            $repairPath = "HKLM:\SYSTEM\CurrentControlSet\Services\$serviceName"
+            if (Test-Path $repairPath) {
+                try {
+                    $originalStart = Get-ItemPropertyValue -Path $repairPath -Name Start -ErrorAction Stop
+                    if ($originalStart -in @(2, 3)) {
+                        New-ItemProperty -Path $repairPath -Name MaintenanceOriginalStart -PropertyType DWord -Value $originalStart -Force -ErrorAction Stop | Out-Null
+                    }
+                }
+                catch {
+                    Write-Status "Could not preserve startup value for $serviceName : $($_.Exception.Message)" 'WARN'
+                }
+            }
+        }
         Stop-AndDisableService `
             -Name $serviceName `
             -AllowMissing `
@@ -828,7 +844,7 @@ catch {
 finally {
     if (-not $pendingReboot) { $pendingReboot = Get-PendingRebootState }
     if (-not $servicesAfter -or $servicesAfter.Count -eq 0) {
-        $targetNames = @('wuauserv','bits','dosvc','UsoSvc','WaaSMedicSvc')
+        $targetNames = @('wuauserv','bits','dosvc','UsoSvc','WaaSMedicSvc','uhssvc')
         $servicesAfter = @(Get-ServiceSnapshot -Names $targetNames)
     }
 

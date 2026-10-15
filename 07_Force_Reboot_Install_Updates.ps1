@@ -1,8 +1,11 @@
-# =====================================================================
+﻿# =====================================================================
 # ScriptName: 07_Force_Reboot_Install_Updates.ps1
-# ScriptVersion: 2.1.1
-# LastUpdated: 2026-09-25
-# ChangeLog: v2.1.1 safely resets an abandoned non-startup reboot cycle after a configurable age,
+# ScriptVersion: 2.1.3
+# LastUpdated: 2026-10-13
+# ChangeLog: v2.1.3 permits execution and forced reboot only on local Sunday.
+#            Missed weekday runs exit before state/flag changes, regardless of
+#            Deep Freeze state. Shutdown countdown must also finish on Sunday.
+# Previous: v2.1.1 safely resets an abandoned non-startup reboot cycle after a configurable age,
 #            while preserving startup-resume protection against consuming an unverified reboot stage.
 #            v2.1.0 adds late-Sunday maintenance closeout/final-verification modes, never reboots a clean
 #            system, and requires proof that the prior reboot occurred before consuming another reboot stage.
@@ -28,6 +31,7 @@ param(
     [switch]$AllowUnsafeRebootFlagCleanup,
     [switch]$StartupResume,
     [switch]$MaintenanceCloseout,
+    [switch]$WindowsServicingOnly,
     [switch]$FinalVerification
 )
 
@@ -35,7 +39,7 @@ $ErrorActionPreference = 'Stop'
 
 $script:RunStart         = Get-Date
 $script:ScriptName       = '07_Force_Reboot_Install_Updates.ps1'
-$script:ScriptVersion    = '2.1.1'
+$script:ScriptVersion    = '2.1.3'
 $script:RunId            = [guid]::NewGuid().ToString()
 $script:Domain           = if ($env:USERDNSDOMAIN) { $env:USERDNSDOMAIN } else { $env:USERDOMAIN }
 $script:TelemetryPath    = Join-Path $LogDirectory 'Maintenance-Telemetry.ndjson'
@@ -712,6 +716,13 @@ function Get-PreviousWindowsUpdateContext {
     }
 }
 
+function Get-WindowsServicingRebootFlags {
+    $flags=@(Get-PendingRebootFlags | Where-Object { $_.Name -match '^(WindowsUpdateRebootRequired|CBSRebootPending|CBSRebootInProgress|CBSPackagesPending)$' })
+    $info=New-Object -ComObject Microsoft.Update.SystemInfo
+    if($info.RebootRequired -and !$flags.Count){$flags+=New-FlagRecord -Name 'WindowsUpdateSystemInfo' -Type 'RegistryKey' -Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired' -ValueName '' -Details 'Microsoft.Update.SystemInfo reports servicing reboot required.'}
+    return $flags
+}
+
 function Get-PendingRebootFlags {
     $flags = @()
 
@@ -1074,6 +1085,7 @@ function Set-RegistryValueSafe {
 }
 
 function Clear-PendingRebootFlags {
+    if ($WindowsServicingOnly) { throw 'Servicing-only closeout never clears pending reboot flags.' }
     $script:ClearResults = @()
     Write-Status "Attempting to clear persistent reboot flags..." 'WARN'
 
@@ -1273,11 +1285,28 @@ function Write-YamlLog {
     }
 }
 
+function Test-SundayRebootAllowed {
+    param([datetime]$Now = (Get-Date), [int]$DelaySeconds = 0)
+    return ($Now.DayOfWeek -eq [DayOfWeek]::Sunday -and
+        $Now.AddSeconds($DelaySeconds).DayOfWeek -eq [DayOfWeek]::Sunday)
+}
+
+function Stop-NonSundayExecution {
+    $script:OverallResult = 'DeferredOutsideSunday'
+    $script:ExitCode = 0
+    $script:RebootIssued = $false
+    Write-Status 'SUNDAY_REBOOT_GUARD: execution deferred. Reboots are permitted only on local Sunday, including the shutdown countdown. No weekday override is provided; frozen and thawed systems are both protected.' 'WARN'
+    Complete-TextLogPublication -Reason 'Sunday-only execution guard'
+    exit 0
+}
+
 function Invoke-ForcedReboot {
     param(
         [Parameter(Mandatory)]
         [string]$Reason
     )
+
+    if (-not (Test-SundayRebootAllowed -DelaySeconds $RebootDelaySeconds)) { Stop-NonSundayExecution }
 
     $script:RebootIssued = $true
     $script:RebootReason = $Reason
@@ -1296,6 +1325,7 @@ function Invoke-ForcedReboot {
         $Reason
     )
 
+    if (-not (Test-SundayRebootAllowed -DelaySeconds $RebootDelaySeconds)) { Stop-NonSundayExecution }
     & shutdown.exe @arguments | Out-Null
 
     if ($LASTEXITCODE -ne 0) {
@@ -1315,6 +1345,7 @@ if ($StartupResume -and -not (Test-RebootCycleActive)) {
 }
 
 Initialize-Paths
+if (-not (Test-SundayRebootAllowed -DelaySeconds $RebootDelaySeconds)) { Stop-NonSundayExecution }
 Write-Status "Starting $($script:ScriptName) version $($script:ScriptVersion)." 'INFO'
 Write-Status "Invocation mode: $($script:InvocationMode)." 'INFO'
 Write-Status "Active staged text log path: $($script:TextLogPath)" 'INFO'
@@ -1335,6 +1366,7 @@ try {
         exit 1
     }
 
+    if (-not (Test-SundayRebootAllowed -DelaySeconds $RebootDelaySeconds)) { Stop-NonSundayExecution }
     $script:BootSnapshot = Get-BootSnapshot
     $script:LoggedOnUsers = @(Get-LoggedOnUserSnapshot)
     $script:UpdateSnapshot = Get-WindowsUpdateSnapshot
@@ -1352,7 +1384,7 @@ try {
                 $script:RebootVerified = $false
             }
         }
-        $flags = @(Get-PendingRebootFlags)
+        $flags = @($(if ($WindowsServicingOnly) { Get-WindowsServicingRebootFlags } else { Get-PendingRebootFlags }))
 
         $stage = 0
         try {

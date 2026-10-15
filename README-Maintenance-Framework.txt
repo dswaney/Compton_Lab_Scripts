@@ -1,4 +1,4 @@
-﻿COMPTON COLLEGE MAINTENANCE FRAMEWORK v2.1.1
+COMPTON COLLEGE MAINTENANCE FRAMEWORK v2.4.0
 
 CANONICAL PATHS
   Scripts: C:\Scripts
@@ -30,16 +30,18 @@ STANDARD EXIT CODES
 
 VALIDATION
   Run elevated Windows PowerShell 5.1:
-    C:\Scripts\Build\Validate-AllScripts.ps1
+    C:\Scripts\Test-AllMaintenanceScripts.ps1
 
 TELEMETRY TEST
     C:\Scripts\Test-MaintenanceTelemetry.ps1
 
 CREATE A RELEASE
-    C:\Scripts\Build\Create-Release.ps1 -Version 2.1.1
+    Run Test-AllMaintenanceScripts.ps1 in Windows PowerShell 5.1, then
+    Update-DeploymentManifest.ps1 against the approved production source folder.
+    Refresh SHA256SUMS.txt after the final file changes.
 
 DEPLOYMENT
-  Copy the top-level files and Build folder to the central Labscripts share.
+  Copy the approved top-level maintenance files to the central Labscripts share.
   Script 00 synchronizes approved production files to C:\Scripts.
 
 IMPORTANT
@@ -47,7 +49,7 @@ IMPORTANT
   Shared infrastructure is centralized in Maintenance.Framework.psm1; future script
   revisions should call the exported framework helpers instead of adding new copies.
 
-MANIFEST-DRIVEN UPDATER (SCRIPT 00 VERSION 4.0.0)
+MANIFEST-DRIVEN UPDATER (SCRIPT 00 VERSION 4.12.1)
 --------------------------------------------------
 The updater uses DeploymentManifest.json from \\SERVER\DeploymentShare, with
 \\FALLBACK-SERVER\DeploymentShare as the fallback source.
@@ -56,7 +58,8 @@ Startup behavior:
 1. Reach the source share and read DeploymentManifest.json.
 2. Verify the manifest structure and required entries.
 3. Bootstrap Maintenance.Framework.psm1 first if it is missing or changed.
-4. Verify every source file against the manifest SHA-256 value.
+4. Compare actual source/local SHA-256 values. Manifest hashes are metadata,
+   not an enforced approval boundary.
 5. Copy each changed file into C:\Scripts\.staging.
 6. Run the Windows PowerShell parser against staged .ps1/.psm1/.psd1 files.
 7. Back up the current local file under C:\Scripts\Rollback before replacement.
@@ -67,10 +70,12 @@ Startup behavior:
 
 Deploy DeploymentManifest.json to the root of \\SERVER\DeploymentShare together
 with every file listed in that manifest. A file not listed in the deployment
-manifest is not installed by Script 00.
+manifest is normally not installed by Script 00. Explicit supplemental files
+listed in the updater are installed during manifest transitions. Script 15
+is approved for manifest-driven deployment, not supplemental deployment.
 
-SHA-256 validation protects against incomplete copies, corruption, and
-accidental modification. It does not authenticate a compromised file share;
+Actual source/staged/destination SHA-256 comparison checks copy integrity.
+It does not authenticate or pin an approved version from a compromised file share;
 Authenticode signing would be required for publisher authenticity.
 
 Framework command cleanup:
@@ -90,3 +95,8 @@ V2.2 ENHANCEMENTS
 REQUIRED SHARE PERMISSIONS
 Grant Domain Computers Modify/Create Files on \\SERVER\MaintenanceStatus.
 Grant Domain Computers Read & Execute on \\SERVER\DeploymentShare.
+
+OCTOBER 15 PRODUCTION SYNC
+- Framework v2.4.0 contains one implementation; appended v2.2.0 was removed.
+- Script 15 and its matching Script 07 are included in the package.
+- See README.md for remaining task/launcher/policy reconciliation before evening closeout.

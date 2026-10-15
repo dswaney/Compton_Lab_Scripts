@@ -1,9 +1,10 @@
 #requires -version 5.1
 # =====================================================================
 # ScriptName: 00_Update-Scripts-FromShare.ps1
-# ScriptVersion: 4.12.0
-# LastUpdated: 2026-10-12
-# Changes: v4.12.0 verifies the current share registrar after updater self-relaunch,
+# ScriptVersion: 4.12.1
+# LastUpdated: 2026-10-15
+# Changes: v4.12.1 approves manifest deployment of 15_Sunday_Update_Closeout.ps1.
+# Previous: v4.12.0 verifies the current share registrar after updater self-relaunch,
 #          reconciles every successful sync and verifies direct or fixed launcher actions.
 # Changes: v4.11.2 approves the component-store repair helper used by Script 08
 #          for source-WIM repair and guarded Windows in-place repair escalation.
@@ -43,7 +44,7 @@ $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 
 $ScriptName = '00_Update-Scripts-FromShare.ps1'
-$ScriptVersion = '4.12.0'
+$ScriptVersion = '4.12.1'
 $DefaultPreferredSourceRoot = '\\SERVER\DeploymentShare'
 $DefaultFallbackSourceRoot = '\\FALLBACK-SERVER\DeploymentShare'
 $SourceConfigurationPath = Join-Path $env:ProgramData 'ComptonMaintenance\Updater.Source.json'
@@ -90,6 +91,7 @@ $SoftwareInventoryPolicyName = 'SoftwareInventory.Policy.json'
     '09_Disable_Windows_Update_Services.ps1',
     '10_Sync_System_Time.ps1',
     '14_Endpoint_Health_Inventory.ps1',
+    '15_Sunday_Update_Closeout.ps1',
     '16_Check_Deep_Freeze_Status.ps1',
     'Get-MaintenanceFleetStatus.ps1',
     'Invoke-MaintenanceScript.ps1',

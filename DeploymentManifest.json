@@ -1,14 +1,14 @@
 {
     "SchemaVersion": 1,
-    "ManifestVersion": "3.0.8",
-    "PackageVersion": "3.0.8",
-    "GeneratedUtc": "2026-10-13T23:34:03.583Z",
+    "ManifestVersion": "3.0.9",
+    "PackageVersion": "3.0.9",
+    "GeneratedUtc": "2026-10-15T14:09:34.352Z",
     "Files": [
         {
             "Name": "00_Update-Scripts-FromShare.ps1",
             "Role": "Updater",
-            "Version": "4.12.0",
-            "SHA256": "CDC3BA2DB04505099087897A71830D1EE6DDD8F8DDFE4A0E92DBE7B331D3E419"
+            "Version": "4.12.1",
+            "SHA256": "C20712DC337BB22302CA8AC78AD341374E218A79119D6D57B36569B15168B310"
         },
         {
             "Name": "01_Enable_Windows_Update_Services.ps1",
@@ -44,13 +44,13 @@
             "Name": "06_Weekend_Windows_Updates.ps1",
             "Role": "ManagedFile",
             "Version": "2.1.10",
-            "SHA256": "AB20FD847F295999132BC497E94CBFDB6929AE133AD8FEB6216CB9DF0353412F"
+            "SHA256": "513CC29B1C967786F5028B7423BE2D6A8C6CE6747B82742D9194EDCAD1FDDCAE"
         },
         {
             "Name": "07_Force_Reboot_Install_Updates.ps1",
             "Role": "ManagedFile",
-            "Version": "2.1.1",
-            "SHA256": "62726E2FC9449083200683AE667F3850916F8CCDFDC6B7F56B48B63F8473A835"
+            "Version": "2.1.3",
+            "SHA256": "4326596DF653CD5A7D4C717AA4B03F2A13941A32257EC37950EA1802E5C292CD"
         },
         {
             "Name": "08_System_Repair.ps1",
@@ -75,6 +75,12 @@
             "Role": "ManagedFile",
             "Version": "1.9.1",
             "SHA256": "3F9C44215BAEFAA23D225259A9246D55BA3E503E62EC22631949FE209F615C0E"
+        },
+        {
+            "Name": "15_Sunday_Update_Closeout.ps1",
+            "Role": "MaintenanceScript",
+            "Version": "1.0.0",
+            "SHA256": "D957CB41B58B348B83EE7B6C76D066D4002A1F6443B244FD990ACFF5889563E0"
         },
         {
             "Name": "16_Check_Deep_Freeze_Status.ps1",
@@ -104,7 +110,7 @@
             "Name": "Maintenance.Framework.psm1",
             "Role": "Framework",
             "Version": "2.4.0",
-            "SHA256": "4A8DAC356DB7B2B72FD7F4F4E78BA5E24A1BF2EF7D9269BFA4B9E5693F1F5EFC"
+            "SHA256": "CB58F10E2FE56A038757E4FAF5C0293BFA93F0021BF35F00D9D778A17D80FC40"
         },
         {
             "Name": "Maintenance.Policy.json",

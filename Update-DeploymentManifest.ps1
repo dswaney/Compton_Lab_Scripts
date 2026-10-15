@@ -1,7 +1,7 @@
 #requires -Version 5.1
 # ScriptName:    Update-DeploymentManifest.ps1
-# ScriptVersion: 2.3.0
-# LastUpdated:   2026-09-21
+# ScriptVersion: 2.3.1
+# LastUpdated:   2026-10-15
 
 <#
 .SYNOPSIS
@@ -18,9 +18,10 @@
 
 .NOTES
     ScriptName:    Update-DeploymentManifest.ps1
-    ScriptVersion: 2.3.0
-    LastUpdated:   2026-09-21
-    Changes:       v2.3.0 adds Repair-MicrosoftEdgeUpdate.ps1 to the approved catalog.
+    ScriptVersion: 2.3.1
+    LastUpdated:   2026-10-15
+    Changes:       v2.3.1 adds Sunday closeout and preserves software policy/component-store helper entries.
+                   v2.3.0 adds Repair-MicrosoftEdgeUpdate.ps1 to the approved catalog.
                    v2.2.0 adds Maintenance.Copilot.psm1 to the approved catalog.
                    v2.1.0 removes former script 12 from the approved catalog,
                    adds it to the script 04 retirement mapping, and validates
@@ -44,7 +45,7 @@ param(
 Set-StrictMode -Version 2.0
 $ErrorActionPreference = 'Stop'
 
-$ScriptVersion = '2.3.0'
+$ScriptVersion = '2.3.1'
 
 # Keep this catalog synchronized with $ApprovedMaintenanceFiles in
 # 00_Update-Scripts-FromShare.ps1. Files absent from the manifest are added.
@@ -61,12 +62,15 @@ $ApprovedFileCatalog = @(
     [pscustomobject]@{ Name='09_Disable_Windows_Update_Services.ps1';                  Role='MaintenanceScript' },
     [pscustomobject]@{ Name='10_Sync_System_Time.ps1';                                 Role='MaintenanceScript' },
     [pscustomobject]@{ Name='14_Endpoint_Health_Inventory.ps1';                        Role='MaintenanceScript' },
+    [pscustomobject]@{ Name='15_Sunday_Update_Closeout.ps1';                          Role='MaintenanceScript' },
     [pscustomobject]@{ Name='16_Check_Deep_Freeze_Status.ps1';                         Role='MaintenanceScript' },
     [pscustomobject]@{ Name='Get-MaintenanceFleetStatus.ps1';                          Role='Utility' },
     [pscustomobject]@{ Name='Invoke-MaintenanceScript.ps1';                            Role='Launcher' },
     [pscustomobject]@{ Name='Maintenance.Copilot.psm1';                                Role='Framework' },
     [pscustomobject]@{ Name='Maintenance.Framework.psm1';                              Role='Framework' },
     [pscustomobject]@{ Name='Maintenance.Policy.json';                                Role='Policy' },
+    [pscustomobject]@{ Name='SoftwareInventory.Policy.json';                         Role='Policy' },
+    [pscustomobject]@{ Name='Repair-Windows-ComponentStore.ps1';                     Role='Remediation' },
     [pscustomobject]@{ Name='Repair-MicrosoftEdgeUpdate.ps1';                         Role='Remediation' },
     [pscustomobject]@{ Name='Register-Tasks_SYSTEM.ps1';                              Role='TaskRegistration' }
 )

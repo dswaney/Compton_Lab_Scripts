@@ -47,7 +47,7 @@ The active endpoint scripts are designed primarily for 64-bit Windows PowerShell
 | [`01_Enable_Windows_Update_Services.ps1`](./01_Enable_Windows_Update_Services.ps1) | Bootstraps the current package, restores Windows Update services/tasks/policies, verifies service recovery, applies standard Windows UI configuration, and can reboot when critical update services cannot be recovered. |
 | [`02_Remove_User_Profiles.ps1`](./02_Remove_User_Profiles.ps1) | Removes eligible stale user profiles with protected-profile, loaded-profile, age, timeout, and disk-space safeguards; applies the standard Windows 11 user environment. Copilot and Edge ownership have moved to Script 04. |
 | [`03_Weekend_Apps_Update.ps1`](./03_Weekend_Apps_Update.ps1) | Inventories available application upgrades, updates supported packages through WinGet, handles pinned/unknown packages according to switches, services Office Click-to-Run, and publishes per-application results. |
-| [`04_Sunday_Lab_Application_Maintenance.ps1`](./04_Sunday_Lab_Application_Maintenance.ps1) | Consolidated Sunday application/configuration runner: restore point, printing, Office migration/activation, Edge InPrivate, Elastic Agent, browser defaults/homepages, Adobe lab policy, Stellarium location, startup allowlist, and final Copilot cleanup. Honorlock remains embedded but disabled because GPO owns it. |
+| [`04_Sunday_Lab_Application_Maintenance.ps1`](./04_Sunday_Lab_Application_Maintenance.ps1) | Consolidated Sunday application/configuration runner: restore point, printing, Office migration/activation, Chrome Incognito startup, Elastic Agent, browser defaults/homepages, Adobe lab policy, Stellarium location, startup allowlist, and final Copilot cleanup. Honorlock remains embedded but disabled because GPO owns it. |
 | [`05_Weekend_HP_Drivers_Update.ps1`](./05_Weekend_HP_Drivers_Update.ps1) | Vendor-aware HP/Dell maintenance with safe driver filtering, HPIA/DCU workflows, HP BIOS Internet-update policy, AV scheduled power-on, Dell Wake-on-LAN validation, Dell cleanup of orphaned HP software, and hardware/driver telemetry. |
 | [`06_Weekend_Windows_Updates.ps1`](./06_Weekend_Windows_Updates.ps1) | Installs Microsoft/Windows updates with PSWindowsUpdate, optionally resets Windows Update components, compares pre/post compliance, records detailed results, and reports—but does not itself perform—the required reboot. |
 | [`07_Force_Reboot_Install_Updates.ps1`](./07_Force_Reboot_Install_Updates.ps1) | Coordinates a persistent, verified multi-reboot cycle; supports scheduled, startup-resume, maintenance-closeout, and final-verification modes; records the source of persistent reboot flags. |
@@ -55,6 +55,7 @@ The active endpoint scripts are designed primarily for 64-bit Windows PowerShell
 | [`09_Disable_Windows_Update_Services.ps1`](./09_Disable_Windows_Update_Services.ps1) | Applies and verifies the post-maintenance Windows Update service, scheduled-task, and registry-policy state. |
 | [`10_Sync_System_Time.ps1`](./10_Sync_System_Time.ps1) | Detects domain or standalone time mode, configures Windows Time, safely restarts/resynchronizes it, validates offset/source/stratum, and publishes recent time-service evidence. |
 | [`14_Endpoint_Health_Inventory.ps1`](./14_Endpoint_Health_Inventory.ps1) | Produces the authoritative endpoint snapshot: hardware, OS, BIOS settings/version, warranty, security, networking, drivers, health findings, remediation candidates, normalized software records, and uninstall tombstones. |
+| [`15_Sunday_Update_Closeout.ps1`](./15_Sunday_Update_Closeout.ps1) | Runs additional Sunday update passes and final readiness checks; requests servicing-only reboots through Script 07 and disables updates only after clean final verification. Does not control Deep Freeze scheduling. |
 | [`16_Check_Deep_Freeze_Status.ps1`](./16_Check_Deep_Freeze_Status.ps1) | Uses the Faronics CLI to report Frozen, Thawed, Unknown, or NotInstalled state and tracks how long the current state has persisted. |
 | [`Repair-MicrosoftEdgeUpdate.ps1`](./Repair-MicrosoftEdgeUpdate.ps1) | Detection-first Edge Update repair for the fixed `MicrosoftEdgeUpdateRepair` remediation class; verifies policy, services, tasks, updater state, and optional signed Enterprise MSI repair. |
 | [`Repair-Windows-ComponentStore.ps1`](./Repair-Windows-ComponentStore.ps1) | Script 08 escalation helper: identifies the matching `install.wim` index, stages a compatible ADK DISM when needed, tries WIM and Windows Update repair sources, verifies DISM/SFC, and can launch a guarded in-place repair while the computer is thawed. |
@@ -88,7 +89,7 @@ The public copy intentionally uses placeholder deployment paths. Do not commit p
 
 ### `00_Update-Scripts-FromShare.ps1`
 
-The updater persists the last working source roots so a self-update does not revert to public placeholders. It validates `DeploymentManifest.json`, restricts deployment to an internal approved-file list, directly deploys critical supplemental files during manifest transitions, compares SHA-256 hashes, parses PowerShell before and after installation, rejects updater downgrades, updates itself last, and relaunches with the working source configuration. Superseded numbered scripts are retired only after Script 04 validates successfully.
+The updater persists the last working source roots so a self-update does not revert to public placeholders. It validates `DeploymentManifest.json`, restricts deployment to an internal approved-file list, directly deploys critical supplemental files during manifest transitions, compares actual source and local SHA-256 hashes, parses PowerShell before and after installation, rejects updater downgrades, updates itself last, and relaunches with the working source configuration. Manifest SHA-256 fields are metadata: this updater uses actual share-file hashes rather than enforcing the manifest hash as an approval boundary. Superseded numbered scripts are retired only after Script 04 validates successfully.
 
 ### `01_Enable_Windows_Update_Services.ps1`
 
@@ -111,7 +112,7 @@ Runs each major section independently so a child script's functions, strict mode
 1. Enables System Restore, initializes shadow-copy services, creates and verifies a restore point, and removes obsolete managed restore points.
 2. Maintains the SHARP driver, PaperCut Print Deploy, and `StudentSecurePrint` connection.
 3. Detects Office products, migrates supported older perpetual/LTSC suites, and—only when Deep Freeze is installed—replaces Microsoft 365 Apps with Office LTSC 2024; verifies machine-wide activation.
-4. Starts Edge InPrivate on targeted `SSB-122-*`, `SSB-114*`, and `SSB-171*` computers while explicitly leaving autologon disabled and existing Winlogon settings unchanged.
+4. Configures Chrome Incognito at `CC-Student` sign-in on targeted `SSB-122-*`, `SSB-114*`, and `SSB-171*` computers, opening `https://www.compton.edu`. Chrome must already be installed; existing Winlogon/autologon settings are preserved.
 5. Installs, enrolls, repairs, or verifies Elastic Agent for configured computer-name prefixes.
 6. Sets `https://www.compton.edu` as the Chrome, Edge, and Firefox homepage/startup page; suppresses Chrome sign-in/onboarding/default-browser prompts; applies a supported default-associations XML that makes Chrome the handler for HTTP, HTTPS, `.htm`, and `.html`.
 7. Applies Adobe Reader/Acrobat machine policy that suppresses Pro trials, upsells, account sign-in, Document Cloud, cloud connectors, and first-run online experiences while preserving local PDF functions.
@@ -140,7 +141,7 @@ Ensures NuGet/PSWindowsUpdate prerequisites, optionally resets Windows Update co
 
 ### `07_Force_Reboot_Install_Updates.ps1`
 
-Uses a durable state file and single-instance lock to prevent repeated or unverified reboot consumption. It requires a newer boot time before advancing a reboot stage, can recover an abandoned non-startup cycle, inventories pending-reboot flags and likely causes, optionally clears only approved flags, and stops after the configured maximum. Startup resume exits safely when no active cycle exists; closeout/final-verification modes do not reboot a clean computer.
+Uses a durable state file and single-instance lock to prevent repeated or unverified reboot consumption. It requires a newer boot time before advancing a reboot stage, can recover an abandoned non-startup cycle, inventories pending-reboot flags and likely causes, optionally clears only approved flags, and stops after the configured maximum. Startup resume exits safely when no active cycle exists; closeout/final-verification modes do not reboot a clean computer. Version 2.1.3 permits execution/reboot only on local Sunday, including the shutdown countdown. `-WindowsServicingOnly` restricts reboot flags to Windows servicing and refuses flag cleanup. This Sunday guard does not enforce a thawed state or an earlier Sunday cutoff; Script 15 adds those checks before invoking it.
 
 ### `08_System_Repair.ps1`
 
@@ -324,6 +325,18 @@ Collects one fault-tolerant weekly `endpoint.health` snapshot and separate event
 
 An access-denied result for active `CapabilityAccessManager.db-wal` inspection is recorded as informational, not storage corruption.
 
+### `15_Sunday_Update_Closeout.ps1`
+
+Version 1.0.0 is supplied from the current production file. Normal mode calls Script 01 to enable updates, calls Script 06 for another installation pass, then checks servicing reboot state and scans for remaining non-hidden software updates. If a servicing reboot is pending, it invokes Script 07 with `-WindowsServicingOnly`; Script 07 v2.1.3 is included as the matching dependency. A successful normal pass reports `UpdatePassVerified_NoPendingReboot` without disabling update services.
+
+`-VerifyOnly` skips the initial enable/install calls, but **can still request a reboot**. When the update scan is clean, no servicing reboot is pending, and the checked servicing processes are absent, it invokes Script 09, verifies that Windows Update, Update Orchestrator, and BITS are Disabled/Stopped, then reports `ReadyToFreeze=true`.
+
+Each guarded operation must start on local Sunday before 20:45. When Deep Freeze services/drivers are detected, a successful DFC query must report Thawed; Frozen/unknown/unavailable state defers the operation. This is a start-time gate, not a timeout for an already-running child or update scan. The script writes `15_Sunday_Update_Closeout.latest.json`, a text log, and `maintenance.sunday_update_closeout` telemetry. Exit 0 means a verified pass/readiness, 3010 means a reboot remains required, and 2 means incomplete or failed verification.
+
+The script does not change the external freeze schedule or prevent refreezing when readiness fails. A deferred/failed run may leave update services enabled; review the status and complete closeout before relying on the configured freeze time. Its telemetry append is not routed through the framework mutex.
+
+The repository registrar and launcher do not yet schedule or expose Script 15. Adding the file to the manifest makes it distributable; it does not create closeout tasks. See the schedule reconciliation notes below.
+
 ### `16_Check_Deep_Freeze_Status.ps1`
 
 Finds `DFC.exe`, queries the installed state, writes one atomic JSON event per run, updates a persistent state record, and reports `StateChanged`, `PreviousState`, `StateSinceUtc`, `ThawedSinceUtc`, `ThawedForHours`, and `ThawedForDays`. It publishes `Installed=false` for computers without Deep Freeze so current-state transforms can remove stale historical state.
@@ -374,7 +387,7 @@ The manifest lists each managed file's version and hash. The update utility vali
 
 `Register-Tasks_SYSTEM.ps1` reconciles only Compton-managed tasks and leaves unrelated/Microsoft tasks untouched. It uses SYSTEM with highest privileges, verifies actions/triggers/settings, removes obsolete names and retired-script references, and writes `maintenance.task_reconciliation` telemetry.
 
-### Sunday schedule
+### Sunday schedule in the repository registrar
 
 | Order | Time | Task | Script |
 |---:|---:|---|---|
@@ -400,6 +413,15 @@ Additional managed triggers:
 | Monday at 7:00 AM, with run-after-missed-start | `16_Check_Deep_Freeze_Status.ps1` |
 
 Task start times are fixed and do not prove that the previous task has finished. Use telemetry to monitor duration and overlap.
+
+### Production schedule reconciliation still required
+
+The saved October 13 production registrar v1.8 differs from the repository registrar v4.12.0. It specifies Script 15 update passes at **18:00, 19:00, and 20:00 Sunday**, and `-VerifyOnly` at **20:30** in the task named `10. Disable Windows Update Services`. These are reference times from that production file; this repository update does not install them.
+
+Before enabling that schedule, reconcile `Register-Tasks_SYSTEM.ps1` task names/actions and legacy-task cleanup; add fixed normal/verification actions to `Invoke-MaintenanceScript.ps1`; and reconcile `Maintenance.Policy.json` with the evening window. The current policy closes at 10:00 for Scripts 01/06/07/09, omits active Script 04 and Script 15, and retains retired entries. The current Script 15 invokes children directly, bypassing launcher policy and the global execution lock, so adding only a policy row is insufficient. Avoid wrapping an unchanged Script 15 in a held launcher lock: Script 01 can bootstrap Script 00 and trigger nested launcher work. Validate nesting/sequencing before scheduling it.
+
+Script 07 v2.1.3 blocks weekday reboots but does not itself enforce the Script 15 20:45 cutoff or Deep Freeze Thawed state. Startup-resume protection for those conditions, and preservation of servicing-only mode across reboot continuation, require further review. Confirm the external thaw/freeze window before reconciling schedules.
+
 
 ## Deployment workflow
 
@@ -461,7 +483,7 @@ The following files are retained under [`Retired`](./Retired) for history only. 
 | `04_Update_Edge_Silent.ps1` | `Repair-MicrosoftEdgeUpdate.ps1` plus Script 14 detection |
 | `11_Install_SharpDriver_And_PaperCut.ps1` | Script 04 printing section |
 | `12_Enable-SystemRestore-And-Create-RestorePoint.ps1` | Script 04 System Restore section |
-| `13_Configure_Autologon_And_Edge.ps1` | Script 04 Edge InPrivate section; autologon is disabled |
+| `13_Configure_Autologon_And_Edge.ps1` | Script 04 Chrome Incognito startup section; existing autologon settings are preserved |
 | `15_Install_Elastic_Agent.ps1` | Script 04 Elastic Agent section |
 | `17_Set_Browser_Homepage.ps1` | Script 04 browser policy/default-browser section |
 | `18_Install_Honorlock_Chrome_Extension.ps1` | Group Policy; embedded Script 04 section is disabled |
@@ -479,3 +501,12 @@ The following files are retained under [`Retired`](./Retired) for history only. 
 - Public deployment settings remain sanitized, and the Elastic enrollment section remains disabled until configured for production. Generate a production manifest after restoring site configuration; public hashes apply to repository bytes only.
 - Fix-Old-00-Script.ps1 is a temporary deployment aid and is excluded from this repository update.
 - Validation: static change review and manifest/checksum verification; Windows PowerShell parsing and endpoint execution were not performed for this update.
+
+
+## October 15, 2026 production-file synchronization
+
+- Restores supplied Script 06 v2.1.10 and framework v2.4.0 without the appended legacy copies present in GitHub. Framework fleet-status defaults retain public placeholders; restore production destinations locally before deployment.
+- Adds Script 15 v1.0.0 and saved Script 07 v2.1.3 for its `-WindowsServicingOnly` dependency. Task start times and launcher actions are unchanged in this release.
+- Updater v4.12.1 approves the new Script 15 filename. Manifest builder v2.3.1 includes Script 15 and preserves the previously missing software-inventory policy and component-store repair helper catalog entries.
+- Refreshes package 3.0.9 manifest, validation record, and checksums. Public repository hashes apply only to these repository bytes; regenerate after applying production configuration.
+- Validation covers file comparison, duplicate-definition checks, catalog consistency, JSON, and SHA-256 integrity. Windows PowerShell 5.1 parsing, task execution, and endpoint behavior still require a Windows pilot.

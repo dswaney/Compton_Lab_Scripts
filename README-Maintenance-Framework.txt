@@ -49,7 +49,7 @@ IMPORTANT
   Shared infrastructure is centralized in Maintenance.Framework.psm1; future script
   revisions should call the exported framework helpers instead of adding new copies.
 
-MANIFEST-DRIVEN UPDATER (SCRIPT 00 VERSION 4.12.1)
+MANIFEST-DRIVEN UPDATER (SCRIPT 00 VERSION 4.12.2)
 --------------------------------------------------
 The updater uses DeploymentManifest.json from \\SERVER\DeploymentShare, with
 \\FALLBACK-SERVER\DeploymentShare as the fallback source.
@@ -99,4 +99,7 @@ Grant Domain Computers Read & Execute on \\SERVER\DeploymentShare.
 OCTOBER 15 PRODUCTION SYNC
 - Framework v2.4.0 contains one implementation; appended v2.2.0 was removed.
 - Script 15 and its matching Script 07 are included in the package.
-- See README.md for remaining task/launcher/policy reconciliation before evening closeout.
+- Registrar v4.13.0 merges the supplied production timetable, including evening closeout.
+- Launcher v2.2.0 uses fixed closeout actions and a separate closeout mutex.
+- Policy v1.1.0 covers active scripts and evening update operations.
+- See README.md for cutoff, startup-resume, direct-child locking, and pilot limits.

@@ -1,6 +1,6 @@
 {
-  "PackageVersion": "3.0.9",
-  "BaseCommit": "17be5bc9c7b23d57cecb16d5b6ab0d18e6e6ecdd",
+  "PackageVersion": "3.0.10",
+  "BaseCommit": "6eaa7a0b8e108ed2673fcdb02b252c41b461409a",
   "PowerShellParserExecuted": false,
   "RequiresWindowsPowerShellValidation": true,
   "StructuralChecks": [
@@ -9,17 +9,21 @@
     "Saved current Script 07 v2.1.3 supplies WindowsServicingOnly and Sunday reboot guards",
     "Script 15 v1.0.0 copied unchanged from supplied production file",
     "Updater approved list and manifest-builder catalog agree with all 23 manifest entries",
-    "Manifest and SHA256SUMS reflect final repository bytes"
+    "Manifest and SHA256SUMS reflect final repository bytes",
+    "All 18 supplied weekly task names/scripts/times/arguments preserved in merged definitions; Monday audit registered separately",
+    "Fixed launcher closeout actions and registrar mappings agree; legacy arbitrary path/bypass launcher not deployed",
+    "Policy covers all scheduled disruptive actions and removes retired script entries",
+    "Closeout mutex is separate from ordinary execution mutex; launcher rechecks policy after lock waits",
+    "Updater verifies both closeout launcher actions after registration"
   ],
   "ValidationNotes": [
-    "Static review only; no Windows PowerShell parser, scheduled-task, COM update, DFC, or endpoint execution was performed.",
-    "Task schedules and launcher actions were not changed. Evening Script 15 schedule integration is pending.",
-    "Production share/status settings must be restored locally and production manifest regenerated."
+    "Static comparison and cross-file checks only; Windows PowerShell parser and endpoint execution remain required.",
+    "Supplied production schedule merged into current fixed-action implementation; internal status destinations remain public placeholders.",
+    "Script 15 unchanged; child invocations remain direct and do not acquire ordinary launcher execution locks."
   ],
   "PendingReconciliation": [
-    "Registrar/launcher integration for evening closeout; retirement of replaced tasks",
-    "Policy rows for current scripts and compatible evening window",
-    "Script 15 direct child execution, locking/nested updater behavior, and mutex-protected telemetry",
+    "Windows PowerShell 5.1 parser and real scheduled-task/COM/DFC pilot",
+    "Script 15 direct child execution versus ordinary global locking and mutex-protected telemetry",
     "Startup-resume freeze/cutoff guards and servicing-only mode persistence",
     "External Deep Freeze schedule coordination and failure closeout"
   ]

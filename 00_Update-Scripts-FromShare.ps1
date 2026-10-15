@@ -1,9 +1,10 @@
 #requires -version 5.1
 # =====================================================================
 # ScriptName: 00_Update-Scripts-FromShare.ps1
-# ScriptVersion: 4.12.1
+# ScriptVersion: 4.12.2
 # LastUpdated: 2026-10-15
-# Changes: v4.12.1 approves manifest deployment of 15_Sunday_Update_Closeout.ps1.
+# Changes: v4.12.2 verifies both registered Sunday closeout actions after sync.
+# Previous: v4.12.1 approves manifest deployment of 15_Sunday_Update_Closeout.ps1.
 # Previous: v4.12.0 verifies the current share registrar after updater self-relaunch,
 #          reconciles every successful sync and verifies direct or fixed launcher actions.
 # Changes: v4.11.2 approves the component-store repair helper used by Script 08
@@ -44,7 +45,7 @@ $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 
 $ScriptName = '00_Update-Scripts-FromShare.ps1'
-$ScriptVersion = '4.12.1'
+$ScriptVersion = '4.12.2'
 $DefaultPreferredSourceRoot = '\\SERVER\DeploymentShare'
 $DefaultFallbackSourceRoot = '\\FALLBACK-SERVER\DeploymentShare'
 $SourceConfigurationPath = Join-Path $env:ProgramData 'ComptonMaintenance\Updater.Source.json'
@@ -691,7 +692,9 @@ function Invoke-TaskReconciliation {
     $requiredScripts = @(
         [pscustomobject]@{ Script=$ScriptName; ActionId='UpdateScripts' },
         [pscustomobject]@{ Script=$CombinedSundayScriptName; ActionId='SundayLabApplicationMaintenance' },
-        [pscustomobject]@{ Script='14_Endpoint_Health_Inventory.ps1'; ActionId='EndpointHealthInventory' }
+        [pscustomobject]@{ Script='14_Endpoint_Health_Inventory.ps1'; ActionId='EndpointHealthInventory' },
+        [pscustomobject]@{ Script='15_Sunday_Update_Closeout.ps1'; ActionId='SundayUpdateCloseoutPass' },
+        [pscustomobject]@{ Script='15_Sunday_Update_Closeout.ps1'; ActionId='SundayUpdateCloseoutVerify' }
     )
     $tasks = @(Get-ScheduledTask -TaskPath '\' -ErrorAction Stop)
     foreach ($definition in $requiredScripts) {

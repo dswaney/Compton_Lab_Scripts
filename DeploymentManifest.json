@@ -1,14 +1,14 @@
 {
     "SchemaVersion": 1,
-    "ManifestVersion": "3.0.9",
-    "PackageVersion": "3.0.9",
-    "GeneratedUtc": "2026-10-15T14:09:34.352Z",
+    "ManifestVersion": "3.0.10",
+    "PackageVersion": "3.0.10",
+    "GeneratedUtc": "2026-10-15T14:15:44.507Z",
     "Files": [
         {
             "Name": "00_Update-Scripts-FromShare.ps1",
             "Role": "Updater",
-            "Version": "4.12.1",
-            "SHA256": "C20712DC337BB22302CA8AC78AD341374E218A79119D6D57B36569B15168B310"
+            "Version": "4.12.2",
+            "SHA256": "5A4F0AEAB833DA5966CDFDE36E4DC0ACEEF2AE37ABDD20410FDE162A54C0D4C2"
         },
         {
             "Name": "01_Enable_Windows_Update_Services.ps1",
@@ -97,8 +97,8 @@
         {
             "Name": "Invoke-MaintenanceScript.ps1",
             "Role": "Launcher",
-            "Version": "2.1.0",
-            "SHA256": "13CE080832B96DD77C47EB2B8E5B0E8E1CE8F999E17C23BBD296E636FDDA7235"
+            "Version": "2.2.0",
+            "SHA256": "B8545B61AD5D54091F431B931660EDA2E7127DB45E65C6CCC5A0AC57733A20ED"
         },
         {
             "Name": "Maintenance.Copilot.psm1",
@@ -115,8 +115,8 @@
         {
             "Name": "Maintenance.Policy.json",
             "Role": "Policy",
-            "Version": "1.0.0",
-            "SHA256": "531703E15DBE1EB0FDF3DD8AA1FFDC95972852F40A5C24008F72A9A497D538FB"
+            "Version": "1.1.0",
+            "SHA256": "7CC77C49CA3C25F7A3F4139A5B17E60A0A669AEAEDF482FD72D4C7C633823CB7"
         },
         {
             "Name": "SoftwareInventory.Policy.json",
@@ -139,8 +139,8 @@
         {
             "Name": "Register-Tasks_SYSTEM.ps1",
             "Role": "TaskRegistration",
-            "Version": "4.12.0",
-            "SHA256": "F1D151CE729EB44C706AE726DC45BF3D516F16D18D4F39D5D7656EC78FF4326E"
+            "Version": "4.13.0",
+            "SHA256": "F72D6D928DEAFFD9CDCDA4544545AEF36BFD1CD1989DB52EE38A38B3821ADF34"
         }
     ]
 }

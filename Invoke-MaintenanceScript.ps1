@@ -2,9 +2,10 @@
 #requires -RunAsAdministrator
 # =====================================================================
 # ScriptName:    Invoke-MaintenanceScript.ps1
-# ScriptVersion: 2.1.0
-# LastUpdated:   2026-10-08
-# Changes:       SystemRepairWeekly enables normal repair and n8n-gated escalation.
+# ScriptVersion: 2.2.0
+# LastUpdated:   2026-10-15
+# Changes:       v2.2.0 adds fixed closeout actions, a coordinator mutex, and post-lock window checks.
+#                Weekly repair matches the supplied approval-gated production arguments.
 # Purpose:       Executes only locally allowlisted maintenance actions with
 #                fixed script mappings and fixed arguments.
 # =====================================================================
@@ -45,7 +46,9 @@ param(
         'SystemRepairWeekly',
         'EndpointHealthInventory',
         'SyncSystemTime',
-        'MicrosoftEdgeUpdateRepair'
+        'MicrosoftEdgeUpdateRepair',
+        'SundayUpdateCloseoutPass',
+        'SundayUpdateCloseoutVerify'
     )]
     [string]$ActionId,
 
@@ -70,7 +73,7 @@ $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 
 $script:ScriptName = 'Invoke-MaintenanceScript.ps1'
-$script:ScriptVersion = '2.1.0'
+$script:ScriptVersion = '2.2.0'
 $script:Root = 'C:\Scripts'
 $script:LogRoot = 'C:\Logs'
 $script:RunId = [guid]::NewGuid().Guid
@@ -144,7 +147,7 @@ $actionCatalog = @{
     }
     SystemRepairWeekly = [pscustomobject]@{
         ScriptName = '08_System_Repair.ps1'
-        FixedArguments = [string[]]@('-AutoRepairOnDetection', '-AllowComponentStoreEscalation', '-AllowCopilotRemoval')
+        FixedArguments = [string[]]@('-AutoRepairOnDetection', '-AllowComponentStoreEscalation')
         Kind = 'ScheduledMaintenance'
     }
     EndpointHealthInventory = [pscustomobject]@{
@@ -156,6 +159,16 @@ $actionCatalog = @{
         ScriptName = '10_Sync_System_Time.ps1'
         FixedArguments = [string[]]@()
         Kind = 'ScheduledMaintenance'
+    }
+    SundayUpdateCloseoutPass = [pscustomobject]@{
+        ScriptName = '15_Sunday_Update_Closeout.ps1'
+        FixedArguments = [string[]]@()
+        Kind = 'Coordinator'
+    }
+    SundayUpdateCloseoutVerify = [pscustomobject]@{
+        ScriptName = '15_Sunday_Update_Closeout.ps1'
+        FixedArguments = [string[]]@('-VerifyOnly')
+        Kind = 'Coordinator'
     }
     MicrosoftEdgeUpdateRepair = [pscustomobject]@{
         ScriptName = 'Repair-MicrosoftEdgeUpdate.ps1'
@@ -197,12 +210,18 @@ function Resolve-LegacyActionId {
         '09_Disable_Windows_Update_Services.ps1'    { 'DisableWindowsUpdateServices' }
         '10_Sync_System_Time.ps1'                   { 'SyncSystemTime' }
         '14_Endpoint_Health_Inventory.ps1'          { 'EndpointHealthInventory' }
+        '15_Sunday_Update_Closeout.ps1'            { if ($normalizedArguments -eq '-VerifyOnly') { 'SundayUpdateCloseoutVerify' } else { 'SundayUpdateCloseoutPass' } }
         default { throw "Legacy script is not allowlisted: $scriptName" }
     }
 
     if ($scriptName -eq '08_System_Repair.ps1') {
-        if ($normalizedArguments -notin @('-AllowCopilotRemoval', '-AutoRepairOnDetection -AllowComponentStoreEscalation -AllowCopilotRemoval')) {
+        if ($normalizedArguments -ne '-AutoRepairOnDetection -AllowComponentStoreEscalation') {
             throw 'Legacy SystemRepairWeekly arguments must match an approved fixed combination.'
+        }
+    }
+    elseif ($scriptName -eq '15_Sunday_Update_Closeout.ps1') {
+        if ($normalizedArguments -notin @('', '-VerifyOnly')) {
+            throw 'Legacy closeout arguments must be empty or exactly -VerifyOnly.'
         }
     }
     elseif (-not [string]::IsNullOrWhiteSpace($normalizedArguments)) {
@@ -356,8 +375,25 @@ try {
     }
 
     $childArguments = Get-ChildArguments -Definition $definition -TargetPath $resolvedTarget
-    $script:Lock = Enter-MaintenanceExecutionLock -TimeoutSeconds ([int]$policy.ExecutionLockTimeoutSeconds)
-    Write-LauncherLog 'Global maintenance execution lock acquired.' 'INFO'
+    if ([string]$definition.Kind -eq 'Coordinator') {
+        # Script 15 directly invokes Script 01, whose updater bootstrap may use
+        # the launcher. Do not hold the ordinary execution mutex across that chain.
+        # This separate mutex serializes all three closeout passes and verification.
+        $script:Lock = Enter-MaintenanceExecutionLock -Name 'Global\Compton_SundayUpdateCloseout' -TimeoutSeconds ([int]$policy.ExecutionLockTimeoutSeconds)
+        Write-LauncherLog 'Sunday closeout coordinator lock acquired.' 'INFO'
+    }
+    else {
+        $script:Lock = Enter-MaintenanceExecutionLock -TimeoutSeconds ([int]$policy.ExecutionLockTimeoutSeconds)
+        Write-LauncherLog 'Global maintenance execution lock acquired.' 'INFO'
+    }
+    # A wait for either mutex must not carry execution past the approved window.
+    $window = Test-MaintenanceWindow -ScriptName $script:TargetScriptName -Policy $policy
+    if (-not $window.Allowed) {
+        $script:Status = 'OutsideMaintenanceWindow'
+        $script:ExitCode = 20
+        Write-LauncherLog $window.Reason 'WARN'
+        throw [System.OperationCanceledException]::new($window.Reason)
+    }
 
     $powerShellExe = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
     & $powerShellExe @childArguments
@@ -390,7 +426,7 @@ catch {
 finally {
     if ($script:Lock) {
         Exit-MaintenanceExecutionLock -Lock $script:Lock
-        try { Write-LauncherLog 'Global maintenance execution lock released.' 'INFO' } catch {}
+        try { Write-LauncherLog ('Execution lock released: {0}' -f $script:Lock.Name) 'INFO' } catch {}
     }
 
     $ended = Get-Date

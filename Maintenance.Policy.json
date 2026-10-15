@@ -1,6 +1,6 @@
 {
   "SchemaVersion": 1,
-  "PolicyVersion": "1.0.0",
+  "PolicyVersion": "1.1.0",
   "FleetStatusRoots": [
     "\\\\SERVER\\MaintenanceStatus",
     "\\\\FALLBACK-SERVER\\MaintenanceStatus"
@@ -12,6 +12,16 @@
   "LogRetentionDays": 60,
   "Scripts": [
     {
+      "Name": "00_Update-Scripts-FromShare.ps1",
+      "Window": {
+        "Enforce": false,
+        "Days": [],
+        "Start": "00:00",
+        "End": "23:59"
+      },
+      "Dependencies": []
+    },
+    {
       "Name": "01_Enable_Windows_Update_Services.ps1",
       "Window": {
         "Enforce": true,
@@ -19,7 +29,7 @@
           "Sunday"
         ],
         "Start": "00:00",
-        "End": "10:00"
+        "End": "20:45"
       },
       "Dependencies": []
     },
@@ -48,7 +58,7 @@
       "Dependencies": []
     },
     {
-      "Name": "04_Update_Edge_Silent.ps1",
+      "Name": "04_Sunday_Lab_Application_Maintenance.ps1",
       "Window": {
         "Enforce": true,
         "Days": [
@@ -85,7 +95,7 @@
           "Sunday"
         ],
         "Start": "00:00",
-        "End": "10:00"
+        "End": "20:45"
       },
       "Dependencies": [
         {
@@ -103,7 +113,7 @@
           "Sunday"
         ],
         "Start": "00:00",
-        "End": "10:00"
+        "End": "20:45"
       },
       "Dependencies": []
     },
@@ -127,7 +137,7 @@
           "Sunday"
         ],
         "Start": "00:00",
-        "End": "10:00"
+        "End": "20:45"
       },
       "Dependencies": []
     },
@@ -142,42 +152,6 @@
       "Dependencies": []
     },
     {
-      "Name": "11_Install_SharpDriver_And_PaperCut.ps1",
-      "Window": {
-        "Enforce": true,
-        "Days": [
-          "Sunday"
-        ],
-        "Start": "00:00",
-        "End": "10:00"
-      },
-      "Dependencies": []
-    },
-    {
-      "Name": "12_Enable-SystemRestore-And-Create-RestorePoint.ps1",
-      "Window": {
-        "Enforce": true,
-        "Days": [
-          "Sunday"
-        ],
-        "Start": "00:00",
-        "End": "10:00"
-      },
-      "Dependencies": []
-    },
-    {
-      "Name": "13_Configure_Autologon_And_Edge.ps1",
-      "Window": {
-        "Enforce": true,
-        "Days": [
-          "Sunday"
-        ],
-        "Start": "07:30",
-        "End": "09:00"
-      },
-      "Dependencies": []
-    },
-    {
       "Name": "14_Endpoint_Health_Inventory.ps1",
       "Window": {
         "Enforce": true,
@@ -186,6 +160,49 @@
         ],
         "Start": "00:00",
         "End": "10:00"
+      },
+      "Dependencies": []
+    },
+    {
+      "Name": "15_Sunday_Update_Closeout.ps1",
+      "Window": {
+        "Enforce": true,
+        "Days": [
+          "Sunday"
+        ],
+        "Start": "18:00",
+        "End": "20:45"
+      },
+      "Dependencies": [
+        {
+          "Type": "File",
+          "Value": "C:\\Scripts\\01_Enable_Windows_Update_Services.ps1",
+          "Required": true
+        },
+        {
+          "Type": "File",
+          "Value": "C:\\Scripts\\06_Weekend_Windows_Updates.ps1",
+          "Required": true
+        },
+        {
+          "Type": "File",
+          "Value": "C:\\Scripts\\07_Force_Reboot_Install_Updates.ps1",
+          "Required": true
+        },
+        {
+          "Type": "File",
+          "Value": "C:\\Scripts\\09_Disable_Windows_Update_Services.ps1",
+          "Required": true
+        }
+      ]
+    },
+    {
+      "Name": "Repair-MicrosoftEdgeUpdate.ps1",
+      "Window": {
+        "Enforce": false,
+        "Days": [],
+        "Start": "00:00",
+        "End": "23:59"
       },
       "Dependencies": []
     }

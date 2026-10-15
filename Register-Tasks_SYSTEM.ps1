@@ -1,8 +1,8 @@
 #requires -Version 5.1
 #requires -RunAsAdministrator
 # ScriptName:    Register-Tasks_SYSTEM.ps1
-# ScriptVersion: 4.12.0
-# LastUpdated:   2026-10-08
+# ScriptVersion: 4.13.0
+# LastUpdated:   2026-10-15
 <#
 .SYNOPSIS
     Reconciles Compton College managed scheduled tasks under SYSTEM.
@@ -14,11 +14,13 @@
 
 .NOTES
     ScriptName:    Register-Tasks_SYSTEM.ps1
-    ScriptVersion: 4.12.0
+    ScriptVersion: 4.13.0
     Change: Replaces seven standalone weekly tasks with combined script 04, removes
             tasks that reference retired scripts, and refactors Sunday timing.
-    LastUpdated:   2026-10-08
-    Changes:       v4.12.0 enables approval-gated Script 08 repair through the
+    LastUpdated:   2026-10-15
+    Changes:       v4.13.0 merges the supplied production timetable and fixed closeout actions;
+                   preserves drift reconciliation, legacy cleanup, and repair approval checks.
+                   v4.12.0 enables approval-gated Script 08 repair through the
                    fixed launcher action. -SystemRepairOnly updates an existing
                    repair task action while preserving its schedule and principal.
     Changes:       v4.11.0 registers launcher actions by fixed ActionId and rejects
@@ -59,7 +61,7 @@ Set-StrictMode -Version 2.0
 $ErrorActionPreference = 'Stop'
 
 $script:ScriptName       = 'Register-Tasks_SYSTEM.ps1'
-$script:ScriptVersion    = '4.12.0'
+$script:ScriptVersion    = '4.13.0'
 $script:RunId            = [guid]::NewGuid().Guid
 $script:StartTime        = Get-Date
 $script:WarningCount     = 0
@@ -98,13 +100,22 @@ if ($SystemRepairOnly) {
     if ($repairTask.Principal.UserId -notin @('SYSTEM', 'NT AUTHORITY\SYSTEM', 'S-1-5-18')) {
         throw 'The existing repair task must run as SYSTEM.'
     }
-    $repairArguments = '-NoProfile -ExecutionPolicy Bypass -File "{0}" -AutoRepairOnDetection -AllowComponentStoreEscalation -AllowCopilotRemoval' -f $repairScriptPath
+    $repairArguments = '-NoProfile -ExecutionPolicy Bypass -File "{0}" -AutoRepairOnDetection -AllowComponentStoreEscalation' -f $repairScriptPath
     $repairAction = New-ScheduledTaskAction -Execute $WindowsPowerShellExe -Argument $repairArguments
     if ($PSCmdlet.ShouldProcess(($repairTask.TaskPath + $repairTask.TaskName), 'Update repair task action; preserve schedule and principal')) {
         Set-ScheduledTask -TaskName $repairTask.TaskName -TaskPath $repairTask.TaskPath -Action $repairAction -ErrorAction Stop | Out-Null
         Write-Host 'Updated only the System Repair task action. The task was not started.'
     }
     return
+}
+
+# Closeout tasks require matching fixed launcher actions and servicing-only reboot support.
+$launcherSource = Get-Content -LiteralPath (Join-Path $ScriptsRoot 'Invoke-MaintenanceScript.ps1') -Raw -ErrorAction Stop
+$rebootSource = Get-Content -LiteralPath (Join-Path $ScriptsRoot '07_Force_Reboot_Install_Updates.ps1') -Raw -ErrorAction Stop
+if ($launcherSource -notmatch 'SundayUpdateCloseoutPass' -or $launcherSource -notmatch 'SundayUpdateCloseoutVerify' -or
+    -not $rebootSource.Contains('[switch]$WindowsServicingOnly') -or
+    -not (Test-Path -LiteralPath (Join-Path $ScriptsRoot '15_Sunday_Update_Closeout.ps1') -PathType Leaf)) {
+    throw 'Deploy the matching launcher, Script 07 servicing-only support, and Script 15 before reconciling closeout tasks.'
 }
 
 # A full -WhatIf exits before framework initialization or task mutations.
@@ -218,12 +229,18 @@ function Resolve-LauncherActionId {
         '09_Disable_Windows_Update_Services.ps1'       { 'DisableWindowsUpdateServices' }
         '10_Sync_System_Time.ps1'                      { 'SyncSystemTime' }
         '14_Endpoint_Health_Inventory.ps1'             { 'EndpointHealthInventory' }
+        '15_Sunday_Update_Closeout.ps1'               { if ($normalizedExtra -eq '-VerifyOnly') { 'SundayUpdateCloseoutVerify' } else { 'SundayUpdateCloseoutPass' } }
         default { throw "Script is not present in the launcher allowlist: $scriptName" }
     }
 
     if ($scriptName -eq '08_System_Repair.ps1') {
-        if ($normalizedExtra -ne '-AutoRepairOnDetection -AllowComponentStoreEscalation -AllowCopilotRemoval') {
+        if ($normalizedExtra -ne '-AutoRepairOnDetection -AllowComponentStoreEscalation') {
             throw "SystemRepairWeekly requires the fixed approval-gated repair arguments. Received: '$normalizedExtra'"
+        }
+    }
+    elseif ($scriptName -eq '15_Sunday_Update_Closeout.ps1') {
+        if ($normalizedExtra -notin @('', '-VerifyOnly')) {
+            throw "Sunday closeout accepts only the fixed empty or -VerifyOnly argument set."
         }
     }
     elseif (-not [string]::IsNullOrWhiteSpace($normalizedExtra)) {
@@ -832,22 +849,26 @@ try {
 
     Write-Log -Message "Reconciling managed tasks under $TaskPath using scripts from $ScriptsRoot"
 
-    # The schedule deliberately leaves time for long-running application, driver,
-    # update, and repair stages. Script 14 runs last so endpoint.health represents
-    # the completed weekly maintenance state.
+    # Production timetable supplied October 15. Script 14 captures the morning
+    # state; Script 15 publishes independent evening closeout/readiness evidence.
     $taskDefinitions = @(
-        [pscustomobject]@{ Name='01. Check for Updated Scripts';             Script='00_Update-Scripts-FromShare.ps1';                    Time='01:00'; Args='' },
-        [pscustomobject]@{ Name='02. Enable Windows Update Services';        Script='01_Enable_Windows_Update_Services.ps1';              Time='01:15'; Args='' },
-        [pscustomobject]@{ Name='03. Remove User Profiles Weekly';           Script='02_Remove_User_Profiles.ps1';                         Time='01:30'; Args='' },
-        [pscustomobject]@{ Name='04. Sunday Lab Application Maintenance';    Script='04_Sunday_Lab_Application_Maintenance.ps1';           Time='02:00'; Args='' },
-        [pscustomobject]@{ Name='05. Weekend Apps Update';                   Script='03_Weekend_Apps_Update.ps1';                          Time='03:15'; Args='' },
-        [pscustomobject]@{ Name='06. Weekend HP Drivers Update';             Script='05_Weekend_HP_Drivers_Update.ps1';                    Time='04:15'; Args='' },
-        [pscustomobject]@{ Name='07. Weekend Windows Updates - 1st Pass';    Script='06_Weekend_Windows_Updates.ps1';                      Time='05:15'; Args='' },
-        [pscustomobject]@{ Name='08. Force Reboot Install Updates';          Script='07_Force_Reboot_Install_Updates.ps1';                 Time='06:15'; Args='' },
-        [pscustomobject]@{ Name='09. Weekend Windows Updates - 2nd Pass';    Script='06_Weekend_Windows_Updates.ps1';                      Time='06:45'; Args='' },
-        [pscustomobject]@{ Name='10. Disable Windows Update Services';       Script='09_Disable_Windows_Update_Services.ps1';              Time='07:45'; Args='' },
-        [pscustomobject]@{ Name='11. System Repair';                         Script='08_System_Repair.ps1';                                Time='08:00'; Args='-AutoRepairOnDetection -AllowComponentStoreEscalation -AllowCopilotRemoval' },
-        [pscustomobject]@{ Name='12. Weekly Endpoint Health Inventory';      Script='14_Endpoint_Health_Inventory.ps1';                    Time='09:00'; Args='' }
+        [pscustomobject]@{ Name='01. Check for Updated Scripts'; Script='00_Update-Scripts-FromShare.ps1'; Time='01:15'; Args='' },
+        [pscustomobject]@{ Name='02. Enable Windows Update Services'; Script='01_Enable_Windows_Update_Services.ps1'; Time='01:20'; Args='' },
+        [pscustomobject]@{ Name='03. Remove User Profiles Weekly'; Script='02_Remove_User_Profiles.ps1'; Time='01:30'; Args='' },
+        [pscustomobject]@{ Name='04. Weekend Apps Update'; Script='03_Weekend_Apps_Update.ps1'; Time='02:00'; Args='' },
+        [pscustomobject]@{ Name='05. Sunday Lab Application Maintenance'; Script='04_Sunday_Lab_Application_Maintenance.ps1'; Time='02:45'; Args='' },
+        [pscustomobject]@{ Name='06. Weekend HP Drivers Update'; Script='05_Weekend_HP_Drivers_Update.ps1'; Time='03:00'; Args='' },
+        [pscustomobject]@{ Name='07. Weekend Windows Updates - 1st Pass'; Script='06_Weekend_Windows_Updates.ps1'; Time='04:00'; Args='' },
+        [pscustomobject]@{ Name='08. Force Reboot Install Updates'; Script='07_Force_Reboot_Install_Updates.ps1'; Time='05:00'; Args='' },
+        [pscustomobject]@{ Name='09. Weekend Windows Updates - 2nd Pass'; Script='06_Weekend_Windows_Updates.ps1'; Time='05:30'; Args='' },
+        [pscustomobject]@{ Name='10. Disable Windows Update Services'; Script='15_Sunday_Update_Closeout.ps1'; Time='20:30'; Args='-VerifyOnly' },
+        [pscustomobject]@{ Name='11. Force Reboot Install Updates 2'; Script='07_Force_Reboot_Install_Updates.ps1'; Time='06:05'; Args='' },
+        [pscustomobject]@{ Name='12. System Repair'; Script='08_System_Repair.ps1'; Time='06:15'; Args='-AutoRepairOnDetection -AllowComponentStoreEscalation' },
+        [pscustomobject]@{ Name='13. Force Reboot Install Updates 3'; Script='07_Force_Reboot_Install_Updates.ps1'; Time='07:00'; Args='' },
+        [pscustomobject]@{ Name='14. Endpoint Health Inventory'; Script='14_Endpoint_Health_Inventory.ps1'; Time='08:00'; Args='' },
+        [pscustomobject]@{ Name='15. Sunday Update Closeout - 1st Pass'; Script='15_Sunday_Update_Closeout.ps1'; Time='18:00'; Args='' },
+        [pscustomobject]@{ Name='15. Sunday Update Closeout - 2nd Pass'; Script='15_Sunday_Update_Closeout.ps1'; Time='19:00'; Args='' },
+        [pscustomobject]@{ Name='15. Sunday Update Closeout - 3rd Pass'; Script='15_Sunday_Update_Closeout.ps1'; Time='20:00'; Args='' }
     )
 
     # Cleanup-only list: these files are never registered as desired tasks.
@@ -901,11 +922,15 @@ try {
         '13. Configure Autologon and Edge',
         '08A. Resume Reboot Verification at Startup',
         '18. Check Deep Freeze Status at Startup',
-        '14. Check Deep Freeze Status at Startup'
+        '14. Check Deep Freeze Status at Startup',
+        '04. Sunday Lab Application Maintenance',
+        '11. System Repair',
+        '12. Weekly Endpoint Health Inventory',
+        '13. Check Deep Freeze Status'
     )
 
     $rebootResumeStartupTaskName = '09A. Resume Reboot Verification at Startup'
-    $deepFreezeWeeklyTaskName = '13. Check Deep Freeze Status'
+    $deepFreezeWeeklyTaskName = '16. Deep Freeze Audit'
     $desiredTaskNames = @($taskDefinitions.Name) + @(
         '00. Sync System Time Every 4 Hours',
         $rebootResumeStartupTaskName,

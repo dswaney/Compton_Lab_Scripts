@@ -280,9 +280,9 @@ Set-Location C:\Scripts
 .\Register-Tasks_SYSTEM.ps1 -SystemRepairOnly
 ```
 
-This mode accepts either `11. System Repair` (current package) or `12. System Repair` (older endpoint schedule), requires exactly one matching SYSTEM task, and preserves its triggers, settings, principal, and enabled state. It does not start the task. The direct action includes `-AutoRepairOnDetection -AllowComponentStoreEscalation -AllowCopilotRemoval`; Copilot removal preserves the current package's existing opt-in behavior.
+This mode accepts either `11. System Repair` (current package) or `12. System Repair` (older endpoint schedule), requires exactly one matching SYSTEM task, and preserves its triggers, settings, principal, and enabled state. It does not start the task. The direct action includes `-AutoRepairOnDetection -AllowComponentStoreEscalation`; Weekly repair leaves the Copilot fallback disabled, matching the supplied production registrar; Script 04 remains the recurring Copilot owner.
 
-A full reconciliation uses `Invoke-MaintenanceScript.ps1 -ActionId SystemRepairWeekly`, whose fixed child arguments contain those same three switches. The launcher continues enforcing maintenance policy/dependencies/locking and refuses an older Script 08 without the n8n approval integration. Registration also checks that integration before enabling the repair action.
+A full reconciliation uses `Invoke-MaintenanceScript.ps1 -ActionId SystemRepairWeekly`, whose fixed child arguments contain those same two switches. The launcher continues enforcing maintenance policy/dependencies/locking and refuses an older Script 08 without the n8n approval integration. Registration also checks that integration before enabling the repair action.
 
 ##### Validation and troubleshooting
 
@@ -335,7 +335,7 @@ Each guarded operation must start on local Sunday before 20:45. When Deep Freeze
 
 The script does not change the external freeze schedule or prevent refreezing when readiness fails. A deferred/failed run may leave update services enabled; review the status and complete closeout before relying on the configured freeze time. Its telemetry append is not routed through the framework mutex.
 
-The repository registrar and launcher do not yet schedule or expose Script 15. Adding the file to the manifest makes it distributable; it does not create closeout tasks. See the schedule reconciliation notes below.
+Registrar v4.13.0 schedules the normal passes through fixed `SundayUpdateCloseoutPass` launcher actions and final verification through `SundayUpdateCloseoutVerify`. The launcher checks policy/dependencies and uses a separate `Global\Compton_SundayUpdateCloseout` mutex to serialize closeout invocations without holding the ordinary execution mutex across Script 01's updater bootstrap. These child calls remain direct and do not individually enter the launcher or global lock.
 
 ### `16_Check_Deep_Freeze_Status.ps1`
 
@@ -389,20 +389,25 @@ The manifest lists each managed file's version and hash. The update utility vali
 
 ### Sunday schedule in the repository registrar
 
-| Order | Time | Task | Script |
-|---:|---:|---|---|
-| 1 | 1:00 AM | Check for Updated Scripts | `00_Update-Scripts-FromShare.ps1` |
-| 2 | 1:15 AM | Enable Windows Update Services | `01_Enable_Windows_Update_Services.ps1` |
-| 3 | 1:30 AM | Remove User Profiles Weekly | `02_Remove_User_Profiles.ps1` |
-| 4 | 2:00 AM | Sunday Lab Application Maintenance | `04_Sunday_Lab_Application_Maintenance.ps1` |
-| 5 | 3:15 AM | Weekend Apps Update | `03_Weekend_Apps_Update.ps1` |
-| 6 | 4:15 AM | Weekend HP Drivers Update | `05_Weekend_HP_Drivers_Update.ps1` |
-| 7 | 5:15 AM | Windows Updates—First Pass | `06_Weekend_Windows_Updates.ps1` |
-| 8 | 6:15 AM | Force Reboot/Install Updates | `07_Force_Reboot_Install_Updates.ps1` |
-| 9 | 6:45 AM | Windows Updates—Second Pass | `06_Weekend_Windows_Updates.ps1` |
-| 10 | 7:45 AM | Disable Windows Update Services | `09_Disable_Windows_Update_Services.ps1` |
-| 11 | 8:00 AM | System Repair | `08_System_Repair.ps1 -AutoRepairOnDetection -AllowComponentStoreEscalation -AllowCopilotRemoval` |
-| 12 | 9:00 AM | Weekly Endpoint Health Inventory | `14_Endpoint_Health_Inventory.ps1` |
+| Time (Sunday, local) | Task | Script / arguments |
+|---|---|---|
+| 01:15 | 01. Check for Updated Scripts | `00_Update-Scripts-FromShare.ps1` |
+| 01:20 | 02. Enable Windows Update Services | `01_Enable_Windows_Update_Services.ps1` |
+| 01:30 | 03. Remove User Profiles Weekly | `02_Remove_User_Profiles.ps1` |
+| 02:00 | 04. Weekend Apps Update | `03_Weekend_Apps_Update.ps1` |
+| 02:45 | 05. Sunday Lab Application Maintenance | `04_Sunday_Lab_Application_Maintenance.ps1` |
+| 03:00 | 06. Weekend HP Drivers Update | `05_Weekend_HP_Drivers_Update.ps1` |
+| 04:00 | 07. Weekend Windows Updates - 1st Pass | `06_Weekend_Windows_Updates.ps1` |
+| 05:00 | 08. Force Reboot Install Updates | `07_Force_Reboot_Install_Updates.ps1` |
+| 05:30 | 09. Weekend Windows Updates - 2nd Pass | `06_Weekend_Windows_Updates.ps1` |
+| 06:05 | 11. Force Reboot Install Updates 2 | `07_Force_Reboot_Install_Updates.ps1` |
+| 06:15 | 12. System Repair | `08_System_Repair.ps1 -AutoRepairOnDetection -AllowComponentStoreEscalation` |
+| 07:00 | 13. Force Reboot Install Updates 3 | `07_Force_Reboot_Install_Updates.ps1` |
+| 08:00 | 14. Endpoint Health Inventory | `14_Endpoint_Health_Inventory.ps1` |
+| 18:00 | 15. Sunday Update Closeout - 1st Pass | `15_Sunday_Update_Closeout.ps1` |
+| 19:00 | 15. Sunday Update Closeout - 2nd Pass | `15_Sunday_Update_Closeout.ps1` |
+| 20:00 | 15. Sunday Update Closeout - 3rd Pass | `15_Sunday_Update_Closeout.ps1` |
+| 20:30 | 10. Disable Windows Update Services | `15_Sunday_Update_Closeout.ps1 -VerifyOnly` |
 
 Additional managed triggers:
 
@@ -414,14 +419,17 @@ Additional managed triggers:
 
 Task start times are fixed and do not prove that the previous task has finished. Use telemetry to monitor duration and overlap.
 
-### Production schedule reconciliation still required
+### October 15 production schedule integration
 
-The saved October 13 production registrar v1.8 differs from the repository registrar v4.12.0. It specifies Script 15 update passes at **18:00, 19:00, and 20:00 Sunday**, and `-VerifyOnly` at **20:30** in the task named `10. Disable Windows Update Services`. These are reference times from that production file; this repository update does not install them.
+The production timetable supplied in registrar v1.8 is merged into registrar v4.13.0, retaining the existing fixed-action launcher, drift checks, legacy task cleanup, repair approval checks, and startup-resume task. Sunday tasks have run-after-missed-start disabled; Monday's `16. Deep Freeze Audit` retains it. Obsolete names from the previous repository timetable are removed during reconciliation so old application, repair, inventory, or Deep Freeze tasks do not run alongside replacements.
 
-Before enabling that schedule, reconcile `Register-Tasks_SYSTEM.ps1` task names/actions and legacy-task cleanup; add fixed normal/verification actions to `Invoke-MaintenanceScript.ps1`; and reconcile `Maintenance.Policy.json` with the evening window. The current policy closes at 10:00 for Scripts 01/06/07/09, omits active Script 04 and Script 15, and retains retired entries. The current Script 15 invokes children directly, bypassing launcher policy and the global execution lock, so adding only a policy row is insufficient. Avoid wrapping an unchanged Script 15 in a held launcher lock: Script 01 can bootstrap Script 00 and trigger nested launcher work. Validate nesting/sequencing before scheduling it.
+The final verification task retains the supplied name `10. Disable Windows Update Services`, but its action is Script 15 `-VerifyOnly` at 20:30. It can still request a reboot and only disables services after clean verification. The 08:00 inventory is a morning snapshot; evening readiness comes from Script 15 telemetry.
 
-Script 07 v2.1.3 blocks weekday reboots but does not itself enforce the Script 15 20:45 cutoff or Deep Freeze Thawed state. Startup-resume protection for those conditions, and preservation of servicing-only mode across reboot continuation, require further review. Confirm the external thaw/freeze window before reconciling schedules.
+Policy v1.1.0 removes retired Scripts 04/11/12/13 entries, explicitly covers active Script 04, and permits Script 15 starts on Sunday from 18:00 through 20:45. Scripts 01/06/07/09 also have a Sunday 20:45 policy end to match their evening use. Script 15 independently rejects operations at or after 20:45. Updater and Edge remediation have explicit policy exemptions matching the previous missing-entry behavior; remediation still requires its fixed action and finding metadata. The launcher rechecks the window after acquiring either execution mutex; it serializes Script 15 passes separately from ordinary maintenance to avoid nested updater locking.
 
+`SystemRepairWeekly` uses `-AutoRepairOnDetection -AllowComponentStoreEscalation`, matching the supplied production task. Copilot removal remains an explicit manual fallback and is owned by Script 04 in recurring maintenance. The supplied unrestricted legacy launcher was not substituted for the fixed-action launcher, because it does not accept `-ActionId` and would break existing repository-registered tasks.
+
+Script 07 v2.1.3 blocks weekday reboots but does not itself enforce Script 15's 20:45 cutoff or Deep Freeze Thawed state. Startup-resume protection for those conditions and preservation of servicing-only mode across reboot continuation remain separate follow-up work. Script 15 serializes its own invocations through the launcher, but its direct child operations do not participate in the ordinary global maintenance mutex. Confirm the external thaw/freeze window and pilot the complete schedule on Windows; registering tasks does not start them.
 
 ## Deployment workflow
 
@@ -510,3 +518,11 @@ The following files are retained under [`Retired`](./Retired) for history only. 
 - Updater v4.12.1 approves the new Script 15 filename. Manifest builder v2.3.1 includes Script 15 and preserves the previously missing software-inventory policy and component-store repair helper catalog entries.
 - Refreshes package 3.0.9 manifest, validation record, and checksums. Public repository hashes apply only to these repository bytes; regenerate after applying production configuration.
 - Validation covers file comparison, duplicate-definition checks, catalog consistency, JSON, and SHA-256 integrity. Windows PowerShell 5.1 parsing, task execution, and endpoint behavior still require a Windows pilot.
+
+
+## October 15, 2026 schedule and policy reconciliation (package 3.0.10)
+
+- Merges all supplied production task times, including three evening closeout passes, final verification, and the Monday audit, into registrar v4.13.0 rather than replacing it with the older registrar implementation.
+- Launcher v2.2.0 retains fixed actions and remediation safeguards, adds the two closeout actions with a separate coordinator mutex, and rechecks policy after lock waits. The legacy arbitrary-path/bypass launcher is not deployed.
+- Policy v1.1.0 covers active scripts and evening update operations; public fleet-status placeholders are retained. Updater v4.12.2 verifies both closeout actions after registration.
+- Manifest, validation metadata, checksum list, and schedule documentation reflect the integrated package. Validation remains static; Windows PowerShell parsing and a Windows endpoint pilot are required.

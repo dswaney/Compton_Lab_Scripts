@@ -1,5 +1,5 @@
-#requires -version 5.1
-# ModuleVersion: 1.2.1
+﻿#requires -version 5.1
+# ModuleVersion: 1.2.2
 # LastUpdated: 2026-10-06
 <#
 .SYNOPSIS
@@ -10,6 +10,8 @@
     Copilot packages, stops Copilot processes, disables Copilot tasks, applies
     machine and user policies, cleans shortcuts, and verifies the result.
 .NOTES
+    v1.2.2 reports exclusively staged Appx remnants separately from installed
+    user registrations, avoiding repeated removal and false verification failures.
     v1.2.1 safely reads optional uninstall-registry properties under StrictMode
     and uses final registration verification as the authoritative uninstall
     result when copilot_setup.exe returns a nonstandard exit code.
@@ -28,7 +30,7 @@
 
 Set-StrictMode -Version 2.0
 
-$script:CopilotModuleVersion = '1.2.1'
+$script:CopilotModuleVersion = '1.2.2'
 
 function Get-CopilotPropertyValue {
     param(
@@ -109,6 +111,20 @@ function Disable-CopilotStartupEntriesForHive {
             Write-CopilotMessage -Logger $Logger -Message "Failed disabling Copilot startup entries under $path`: $($_.Exception.Message)" -Level WARN
         }
     }
+}
+
+function Test-CopilotPackageStagedOnly {
+    param([Parameter(Mandatory)]$Package)
+
+    # Unknown or missing state remains actionable; exclude only proven staged-only entries.
+    $users = @(Get-CopilotPropertyValue -InputObject $Package -Name 'PackageUserInformation')
+    if ($users.Count -eq 0) { return $false }
+    foreach ($user in $users) {
+        if ($null -eq $user) { return $false }
+        $state = [string](Get-CopilotPropertyValue -InputObject $user -Name 'InstallState')
+        if ($state -ne 'Staged') { return $false }
+    }
+    return $true
 }
 
 function Get-CopilotDesktopRegistrations {
@@ -275,6 +291,8 @@ function Invoke-ComprehensiveCopilotRemoval {
         OfflineUserHivesUpdated       = 0
         ShortcutsRemoved              = 0
         StartupEntriesDisabled        = 0
+        RemainingStagedPackages      = 0
+        StagedPackageNames            = @()
         RemainingInstalledPackages   = 0
         RemainingProvisionedPackages = 0
         RemainingDesktopApplications = 0
@@ -424,6 +442,10 @@ function Invoke-ComprehensiveCopilotRemoval {
     } | Sort-Object PackageFullName -Unique)
     $result.InstalledPackagesFound = $installed.Count
     foreach ($package in $installed) {
+        if (Test-CopilotPackageStagedOnly -Package $package) {
+            Write-CopilotMessage -Logger $Logger -Message ("Staged-only Copilot package has no installed user registration; skipping repeat removal: {0}" -f $package.PackageFullName)
+            continue
+        }
         try {
             if ($PSCmdlet.ShouldProcess($package.PackageFullName,'Remove Copilot Appx package for all users')) {
                 Remove-AppxPackage -Package $package.PackageFullName -AllUsers -ErrorAction Stop
@@ -487,10 +509,18 @@ function Invoke-ComprehensiveCopilotRemoval {
         }
     }
 
-    $result.RemainingInstalledPackages = @(Get-AppxPackage -AllUsers -ErrorAction SilentlyContinue | Where-Object {
+    $remainingPackages = @(Get-AppxPackage -AllUsers -ErrorAction SilentlyContinue | Where-Object {
         $name = [string]$_.Name; $fullName = [string]$_.PackageFullName
         @($packagePatterns | Where-Object { $name -like $_ -or $fullName -like $_ }).Count -gt 0
-    }).Count
+    })
+    $stagedPackages = @($remainingPackages | Where-Object { Test-CopilotPackageStagedOnly -Package $_ })
+    $result.RemainingStagedPackages = $stagedPackages.Count
+    $result.StagedPackageNames = @($stagedPackages | ForEach-Object { [string]$_.PackageFullName })
+    $result.RemainingInstalledPackages = @($remainingPackages | Where-Object { -not (Test-CopilotPackageStagedOnly -Package $_) }).Count
+    foreach ($package in $remainingPackages) {
+        $stagedOnly = Test-CopilotPackageStagedOnly -Package $package
+        Write-CopilotMessage -Logger $Logger -Level $(if ($stagedOnly) { 'INFO' } else { 'ERROR' }) -Message ("Copilot package verification: {0}; StagedOnly={1}; UserStates={2}" -f $package.PackageFullName,$stagedOnly,([string]$package.PackageUserInformation))
+    }
     $result.RemainingProvisionedPackages = @(Get-AppxProvisionedPackage -Online -ErrorAction SilentlyContinue | Where-Object {
         $name = [string]$_.DisplayName; $fullName = [string]$_.PackageName
         @($packagePatterns | Where-Object { $name -like $_ -or $fullName -like $_ }).Count -gt 0
@@ -506,6 +536,9 @@ function Invoke-ComprehensiveCopilotRemoval {
     }
     elseif ($result.Failures -gt 0) {
         $result.Status = 'CompletedWithErrors'
+    }
+    elseif ($result.RemainingStagedPackages -gt 0) {
+        $result.Status = 'StagedRemnantsOnly'
     }
     else {
         $result.Status = 'RemovedOrNotPresent'

@@ -1,8 +1,9 @@
-# =====================================================================
+﻿# =====================================================================
 # ScriptName: 02_Remove_User_Profiles.ps1
-# ScriptVersion: 2.5.1
-# LastUpdated: 2026-10-12
-# Changes: v2.5.1 removes only ForceAutoLogon for enabled CC-Students autologon.
+# ScriptVersion: 2.5.22
+# LastUpdated: 2026-10-16
+# Changes: v2.5.22 preserves the manually added hr-ib2130 profile exclusion and aligns telemetry version.
+#          v2.5.1 removes only ForceAutoLogon for enabled CC-Students autologon.
 #          All other Winlogon/autologon values remain unchanged.
 #          v2.5.0 removes Copilot removal/policies and Edge InPrivate startup
 #          configuration from Script 02. Those functions are now owned by
@@ -30,7 +31,8 @@ param(
         'All Users',
         'MISAdmin',
         'CC-Student',
-        'dswaney'
+        'dswaney',
+		'hr-ib2130'
     ),
 
     [string]$UsersRoot = 'C:\Users',
@@ -61,7 +63,7 @@ $script:BaseFileName = "{0}-RemoveUserProfiles-{1}" -f $script:ComputerName, $sc
 $script:YamlLogPath = Join-Path $LogDirectory ($script:BaseFileName + '.yaml')
 $script:RunId = [guid]::NewGuid().ToString('N')
 $script:ScriptName = '02_Remove_User_Profiles.ps1'
-$script:ScriptVersion = '2.5.1'
+$script:ScriptVersion = '2.5.22'
 $script:Domain = $env:USERDNSDOMAIN
 $script:TextLogPath = $null
 $script:PublishedTextLogPath = $null

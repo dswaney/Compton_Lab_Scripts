@@ -1,30 +1,27 @@
 {
-  "PackageVersion": "3.0.10",
-  "BaseCommit": "6eaa7a0b8e108ed2673fcdb02b252c41b461409a",
-  "PowerShellParserExecuted": false,
+  "PackageVersion": "3.0.20",
+  "BaseCommit": "a0d39170d887512c6cf976f47b1b0207c566d513",
+  "PowerShellParserExecuted": true,
+  "PowerShellParserVersion": "7.5.3 (Linux)",
   "RequiresWindowsPowerShellValidation": true,
   "StructuralChecks": [
-    "Supplied Script 06 v2.1.10 has one parameter block and no duplicated functions",
-    "Supplied framework v2.4.0 has no duplicated functions; public fleet-status placeholders preserved",
-    "Saved current Script 07 v2.1.3 supplies WindowsServicingOnly and Sunday reboot guards",
-    "Script 15 v1.0.0 copied unchanged from supplied production file",
-    "Updater approved list and manifest-builder catalog agree with all 23 manifest entries",
-    "Manifest and SHA256SUMS reflect final repository bytes",
-    "All 18 supplied weekly task names/scripts/times/arguments preserved in merged definitions; Monday audit registered separately",
-    "Fixed launcher closeout actions and registrar mappings agree; legacy arbitrary path/bypass launcher not deployed",
-    "Policy covers all scheduled disruptive actions and removes retired script entries",
-    "Closeout mutex is separate from ordinary execution mutex; launcher rechecks policy after lock waits",
-    "Updater verifies both closeout launcher actions after registration"
+    "All active root PowerShell files parsed without execution",
+    "Manifest SHA256 values recomputed against all 23 repository managed files",
+    "Updater helper approval and both closeout verification actions preserved",
+    "Fixed periodic action, six Mon-Sat triggers and explicit policy entry present",
+    "Both uploaded Script 02 files identical; hr-ib2130 exclusion preserved; runtime version aligned",
+    "Secure Boot remediation lists remain empty; no automatic decryption enabled"
   ],
-  "ValidationNotes": [
-    "Static comparison and cross-file checks only; Windows PowerShell parser and endpoint execution remain required.",
-    "Supplied production schedule merged into current fixed-action implementation; internal status destinations remain public placeholders.",
-    "Script 15 unchanged; child invocations remain direct and do not acquire ordinary launcher execution locks."
-  ],
+  "FunctionalTests": {
+    "SecureBootOfflineTestsPassed": 23,
+    "WindowsAuditUserEvidence": "SSC-216-007 SYSTEM audit: AlreadyUpdated; firmware verified; BitLocker On; event observed in Elastic"
+  },
   "PendingReconciliation": [
-    "Windows PowerShell 5.1 parser and real scheduled-task/COM/DFC pilot",
-    "Script 15 direct child execution versus ordinary global locking and mutex-protected telemetry",
-    "Startup-resume freeze/cutoff guards and servicing-only mode persistence",
-    "External Deep Freeze schedule coordination and failure closeout"
+    "Windows PowerShell 5.1 parsing on final repository bytes",
+    "Attended certificate remediation/reboot/resume/frozen-boot pilot",
+    "External freeze schedule is not controlled by readiness",
+    "Script 07 startup continuation thaw/cutoff and servicing-mode persistence",
+    "Direct coordinator children versus ordinary maintenance global locking",
+    "Pending telemetry events require explicit forwarding if shared append remains locked"
   ]
 }

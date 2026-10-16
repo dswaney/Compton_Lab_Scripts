@@ -1,7 +1,7 @@
-#requires -Version 5.1
+﻿#requires -Version 5.1
 #requires -RunAsAdministrator
 # ScriptName:    Register-Tasks_SYSTEM.ps1
-# ScriptVersion: 4.13.0
+# ScriptVersion: 4.14.0
 # LastUpdated:   2026-10-15
 <#
 .SYNOPSIS
@@ -14,11 +14,12 @@
 
 .NOTES
     ScriptName:    Register-Tasks_SYSTEM.ps1
-    ScriptVersion: 4.13.0
+    ScriptVersion: 4.14.0
     Change: Replaces seven standalone weekly tasks with combined script 04, removes
             tasks that reference retired scripts, and refactors Sunday timing.
     LastUpdated:   2026-10-15
-    Changes:       v4.13.0 merges the supplied production timetable and fixed closeout actions;
+    Changes:       v4.14.0 adds a staggered Monday-Saturday reporting task and -InventoryReportingOnly.
+                   v4.13.0 merges the supplied production timetable and fixed closeout actions;
                    preserves drift reconciliation, legacy cleanup, and repair approval checks.
                    v4.12.0 enables approval-gated Script 08 repair through the
                    fixed launcher action. -SystemRepairOnly updates an existing
@@ -54,14 +55,15 @@ param(
     [string]$ScriptsRoot = 'C:\Scripts',
     [string]$TaskPath = '\',
     [string]$LogDirectory = 'C:\Logs',
-    [switch]$SystemRepairOnly = $false
+    [switch]$SystemRepairOnly = $false,
+    [switch]$InventoryReportingOnly = $false
 )
 
 Set-StrictMode -Version 2.0
 $ErrorActionPreference = 'Stop'
 
 $script:ScriptName       = 'Register-Tasks_SYSTEM.ps1'
-$script:ScriptVersion    = '4.13.0'
+$script:ScriptVersion    = '4.14.0'
 $script:RunId            = [guid]::NewGuid().Guid
 $script:StartTime        = Get-Date
 $script:WarningCount     = 0
@@ -80,6 +82,8 @@ $script:LatestPath = Join-Path $LogDirectory 'Register-Tasks_SYSTEM.latest.json'
 
 $WindowsPowerShellExe = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
 
+if ($InventoryReportingOnly -and $SystemRepairOnly) { throw 'Choose only one registration mode.' }
+if (-not $InventoryReportingOnly) {
 # Check before any reconciliation or log initialization. The old Script 08
 # used the escalation switch alone as authorization and must not be enabled.
 $repairScriptPath = Join-Path $ScriptsRoot '08_System_Repair.ps1'
@@ -118,8 +122,17 @@ if ($launcherSource -notmatch 'SundayUpdateCloseoutPass' -or $launcherSource -no
     throw 'Deploy the matching launcher, Script 07 servicing-only support, and Script 15 before reconciling closeout tasks.'
 }
 
+}
+# Validate reporting prerequisites before registering any task.
+$reportingLauncherSource = Get-Content -LiteralPath (Join-Path $ScriptsRoot 'Invoke-MaintenanceScript.ps1') -Raw -ErrorAction Stop
+$reportingInventorySource = Get-Content -LiteralPath (Join-Path $ScriptsRoot '14_Endpoint_Health_Inventory.ps1') -Raw -ErrorAction Stop
+if (-not $reportingLauncherSource.Contains('EndpointHealthInventoryPeriodic') -or
+    -not $reportingInventorySource.Contains('[switch]$InventoryOnly')) {
+    throw 'Deploy Script 14 v1.10.0 and the matching fixed-action launcher before registering periodic reporting.'
+}
 # A full -WhatIf exits before framework initialization or task mutations.
-if (-not $PSCmdlet.ShouldProcess($TaskPath, 'Reconcile all managed SYSTEM maintenance tasks')) {
+$reconcileDescription = if ($InventoryReportingOnly) { 'Reconcile only the periodic SYSTEM inventory reporting task' } else { 'Reconcile all managed SYSTEM maintenance tasks' }
+if (-not $PSCmdlet.ShouldProcess($TaskPath, $reconcileDescription)) {
     return
 }
 
@@ -575,6 +588,60 @@ function Ensure-WeeklyTask {
     }
 }
 
+function Test-InventoryReportingTaskMatches {
+    param($ExistingTask, [string]$ExpectedArguments)
+    $issues = New-Object System.Collections.Generic.List[string]
+    foreach ($issue in @(Test-CommonTaskProperties -ExistingTask $ExistingTask -ExpectedArguments $ExpectedArguments)) { $issues.Add($issue) }
+    if ([bool]$ExistingTask.Settings.WakeToRun) { $issues.Add('WakeToRun must be disabled.') }
+    if ([string]$ExistingTask.Settings.ExecutionTimeLimit -ne 'PT20M') { $issues.Add('Expected a 20-minute execution limit.') }
+    if ([int]$ExistingTask.Settings.Priority -ne 7) { $issues.Add('Expected below-normal priority 7.') }
+    $triggers = @($ExistingTask.Triggers)
+    $times = @('00:00','04:00','08:00','12:00','16:00','20:00')
+    if ($triggers.Count -ne $times.Count) { $issues.Add('Expected six weekly triggers.') }
+    $actualTimes = @()
+    foreach ($trigger in $triggers) {
+        if ([string]$trigger.CimClass.CimClassName -notmatch 'Weekly' -or [int]$trigger.DaysOfWeek -ne 126 -or [int]$trigger.WeeksInterval -ne 1) {
+            $issues.Add('Expected Monday through Saturday weekly triggers only.')
+        }
+        if ([string]$trigger.RandomDelay -ne 'PT10M') { $issues.Add('Expected a ten-minute random delay.') }
+        if (-not $trigger.Enabled) { $issues.Add('A trigger is disabled.') }
+        $actualTimes += Get-TimeText -DateValue $trigger.StartBoundary
+    }
+    if ((($actualTimes | Sort-Object) -join ',') -ne ($times -join ',')) { $issues.Add('Trigger times differ.') }
+    return $issues.ToArray()
+}
+
+function Ensure-InventoryReportingTask {
+    $name = '14A. Endpoint Health Refresh Every 4 Hours'
+    $scriptPath = Join-Path $ScriptsRoot '14_Endpoint_Health_Inventory.ps1'
+    $arguments = '-NoLogo -NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File "{0}" -ActionId "EndpointHealthInventoryPeriodic"' -f (Join-Path $ScriptsRoot 'Invoke-MaintenanceScript.ps1')
+    $existing = Get-ScheduledTask -TaskName $name -TaskPath $TaskPath -ErrorAction SilentlyContinue
+    $issues = @()
+    if ($existing) {
+        $issues = @(Test-InventoryReportingTaskMatches -ExistingTask $existing -ExpectedArguments $arguments)
+        if ($issues.Count -eq 0) {
+            Add-TaskResult -Name $name -ScriptPath $scriptPath -Schedule 'Monday-Saturday every 4 hours; random delay 0-10 minutes' -Result Current -ScriptExists $true
+            return
+        }
+    }
+    $action = New-ScheduledTaskAction -Execute $WindowsPowerShellExe -Argument $arguments
+    $triggers = @('00:00','04:00','08:00','12:00','16:00','20:00') | ForEach-Object {
+        New-ScheduledTaskTrigger -Weekly -DaysOfWeek Monday,Tuesday,Wednesday,Thursday,Friday,Saturday -WeeksInterval 1 `
+            -At ([datetime]::Today.Add([timespan]::Parse($_))) -RandomDelay (New-TimeSpan -Minutes 10)
+    }
+    $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
+        -ExecutionTimeLimit (New-TimeSpan -Minutes 20) -MultipleInstances IgnoreNew -Priority 7
+    $settings.StartWhenAvailable = $false
+    $settings.WakeToRun = $false
+    Register-ScheduledTask -TaskName $name -TaskPath $TaskPath -Action $action -Trigger $triggers `
+        -Principal (New-ManagedTaskPrincipal) -Settings $settings -Force -ErrorAction Stop | Out-Null
+    $verified = Get-ScheduledTask -TaskName $name -TaskPath $TaskPath -ErrorAction Stop
+    $verifyIssues = @(Test-InventoryReportingTaskMatches -ExistingTask $verified -ExpectedArguments $arguments)
+    if ($verifyIssues.Count -gt 0) { throw "Periodic inventory task verification failed: $($verifyIssues -join '; ')" }
+    Add-TaskResult -Name $name -ScriptPath $scriptPath -Schedule 'Monday-Saturday every 4 hours; random delay 0-10 minutes' `
+        -Result $(if ($existing) {'Updated'} else {'Created'}) -ScriptExists $true -Issues $issues
+}
+
 function Ensure-TimeSyncTask {
     param(
         [Parameter(Mandatory)][string]$ScriptPath,
@@ -842,6 +909,11 @@ try {
     }
 
     Import-Module ScheduledTasks -ErrorAction Stop
+    if ($InventoryReportingOnly) {
+        Ensure-InventoryReportingTask
+        Write-Log -Level OK -Message 'Only the periodic inventory task was reconciled. No task was started.'
+        return
+    }
 
     if (-not (Test-Path -LiteralPath $ScriptsRoot -PathType Container)) {
         Write-Log -Level 'WARN' -Message "Scripts root does not currently exist: $ScriptsRoot"
@@ -934,7 +1006,8 @@ try {
     $desiredTaskNames = @($taskDefinitions.Name) + @(
         '00. Sync System Time Every 4 Hours',
         $rebootResumeStartupTaskName,
-        $deepFreezeWeeklyTaskName
+        $deepFreezeWeeklyTaskName,
+        '14A. Endpoint Health Refresh Every 4 Hours'
     )
     Remove-TasksReferencingRetiredScripts -RetiredScriptNames $retiredScriptNames
 
@@ -943,6 +1016,8 @@ try {
             Remove-ObsoleteManagedTask -Name $obsoleteName
         }
     }
+
+    Ensure-InventoryReportingTask
 
     Ensure-TimeSyncTask -ScriptPath (Join-Path $ScriptsRoot '10_Sync_System_Time.ps1')
 
@@ -1043,4 +1118,3 @@ finally {
 }
 
 exit $exitCode
-

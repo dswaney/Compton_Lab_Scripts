@@ -310,6 +310,9 @@ Selects domain-hierarchy or configured NTP behavior, repairs Windows Time startu
 
 ### `14_Endpoint_Health_Inventory.ps1`
 
+Version 1.10.2 adds `-InventoryOnly`: operational health and incremental selected system-error reporting refresh from a hostname/serial-bound full-inventory cache. Static/privileged weekly collectors retain their original observation time and cached status; periodic reporting does not rerun auditing setup, WinRM setup, Autopilot hash generation or software inventory. Seed the full cache while thawed before relying on frozen reporting. Registry auditing setup remains restricted to SSC* computers; its numeric policy query and registry ACL path handling are corrected. Domain policy can subsequently remove audit success, and a cached weekly auditing result does not prove live audit policy remains enabled.
+
+
 Collects one fault-tolerant weekly `endpoint.health` snapshot and separate events for findings, remediation candidates, and tracked software. Major inventory areas include:
 
 - Computer identity, hostname-derived building/lab/device ID, domain state, enclosure/chassis, serial number, system SKU, baseboard, monitors, CPU, GPU, memory modules, storage, optical drives, printers, audio devices, battery, and firmware.
@@ -327,15 +330,15 @@ An access-denied result for active `CapabilityAccessManager.db-wal` inspection i
 
 ### `15_Sunday_Update_Closeout.ps1`
 
-Version 1.0.0 is supplied from the current production file. Normal mode calls Script 01 to enable updates, calls Script 06 for another installation pass, then checks servicing reboot state and scans for remaining non-hidden software updates. If a servicing reboot is pending, it invokes Script 07 with `-WindowsServicingOnly`; Script 07 v2.1.3 is included as the matching dependency. A successful normal pass reports `UpdatePassVerified_NoPendingReboot` without disabling update services.
+Version 1.1.2 retains the Sunday update passes and final service closeout, and adds a Secure Boot certificate coordinator invoked by Script 01. `-SecureBootAuditOnly` reports deployment status, a live firmware query, separately labeled registry evidence, BitLocker protection and Deep Freeze version without updating certificates or changing protection. A denied firmware query preserves the other evidence and reports `Updated_FirmwareQueryRestricted` when applicable; it cannot establish readiness or authorize remediation. Run audits as SYSTEM to match the maintenance execution context.
 
-`-VerifyOnly` skips the initial enable/install calls, but **can still request a reboot**. When the update scan is clean, no servicing reboot is pending, and the checked servicing processes are absent, it invokes Script 09, verifies that Windows Update, Update Orchestrator, and BITS are Disabled/Stopped, then reports `ReadyToFreeze=true`.
+Remediation is controlled by `Maintenance.Policy.json` → `SecureBootMaintenance`. The exact-host pilot, recovery-key-confirmation and thaw-through-verification lists are empty by default. New remediation is restricted to Sunday, requires live thaw proof for Deep Freeze, and requires encrypted Deep Freeze pilots to have version 10.20.220.5844 or later. It uses Microsoft's certificate/boot-manager update process, a protected machine/volume-bound transaction, bounded BitLocker suspension (two reboots), at most three reboot requests, and a temporary SYSTEM startup/deadline task. New transactions start before 18:00; reboot requests stop before 20:15. Completed deployment must resume owned protection and pass a subsequent protected boot check before the transaction is ready. No automatic decryption, TPM clear, PCR change or Secure Boot disabling is performed.
 
-Each guarded operation must start on local Sunday before 20:45. When Deep Freeze services/drivers are detected, a successful DFC query must report Thawed; Frozen/unknown/unavailable state defers the operation. This is a start-time gate, not a timeout for an already-running child or update scan. The script writes `15_Sunday_Update_Closeout.latest.json`, a text log, and `maintenance.sunday_update_closeout` telemetry. Exit 0 means a verified pass/readiness, 3010 means a reboot remains required, and 2 means incomplete or failed verification.
+The coordinator emits `maintenance.secure_boot` to the existing NDJSON feed and writes `SecureBoot-Maintenance.latest.json`. Explicit shared-file append retries coexist with readers; an exclusive lock falls back to a uniquely named local pending event. A pending file is not guaranteed to be ingested by the existing Elastic input. See [Secure Boot pilot instructions](./docs/SecureBoot-Maintenance.md) for the gates, failure handling, and remaining Windows pilot requirements.
 
-The script does not change the external freeze schedule or prevent refreezing when readiness fails. A deferred/failed run may leave update services enabled; review the status and complete closeout before relying on the configured freeze time. Its telemetry append is not routed through the framework mutex.
+Normal closeout mode calls Scripts 01/06, independently scans updates, and requests servicing-only reboots through Script 07. `-VerifyOnly` skips initial enable/install but can still request servicing reboots. Final service closeout runs independently of certificate readiness, then verifies service state and certificate readiness before reporting `ReadyToFreeze=true`. Ordinary closeout operations must start on Sunday before 20:45, with a successful DFC Thawed query when Deep Freeze is detected. A queued Secure Boot reboot defers subsequent installation work in that pass.
 
-Registrar v4.13.0 schedules the normal passes through fixed `SundayUpdateCloseoutPass` launcher actions and final verification through `SundayUpdateCloseoutVerify`. The launcher checks policy/dependencies and uses a separate `Global\Compton_SundayUpdateCloseout` mutex to serialize closeout invocations without holding the ordinary execution mutex across Script 01's updater bootstrap. These child calls remain direct and do not individually enter the launcher or global lock.
+Neither this script nor a failed readiness check can hold the computer thawed or override the external Deep Freeze schedule. Arrange a thawed pilot through completion and monitor failures. Existing Script 07 startup-resume cutoff/thaw and direct-child/global-lock limitations remain follow-up work; the Secure Boot coordinator's own guards do not change Script 07.
 
 ### `16_Check_Deep_Freeze_Status.ps1`
 
@@ -414,6 +417,7 @@ Additional managed triggers:
 | Trigger | Task |
 |---|---|
 | Every four hours | `10_Sync_System_Time.ps1` |
+| Monday–Saturday at 00:00/04:00/08:00/12:00/16:00/20:00, up to 10 minutes random delay | `14A. Endpoint Health Refresh Every 4 Hours` → fixed `EndpointHealthInventoryPeriodic` action → Script 14 `-InventoryOnly` |
 | At system startup | `07_Force_Reboot_Install_Updates.ps1 -StartupResume` |
 | Monday at 7:00 AM, with run-after-missed-start | `16_Check_Deep_Freeze_Status.ps1` |
 
@@ -421,7 +425,7 @@ Task start times are fixed and do not prove that the previous task has finished.
 
 ### October 15 production schedule integration
 
-The production timetable supplied in registrar v1.8 is merged into registrar v4.13.0, retaining the existing fixed-action launcher, drift checks, legacy task cleanup, repair approval checks, and startup-resume task. Sunday tasks have run-after-missed-start disabled; Monday's `16. Deep Freeze Audit` retains it. Obsolete names from the previous repository timetable are removed during reconciliation so old application, repair, inventory, or Deep Freeze tasks do not run alongside replacements.
+The production timetable supplied in registrar v1.8 is merged into registrar v4.14.0, retaining the existing fixed-action launcher, drift checks, legacy task cleanup, repair approval checks, and startup-resume task. Sunday tasks have run-after-missed-start disabled; Monday's `16. Deep Freeze Audit` retains it. Obsolete names from the previous repository timetable are removed during reconciliation so old application, repair, inventory, or Deep Freeze tasks do not run alongside replacements.
 
 The final verification task retains the supplied name `10. Disable Windows Update Services`, but its action is Script 15 `-VerifyOnly` at 20:30. It can still request a reboot and only disables services after clean verification. The 08:00 inventory is a morning snapshot; evening readiness comes from Script 15 telemetry.
 
@@ -461,6 +465,9 @@ Important event families include:
 - `maintenance.updater`
 - `maintenance.task_reconciliation`
 - `maintenance.launcher`
+- `maintenance.secure_boot`
+- `maintenance.sunday_update_closeout`
+- `endpoint.system_error`
 - `maintenance.remediation`
 - `endpoint.health`
 - `endpoint.health.finding`
@@ -522,7 +529,16 @@ The following files are retained under [`Retired`](./Retired) for history only. 
 
 ## October 15, 2026 schedule and policy reconciliation (package 3.0.10)
 
-- Merges all supplied production task times, including three evening closeout passes, final verification, and the Monday audit, into registrar v4.13.0 rather than replacing it with the older registrar implementation.
+- Merges all supplied production task times, including three evening closeout passes, final verification, and the Monday audit, into registrar v4.14.0 rather than replacing it with the older registrar implementation.
 - Launcher v2.2.0 retains fixed actions and remediation safeguards, adds the two closeout actions with a separate coordinator mutex, and rechecks policy after lock waits. The legacy arbitrary-path/bypass launcher is not deployed.
 - Policy v1.1.0 covers active scripts and evening update operations; public fleet-status placeholders are retained. Updater v4.12.2 verifies both closeout actions after registration.
 - Manifest, validation metadata, checksum list, and schedule documentation reflect the integrated package. Validation remains static; Windows PowerShell parsing and a Windows endpoint pilot are required.
+
+## October 16, 2026 endpoint reporting and Secure Boot pilot (package 3.0.20)
+
+- Synchronizes supplied Scripts 01 2.8.8, 02 2.5.22, 14 1.10.2, 15 1.1.2, launcher 2.3.2, registrar 4.14.0 and policy 1.3.0. Both uploaded Script 02 copies were identical; its manual `hr-ib2130` exclusion is preserved and runtime telemetry version is aligned to 2.5.22.
+- Retains the repository updater 4.12.2 implementation: the supplied same-version updater omitted the existing component-store repair-helper approval and closeout task verification, so those repository safeguards are preserved.
+- Periodic reporting runs Monday–Saturday without changing the Sunday timetable. The launcher correlation-state fix avoids colliding with its validated input parameter.
+- Secure Boot remediation lists remain empty. An encrypted updated endpoint passed the SYSTEM audit and its `AlreadyUpdated`/firmware-verified/BitLocker-On event was observed in Elastic. This validates audit/reporting only; update, suspension, restart, protection-resume and frozen-boot remediation still require an attended pilot.
+- Public deployment/status paths retain repository placeholders. Manifest and checksums describe repository bytes and must be regenerated after local site configuration.
+- PowerShell 7.5.3 parsing and 23 isolated offline Secure Boot tests pass; Windows PowerShell 5.1 parsing and broader Windows integration remain required.

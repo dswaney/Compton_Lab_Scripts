@@ -103,3 +103,10 @@ OCTOBER 15 PRODUCTION SYNC
 - Launcher v2.2.0 uses fixed closeout actions and a separate closeout mutex.
 - Policy v1.1.0 covers active scripts and evening update operations.
 - See README.md for cutoff, startup-resume, direct-child locking, and pilot limits.
+
+OCTOBER 16 REPORTING AND CERTIFICATE PILOT
+- Registrar 4.14.0 and launcher 2.3.2 add fixed Mon-Sat four-hour inventory reporting.
+- Script 14 1.10.2 reuses a full inventory cache for weekly-only collectors.
+- Script 15 1.1.2 adds gated Secure Boot servicing and shared append with pending fallback.
+- All certificate remediation enrollment lists remain empty.
+- See docs/SecureBoot-Maintenance.md and README.md for audit evidence and untested remediation limits.

@@ -1,13 +1,13 @@
-# =====================================================================
+﻿# =====================================================================
 # ScriptName: 01_Enable_Windows_Update_Services.ps1
-# ScriptVersion: 2.8.7
-# LastUpdated: 2026-10-13
+# ScriptVersion: 2.8.8
+# LastUpdated: 2026-10-16
 # Purpose: Restore Windows Update services, tasks, policy settings,
 #          Windows 11 UI preferences, and classic right-click context menu behavior for all users;
 #          verify required services are running, retry startup failures
 #          up to 4 total attempts, and force a reboot if critical
 #          services still refuse to start.
-# Changes:  v2.8.7 restores the optional Microsoft Update Health service.
+# Changes:  v2.8.8 restores the optional Microsoft Update Health service.
 #           v2.8.6 verifies Medic native exit codes and restores SIH healing tasks.
 #           v2.8.5 aligns updater-task validation and repair with the 01:00 Sunday master schedule.
 #           v2.8.4 guarantees structured failure telemetry for bootstrap/framework/privilege/runtime failures.
@@ -22,7 +22,7 @@ param()
 $ErrorActionPreference = 'Stop'
 
 $script:ScriptName       = '01_Enable_Windows_Update_Services.ps1'
-$script:ScriptVersion    = '2.8.7'
+$script:ScriptVersion    = '2.8.8'
 $script:ExecutionStart   = Get-Date
 $script:WarningCount     = 0
 $script:ErrorCount       = 0
@@ -1298,12 +1298,22 @@ else {
     Write-Status "Task reconciliation script is missing: $RegisterTasksScript" 'WARN'
 }
 
+# Secure Boot servicing is coordinated by Script 15, independently of update-service success.
+# It enforces Sunday/thawed/pilot/recovery-key/version gates and emits separate telemetry.
+$secureBootCoordinator = Join-Path $PSScriptRoot '15_Sunday_Update_Closeout.ps1'
+if (Test-Path -LiteralPath $secureBootCoordinator -PathType Leaf) {
+    & "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe" -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $secureBootCoordinator -ScriptsRoot $PSScriptRoot -SecureBootOnly | Out-Host
+    $secureBootCode = $LASTEXITCODE
+    if ($secureBootCode -eq 3010) { $script:ExitCode=3010; Write-Status 'Secure Boot coordinator requested a bounded Sunday reboot. See SecureBoot-Maintenance.latest.json.' 'WARN' }
+    elseif ($secureBootCode -ne 0) { Write-Status 'Secure Boot certificate verification/remediation is blocked or incomplete. See SecureBoot-Maintenance.latest.json.' 'WARN' }
+} else { Write-Status 'Secure Boot coordinator (Script 15) is missing.' 'WARN' }
+
 # Final enforcement pass. This runs after any task rebuild so older register scripts
 # cannot leave "Run task as soon as possible after a scheduled start is missed" enabled.
 $script:FinalStatus = if ($script:WarningCount -gt 0) { 'SuccessWithWarnings' } else { 'Success' }
-$script:ExitCode = 0
+if ($script:ExitCode -ne 3010) { $script:ExitCode = 0 }
 Write-Status "Windows Update settings have been restored and critical services are running." 'OK'
-Write-Status "No reboot required. Continuing normally." 'INFO'
+if ($script:ExitCode -ne 3010) { Write-Status "No reboot required. Continuing normally." 'INFO' }
 }
 catch {
     if ($script:ExitCode -eq 0) { $script:ExitCode = 1 }

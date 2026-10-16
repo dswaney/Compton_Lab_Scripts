@@ -1,10 +1,15 @@
-#requires -Version 5.1
+﻿#requires -Version 5.1
 #requires -RunAsAdministrator
 <#
 .SYNOPSIS
-    Creates one authoritative weekly endpoint health snapshot for Elastic.
+    Creates full weekly and read-only periodic endpoint health snapshots for Elastic.
 
 .DESCRIPTION
+    -InventoryOnly refreshes operational health without changing auditing, WinRM,
+    BIOS settings, update services, or software. Static/vendor inventory is reused
+    from a serial-bound full-run cache with its original collection timestamps.
+    New selected Windows errors are emitted as endpoint.system_error events.
+
     Collects hardware, operating system, performance, storage, security,
     networking, update, event-log, service, management-agent, and normalized
     managed-software inventory.
@@ -41,12 +46,17 @@
 
 .NOTES
     ScriptName:    14_Endpoint_Health_Inventory.ps1
-    ScriptVersion: 1.9.1
+    ScriptVersion: 1.10.2
     Audit scope:   Registry Success / service SetValue auditing applies only to SSC* hosts.
                    Requires Administrator/SYSTEM and a thawed system for persistence.
                    Elastic System/Security event collection must be configured separately.
-    LastUpdated:   2026-10-13
-    Changes:       v1.9.0 adds Dell TechDirect warranty collection with a serial-bound,
+    LastUpdated:   2026-10-15
+    Changes:       v1.10.2 uses registry-provider-compatible Path for fixed-key audit ACL operations.
+                   v1.10.1 queries numeric Registry audit policy with the Windows API.
+                   v1.10.0 adds read-only periodic reporting, full-inventory cache,
+                   bounded incremental Windows error telemetry and per-script overlap prevention.
+                   v1.9.1 adds SSC-only update-service registry auditing.
+                   v1.9.0 adds Dell TechDirect warranty collection with a serial-bound,
                    persistent local snapshot. HP and Dell now publish the same normalized
                    warranty fields, while Dell API credentials remain outside logs,
                    snapshots, and telemetry.
@@ -143,6 +153,15 @@
 
 [CmdletBinding()]
 param(
+    [switch]$InventoryOnly,
+
+    [string]$InventoryRefreshCachePath = 'C:\ProgramData\Compton\Inventory\HealthRefreshCache.latest.json',
+
+    [string]$ErrorReportingStatePath = 'C:\ProgramData\Compton\Inventory\SystemErrors.checkpoint.json',
+
+    [ValidateRange(10, 2000)]
+    [int]$MaxErrorEventsPerSource = 500,
+
     [ValidateRange(1, 120)]
     [int]$CpuSampleSeconds = 5,
 
@@ -263,9 +282,22 @@ Set-StrictMode -Version 2.0
 $ErrorActionPreference = 'Stop'
 
 $script:ScriptName       = '14_Endpoint_Health_Inventory.ps1'
-$script:ScriptVersion    = '1.9.1'
+$script:ScriptVersion    = '1.10.2'
 $script:RunId            = [guid]::NewGuid().Guid
 $script:StartTime        = Get-Date
+# One per-script mutex also protects direct/manual runs from overlapping the scheduled run.
+$script:InventoryMutex = New-Object Threading.Mutex($false, 'Global\Compton_EndpointHealthInventory')
+try { $inventoryMutexAcquired = $script:InventoryMutex.WaitOne(0) }
+catch [Threading.AbandonedMutexException] { $inventoryMutexAcquired = $true }
+if (-not $inventoryMutexAcquired) { $script:InventoryMutex.Dispose(); exit 0 }
+if ($InventoryOnly -and -not $PSBoundParameters.ContainsKey('EventLookbackHours')) { $EventLookbackHours = 4 }
+if ($InventoryOnly) { $ShowCollectorProgress = $false }
+$script:InventoryRefreshCache = $null
+$script:InventoryRefreshSections = [ordered]@{}
+$script:PendingSystemErrors = [object[]]@()
+$script:PendingErrorReportingState = $null
+$script:WeeklyOnlyCollectors = @('UpdateServiceRegistryAuditing','RestrictedWinRM','LocalAutopilotHardwareHash',
+    'BIOSSettingsInventory','BIOSUpdateEvidence','VendorWarranty','HardwareInventory','DriverCurrency','BiosCurrency','InstalledSoftware')
 $script:WarningCount     = 0
 $script:ErrorCount       = 0
 $script:Findings         = New-Object System.Collections.Generic.List[object]
@@ -578,6 +610,24 @@ function Invoke-Collector {
         [Parameter(Mandatory)][scriptblock]$ScriptBlock
     )
 
+    if ($InventoryOnly -and $Name -in $script:WeeklyOnlyCollectors) {
+        $cached = Get-ObjectPropertyValueSafe -InputObject $script:InventoryRefreshCache.Sections -Name $Name
+        if ($cached) {
+            foreach ($finding in @($cached.Findings)) {
+                $copy = $finding | ConvertTo-Json -Depth 12 | ConvertFrom-Json
+                $copy | Add-Member -NotePropertyName SourceObservedAt -NotePropertyValue $cached.CollectedUtc -Force
+                $copy | Add-Member -NotePropertyName SourceCollectionMode -NotePropertyValue 'CachedFullInventory' -Force
+                $script:Findings.Add($copy)
+            }
+            $script:CollectorResults.Add([pscustomobject]@{Name=$Name;Status='Cached';StartTime=$cached.CollectedUtc;
+                EndTime=$cached.CollectedUtc;DurationSeconds=0;Error=$null})
+            return $cached.Data
+        }
+        $script:CollectorResults.Add([pscustomobject]@{Name=$Name;Status='NotCollected';StartTime=$null;EndTime=$null;DurationSeconds=0;Error='No successful full inventory data for this collector.'})
+        Add-Finding -Severity Warning -Category Collection -Check $Name -Message ("Full inventory data is unavailable for {0}; it was not rechecked during this reporting run." -f $Name)
+        return $null
+    }
+    $findingStart = $script:Findings.Count
     $started = Get-Date
     Write-CollectorProgress -Level 'INFO' -Message ("Starting collector: {0}" -f $Name)
     try {
@@ -592,6 +642,11 @@ function Invoke-Collector {
             Error           = $null
         }
         $script:CollectorResults.Add($result)
+        if (-not $InventoryOnly -and $Name -in $script:WeeklyOnlyCollectors) {
+            $collectorFindings = @()
+            for ($i = $findingStart; $i -lt $script:Findings.Count; $i++) { $collectorFindings += $script:Findings[$i] }
+            $script:InventoryRefreshSections[$Name] = [ordered]@{Data=$data;Findings=[object[]]$collectorFindings;CollectedUtc=$result.EndTime}
+        }
         Write-CollectorProgress -Level 'SUCCESS' -Message ("Completed collector: {0}; DurationSeconds={1}" -f $Name, $durationSeconds)
         return $data
     } catch {
@@ -2466,6 +2521,7 @@ function Get-WindowsUpdateHealth {
     } | Select-Object HotFixID, Description, InstalledBy, InstalledOn)
 
     $history = @()
+    if (-not $InventoryOnly) {
     try {
         $session = New-Object -ComObject Microsoft.Update.Session
         $searcher = $session.CreateUpdateSearcher()
@@ -2485,6 +2541,8 @@ function Get-WindowsUpdateHealth {
     } catch {
         Write-Log -Level 'WARN' -Message ("Windows Update history could not be collected: {0}" -f $_.Exception.Message)
     }
+
+    } # InventoryOnly does not instantiate Windows Update Agent or activate update services.
 
     $latestDate = if ($latest -and $latest.InstalledOn) { [datetime]$latest.InstalledOn } else { $null }
     $latestUpdateSource = if ($latestDate) { 'Get-HotFix' } else { $null }
@@ -3807,7 +3865,9 @@ function Get-VendorBiosSettingsInventory {
             $output = @(& $bcu "/Get:$export" 2>&1)
             $exitCode = $LASTEXITCODE
             if ($exitCode -ne 0 -or -not (Test-Path -LiteralPath $export -PathType Leaf)) {
-                throw "HP BIOS settings export failed (exit $exitCode): $($output -join ' ')"
+                throw "HP BIOS settings export failed ($script:InventoryMutex.ReleaseMutex()
+$script:InventoryMutex.Dispose()
+exit $exitCode): $($output -join ' ')"
             }
             $result.Settings = New-ObjectArrayForJson -InputObject @(ConvertFrom-HpBcuExport -Lines @(Get-Content -LiteralPath $export -ErrorAction Stop))
         }
@@ -3822,7 +3882,9 @@ function Get-VendorBiosSettingsInventory {
             $output = @(& $cctk ("--outfile={0}" -f $export) 2>&1)
             $exitCode = $LASTEXITCODE
             if ($exitCode -ne 0 -or -not (Test-Path -LiteralPath $export -PathType Leaf)) {
-                throw "Dell BIOS settings export failed (exit $exitCode): $($output -join ' ')"
+                throw "Dell BIOS settings export failed ($script:InventoryMutex.ReleaseMutex()
+$script:InventoryMutex.Dispose()
+exit $exitCode): $($output -join ' ')"
             }
             $result.Settings = New-ObjectArrayForJson -InputObject @(ConvertFrom-DellCctkExport -Lines @(Get-Content -LiteralPath $export -ErrorAction Stop))
         }
@@ -4952,24 +5014,58 @@ function Write-RemediationCandidateTelemetry {
 }
 
 function Get-RegistrySuccessAuditPolicy {
-    # GUID and numeric CSV field avoid localized subcategory/setting names.
-    $guid = '{0CCE921E-69AE-11D9-BED3-505054503030}'
-    $auditpol = Join-Path $env:SystemRoot 'System32\auditpol.exe'
-    $output = @(& $auditpol /get "/subcategory:$guid" /r 2>&1)
-    $nativeExitCode = $LASTEXITCODE
-    if ($nativeExitCode -ne 0) { throw "auditpol query failed ($nativeExitCode): $($output -join ' ')" }
-    $lines = @($output | ForEach-Object { [string]$_ } | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
-    $headers = @('Machine','Target','Subcategory','Guid','Inclusion','Exclusion','SettingValue')
-    $rows = @($lines | Select-Object -Skip 1 | ConvertFrom-Csv -Header $headers)
-    $row = @($rows | Where-Object { $_.Guid -ieq $guid })
-    if ($row.Count -ne 1 -or $row[0].SettingValue -notmatch '^[0-3]$') {
-        throw 'Unable to verify the numeric Registry audit policy.'
-    }
-    return [pscustomobject]@{
-        SettingValue = [int]$row[0].SettingValue
-        SuccessEnabled = (([int]$row[0].SettingValue -band 1) -ne 0)
+    # Read numeric policy directly; auditpol /r has no numeric column on some builds.
+    if (-not ('Compton.Inventory.RegistryAuditPolicyV1' -as [type])) {
+        Add-Type -TypeDefinition @'
+using System;
+using System.ComponentModel;
+using System.Runtime.InteropServices;
+namespace Compton.Inventory {
+    public static class RegistryAuditPolicyV1 {
+        [StructLayout(LayoutKind.Sequential)]
+        private struct AuditPolicyInformation {
+            public Guid Subcategory;
+            public UInt32 Information;
+            public Guid Category;
+        }
+        [DllImport("advapi32.dll", ExactSpelling = true, SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.U1)]
+        private static extern bool AuditQuerySystemPolicy(
+            ref Guid subcategory, UInt32 count, out IntPtr policy);
+        [DllImport("advapi32.dll", ExactSpelling = true)]
+        private static extern void AuditFree(IntPtr buffer);
+        public static UInt32 Read(Guid subcategory) {
+            IntPtr buffer = IntPtr.Zero;
+            try {
+                if (!AuditQuerySystemPolicy(ref subcategory, 1, out buffer)) {
+                    throw new Win32Exception(Marshal.GetLastWin32Error());
+                }
+                if (buffer == IntPtr.Zero) {
+                    throw new InvalidOperationException("Audit policy query returned no buffer.");
+                }
+                AuditPolicyInformation result = (AuditPolicyInformation)
+                    Marshal.PtrToStructure(buffer, typeof(AuditPolicyInformation));
+                if (result.Subcategory != subcategory) {
+                    throw new InvalidOperationException("Audit policy query returned the wrong subcategory.");
+                }
+                return result.Information;
+            }
+            finally {
+                if (buffer != IntPtr.Zero) AuditFree(buffer);
+            }
+        }
     }
 }
+'@ -ErrorAction Stop
+    }
+    $guid = [guid]'{0CCE921E-69AE-11D9-BED3-505054503030}'
+    $setting = [Compton.Inventory.RegistryAuditPolicyV1]::Read($guid)
+    return [pscustomobject]@{
+        SettingValue = [int]$setting
+        SuccessEnabled = (($setting -band 1) -ne 0)
+    }
+}
+
 
 function Test-ServiceRegistryAuditRule {
     param([Parameter(Mandatory)]$Acl)
@@ -5033,7 +5129,7 @@ function Initialize-UpdateServiceRegistryAuditing {
             }
             # Read the existing security descriptor; add only one non-inherited
             # SetValue/Success audit rule. Preserve ownership, DACL and other SACL entries.
-            $acl = Get-Acl -LiteralPath $path -Audit -ErrorAction Stop
+            $acl = Get-Acl -Path $path -Audit -ErrorAction Stop
             $accessSections = [Security.AccessControl.AccessControlSections]::Access -bor [Security.AccessControl.AccessControlSections]::Owner -bor [Security.AccessControl.AccessControlSections]::Group
             $accessBefore = $acl.GetSecurityDescriptorSddlForm($accessSections)
             if (-not (Test-ServiceRegistryAuditRule -Acl $acl)) {
@@ -5044,10 +5140,10 @@ function Initialize-UpdateServiceRegistryAuditing {
                     [Security.AccessControl.PropagationFlags]::None,
                     [Security.AccessControl.AuditFlags]::Success)
                 $acl.AddAuditRule($rule)
-                Set-Acl -LiteralPath $path -AclObject $acl -ErrorAction Stop
+                Set-Acl -Path $path -AclObject $acl -ErrorAction Stop
                 $entry.Changed = $true
             }
-            $verifiedAcl = Get-Acl -LiteralPath $path -Audit -ErrorAction Stop
+            $verifiedAcl = Get-Acl -Path $path -Audit -ErrorAction Stop
             if (-not (Test-ServiceRegistryAuditRule -Acl $verifiedAcl)) { throw 'SetValue Success auditing rule did not verify.' }
             if ($verifiedAcl.GetSecurityDescriptorSddlForm($accessSections) -ne $accessBefore) { throw 'Registry ownership/access permissions changed unexpectedly during auditing setup.' }
             $entry.Start = Get-ItemPropertyValue -LiteralPath $path -Name Start -ErrorAction Stop
@@ -5067,11 +5163,205 @@ function Initialize-UpdateServiceRegistryAuditing {
     return [pscustomobject]$result
 }
 
+function Get-ReportingEventFingerprint {
+    param([Parameter(Mandatory)]$Event)
+    New-StableFingerprint -Namespace 'endpoint.system_error' -Components @(
+        [string]$Event.LogName, [string]$Event.ProviderName, [string]$Event.Id,
+        [string]$Event.RecordId, $Event.TimeCreated.ToUniversalTime().ToString('o')
+    )
+}
+
+function Get-SelectedSystemErrors {
+    # Read existing logs only. Never enable channels, start update services or scan for updates.
+    $queryEnd = (Get-Date).ToUniversalTime()
+    $floor = $queryEnd.AddDays(-7)
+    $initial = $queryEnd.AddHours(-4)
+    $state = $null
+    if (Test-Path -LiteralPath $ErrorReportingStatePath) {
+        try {
+            $candidate = Get-Content -LiteralPath $ErrorReportingStatePath -Raw | ConvertFrom-Json
+            if ($candidate.ComputerName -ieq $env:COMPUTERNAME -and $candidate.SchemaVersion -eq 1) { $state = $candidate }
+        } catch { Write-Log -Level WARN -Message 'Error reporting checkpoint could not be read; using the initial four-hour window.' }
+    }
+    $sources = @(
+        @{ Name='UpdateOperational'; Category='WindowsUpdate'; Filter=@{LogName='Microsoft-Windows-WindowsUpdateClient/Operational'; Level=1,2} },
+        @{ Name='UpdateSystem'; Category='WindowsUpdate'; Filter=@{LogName='System'; ProviderName='Microsoft-Windows-WindowsUpdateClient'; Level=1,2} },
+        @{ Name='Shutdown'; Category='UnexpectedShutdown'; Filter=@{LogName='System'; ProviderName='Microsoft-Windows-Kernel-Power','EventLog','Microsoft-Windows-WER-SystemErrorReporting'; Id=41,6008,1001} },
+        @{ Name='Storage'; Category='Storage'; Filter=@{LogName='System'; ProviderName='disk','Ntfs','Microsoft-Windows-Ntfs','storahci','stornvme','storport','Microsoft-Windows-StorPort','volmgr'; Level=1,2,3} },
+        @{ Name='Services'; Category='ServiceFailure'; Filter=@{LogName='System'; ProviderName='Service Control Manager'; Id=7000,7001,7009,7011,7022,7023,7024,7031,7034} },
+        @{ Name='Applications'; Category='ApplicationCrash'; Filter=@{LogName='Application'; ProviderName='Application Error','Application Hang','Windows Error Reporting'; Id=1000,1001,1002} }
+    )
+    $seen = @{}
+    if ($state) {
+        foreach ($item in @($state.Seen)) {
+            try { if ([datetimeoffset]$item.Time -ge $floor) { $seen[[string]$item.Fingerprint] = [string]$item.Time } } catch {}
+        }
+    }
+    $pendingSources = [ordered]@{}
+    $results = New-Object System.Collections.Generic.List[object]
+    $events = New-Object System.Collections.Generic.List[object]
+    foreach ($source in $sources) {
+        $since = $initial
+        if ($state) {
+            $old = Get-ObjectPropertyValueSafe -InputObject $state.Sources -Name $source.Name
+            if ($old) {
+                try { $since = ([datetimeoffset]$old).UtcDateTime } catch {}
+            }
+        }
+        $gap = $since -lt $floor -or $since -gt $queryEnd
+        if ($since -lt $floor) { $since = $floor }
+        if ($since -gt $queryEnd) { $since = $initial }
+        if ($gap) { Add-Finding -Severity Warning -Category Collection -Check ErrorReportingCoverage -Message ("Error history coverage was limited for {0}; checkpoint was outside the seven-day recovery window or ahead of the clock." -f $source.Name) }
+        $filter = @{}
+        foreach ($key in $source.Filter.Keys) { $filter[$key] = $source.Filter[$key] }
+        $filter.StartTime = $since.AddMinutes(-2)
+        $filter.EndTime = $queryEnd
+        try {
+            # XPath provider predicates work even when an optional storage provider is not registered.
+            $predicates = New-Object System.Collections.Generic.List[string]
+            if ($filter.ContainsKey('ProviderName')) {
+                $names = @($filter.ProviderName | ForEach-Object { "Provider[@Name='$_']" })
+                $predicates.Add('(' + ($names -join ' or ') + ')')
+            }
+            if ($filter.ContainsKey('Id')) {
+                $ids = @($filter.Id | ForEach-Object { "EventID=$_" })
+                $predicates.Add('(' + ($ids -join ' or ') + ')')
+            }
+            if ($filter.ContainsKey('Level')) {
+                $levels = @($filter.Level | ForEach-Object { "Level=$_" })
+                $predicates.Add('(' + ($levels -join ' or ') + ')')
+            }
+            $fromText = $filter.StartTime.ToUniversalTime().ToString('o')
+            $toText = $filter.EndTime.ToUniversalTime().ToString('o')
+            $predicates.Add("TimeCreated[@SystemTime >= '$fromText' and @SystemTime <= '$toText']")
+            $xpath = '*[System[' + ($predicates -join ' and ') + ']]'
+            $selected = @(Get-WinEvent -LogName $filter.LogName -FilterXPath $xpath -Oldest -ErrorAction Stop |
+                Where-Object { -not $seen.ContainsKey((Get-ReportingEventFingerprint -Event $_)) } |
+                Select-Object -First ($MaxErrorEventsPerSource + 1))
+        } catch {
+            if ($_.FullyQualifiedErrorId -match 'NoMatchingEventsFound' -or $_.Exception.Message -match 'No events were found') {
+                $selected = @()
+            } else {
+                # Leave this source's checkpoint unchanged so a later run can retry.
+                $pendingSources[$source.Name] = $since.ToString('o')
+                $results.Add([pscustomobject]@{Name=$source.Name;Status='Unavailable';NewEventCount=0;Truncated=$false;Error=$_.Exception.Message})
+                Add-Finding -Severity Warning -Category Collection -Check ErrorEventChannel -Message ("Could not read {0}: {1}" -f $source.Filter.LogName,$_.Exception.Message)
+                continue
+            }
+        }
+        $truncated = $selected.Count -gt $MaxErrorEventsPerSource
+        $batch = @($selected | Select-Object -First $MaxErrorEventsPerSource)
+        $newCount = 0
+        foreach ($raw in $batch) {
+            $fingerprint = Get-ReportingEventFingerprint -Event $raw
+            $when = $raw.TimeCreated.ToUniversalTime().ToString('o')
+            $seen[$fingerprint] = $when
+            $crash = $null
+            if ($source.Name -eq 'Applications') {
+                # IDs are reused by unrelated providers; use the existing WER classification.
+                if (($raw.Id -eq 1000 -and $raw.ProviderName -ne 'Application Error') -or
+                    ($raw.Id -eq 1002 -and $raw.ProviderName -ne 'Application Hang') -or
+                    ($raw.Id -eq 1001 -and $raw.ProviderName -ne 'Windows Error Reporting')) { continue }
+                $crash = ConvertTo-ApplicationCrashRecord -Event $raw
+                if ($raw.Id -eq 1001 -and -not (Test-ApplicationWerRecord -Record $crash)) { continue }
+            }
+            $message = ''
+            try { $message = [string]$raw.Message } catch {}
+            if ($message.Length -gt 2048) { $message = $message.Substring(0,2048) }
+            $events.Add([pscustomobject][ordered]@{
+                '@timestamp' = $when
+                EventType = 'endpoint.system_error'
+                SchemaVersion = '1.0'
+                ComputerName = $env:COMPUTERNAME
+                ScriptName = $script:ScriptName
+                ScriptVersion = $script:ScriptVersion
+                RunId = $script:RunId
+                Fingerprint = $fingerprint
+                FingerprintVersion = '1'
+                FingerprintAlgorithm = 'SHA256'
+                SystemError = [ordered]@{
+                    Category=$source.Category; Channel=[string]$raw.LogName; Provider=[string]$raw.ProviderName
+                    EventId=[int]$raw.Id; RecordId=[long]$raw.RecordId; Level=[int]$raw.Level
+                    Message=$message; ObservedAt=$queryEnd.ToString('o'); ApplicationCrash=$crash
+                }
+            })
+            $newCount++
+        }
+        $watermark = if ($truncated -and $batch.Count -gt 0) { $batch[-1].TimeCreated.ToUniversalTime() } else { $queryEnd }
+        $pendingSources[$source.Name] = $watermark.ToString('o')
+        $results.Add([pscustomobject]@{Name=$source.Name;Status='Success';NewEventCount=$newCount;Truncated=$truncated;Error=$null})
+        if ($truncated) { Add-Finding -Severity Warning -Category Collection -Check ErrorEventBacklog -Message ("Error reporting for {0} reached the per-run limit of {1}; remaining events will be retried on the next run." -f $source.Name,$MaxErrorEventsPerSource) }
+        if ($newCount -gt 0 -and $source.Category -in @('WindowsUpdate','Storage','ServiceFailure')) {
+            Add-Finding -Severity Warning -Category $source.Category -Check NewSystemErrors -Message ("{0} new {1} error event(s) were recorded since the checkpoint." -f $newCount,$source.Category) -Value $newCount
+        }
+    }
+    $seenRows = @($seen.GetEnumerator() | ForEach-Object { [pscustomobject]@{Fingerprint=$_.Key;Time=$_.Value} } | Sort-Object Time -Descending | Select-Object -First 20000)
+    $script:PendingErrorReportingState = [ordered]@{
+        SchemaVersion=1;ComputerName=$env:COMPUTERNAME;SavedUtc=$queryEnd.ToString('o')
+        Sources=$pendingSources;Seen=[object[]]$seenRows
+    }
+    $script:PendingSystemErrors = [object[]]@($events | ForEach-Object { $_ })
+    [pscustomobject]@{NewEventCount=$events.Count;Sources=[object[]]@($results | ForEach-Object { $_ });MaximumRecoveryDays=7;InitialLookbackHours=4;Deduplication='Local checkpoint; use Fingerprint to collapse frozen-state replay centrally'}
+}
+
+function Publish-SelectedSystemErrors {
+    # At-least-once publishing: checkpoint advances only after every event append succeeds.
+    foreach ($errorEvent in @($script:PendingSystemErrors)) {
+        Write-MaintenanceTelemetryLine -Path $script:NdjsonPath -JsonLine ($errorEvent | ConvertTo-Json -Depth 14 -Compress)
+    }
+    if ($script:PendingErrorReportingState) {
+        Ensure-Directory -Path (Split-Path -Parent $ErrorReportingStatePath)
+        Write-JsonAtomically -Path $ErrorReportingStatePath -Json ($script:PendingErrorReportingState | ConvertTo-Json -Depth 8)
+    }
+}
+
+function Initialize-InventoryRefreshCache {
+    $script:InventoryRefreshCache = $null
+    if (-not $InventoryOnly) { return }
+    if (Test-Path -LiteralPath $InventoryRefreshCachePath) {
+        try {
+            $cache = Get-Content -LiteralPath $InventoryRefreshCachePath -Raw | ConvertFrom-Json
+            $current = Get-CimInstance Win32_BIOS -ErrorAction Stop
+            if ($cache.SchemaVersion -eq 1 -and $cache.ComputerName -ieq $env:COMPUTERNAME -and
+                $cache.SerialNumber -eq ([string]$current.SerialNumber).Trim() -and $cache.Sections) {
+                $script:InventoryRefreshCache = $cache
+            }
+        } catch { Write-Log -Level WARN -Message ("Full inventory cache could not be validated: {0}" -f $_.Exception.Message) }
+    }
+}
+
+function Save-InventoryRefreshCache {
+    param($Identity)
+    if ($InventoryOnly) { return }
+    $cache = [ordered]@{
+        SchemaVersion=1;ComputerName=$env:COMPUTERNAME;SerialNumber=([string]$Identity.SerialNumber).Trim()
+        CollectedUtc=$script:StartTime.ToUniversalTime().ToString('o');Sections=$script:InventoryRefreshSections
+    }
+    Ensure-Directory -Path (Split-Path -Parent $InventoryRefreshCachePath)
+    Write-JsonAtomically -Path $InventoryRefreshCachePath -Json ($cache | ConvertTo-Json -Depth 16)
+}
+
 Ensure-Directory -Path $LogDirectory
 Write-Log -Message ("Starting {0} version {1}. RunId={2}" -f
     $script:ScriptName, $script:ScriptVersion, $script:RunId)
 Write-Log -Message ("Active staged text log: {0}" -f $script:LogPath)
 Write-Log -Message ("Completed text log publish path: {0}" -f $script:PublishedLogPath)
+
+Initialize-InventoryRefreshCache
+$systemErrors = Invoke-Collector -Name 'SelectedSystemErrors' -ScriptBlock { Get-SelectedSystemErrors }
+if ($InventoryOnly -and -not $script:InventoryRefreshCache) {
+    # Keep the previous complete endpoint.health record rather than publishing an empty inventory.
+    Publish-SelectedSystemErrors
+    $notice = [ordered]@{'@timestamp'=(Get-Date).ToUniversalTime().ToString('o');EventType='endpoint.health.refresh';
+        ComputerName=$env:COMPUTERNAME;ScriptName=$script:ScriptName;ScriptVersion=$script:ScriptVersion;
+        RunId=$script:RunId;Status='FullInventoryRequired';SystemErrorReporting=$systemErrors;
+        Message='Run the new full Script 14 during a thawed maintenance period before periodic snapshots can refresh.'}
+    Write-MaintenanceTelemetryLine -Path $script:NdjsonPath -JsonLine ($notice | ConvertTo-Json -Depth 8 -Compress)
+    Write-Log -Level WARN -Message $notice.Message
+    Publish-MaintenanceLog -LogSession $script:LogSession | Out-Null
+    $script:InventoryMutex.ReleaseMutex(); $script:InventoryMutex.Dispose()
+    exit 0
+}
 
 $updateServiceAuditing = Invoke-Collector -Name 'UpdateServiceRegistryAuditing' -ScriptBlock { Initialize-UpdateServiceRegistryAuditing }
 $healthBaseline  = Get-OptionalHealthBaseline
@@ -5175,6 +5465,9 @@ $remediationCandidates = @(
 $event = [ordered]@{
     '@timestamp' = $endTime.ToUniversalTime().ToString('o')
     EventType    = 'endpoint.health'
+    CollectionMode = if ($InventoryOnly) { 'InventoryOnly' } else { 'Full' }
+    FullInventoryCollectedUtc = if ($InventoryOnly) { $script:InventoryRefreshCache.CollectedUtc } else { $script:StartTime.ToUniversalTime().ToString('o') }
+    SystemErrorReporting = $systemErrors
     SchemaVersion= '1.1'
     RunId        = $script:RunId
 
@@ -5317,24 +5610,28 @@ try {
 
     Write-Telemetry -Event $event
 
-    if ($softwareInventory) {
+    if ($softwareInventory -and -not $InventoryOnly) {
         Write-SoftwareInventoryTelemetry -Inventory $softwareInventory -EventTime $endTime -Identity $identity
         Write-Log -Message ("Published {0} endpoint.software event(s) and updated snapshot '{1}'." -f `
             $softwareInventory.Summary.EventCount, $SoftwareInventorySnapshotPath)
     }
 
-    $actionableFindings = @($summary.Findings | Where-Object { $_.Severity -in @('Warning','Critical') })
+    $actionableFindings = @($summary.Findings | Where-Object { $_.Severity -in @('Warning','Critical') -and -not $_.PSObject.Properties['SourceCollectionMode'] })
     for ($findingIndex = 0; $findingIndex -lt $actionableFindings.Count; $findingIndex++) {
         Write-HealthFindingTelemetry -Finding $actionableFindings[$findingIndex] `
             -FindingNumber ($findingIndex + 1) -FindingCount $actionableFindings.Count `
             -EventTime $endTime -Identity $identity -Summary $summary
     }
 
-    for ($candidateIndex = 0; $candidateIndex -lt $remediationCandidates.Count; $candidateIndex++) {
-        Write-RemediationCandidateTelemetry -Candidate $remediationCandidates[$candidateIndex] `
-            -CandidateNumber ($candidateIndex + 1) -CandidateCount $remediationCandidates.Count `
-            -EventTime $endTime -Identity $identity
+    if (-not $InventoryOnly) {
+        for ($candidateIndex = 0; $candidateIndex -lt $remediationCandidates.Count; $candidateIndex++) {
+            Write-RemediationCandidateTelemetry -Candidate $remediationCandidates[$candidateIndex] `
+                -CandidateNumber ($candidateIndex + 1) -CandidateCount $remediationCandidates.Count `
+                -EventTime $endTime -Identity $identity
+        }
     }
+    Publish-SelectedSystemErrors
+    if (-not $InventoryOnly -and $identity) { Save-InventoryRefreshCache -Identity $identity }
 
     Write-Log -Message ("Endpoint snapshot completed. Health={0}; ExitCode={1}; CollectorsFailed={2}; FindingEvents={3}; RemediationCandidateEvents={4}" -f
         $summary.Status, $exitCode, $failedCollectors, $actionableFindings.Count, $remediationCandidates.Count)
@@ -5364,5 +5661,6 @@ if ($null -ne $script:LogSession) {
     }
 }
 
+$script:InventoryMutex.ReleaseMutex()
+$script:InventoryMutex.Dispose()
 exit $exitCode
-

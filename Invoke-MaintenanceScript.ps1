@@ -1,10 +1,13 @@
-#requires -Version 5.1
+﻿#requires -Version 5.1
 #requires -RunAsAdministrator
 # =====================================================================
 # ScriptName:    Invoke-MaintenanceScript.ps1
-# ScriptVersion: 2.2.0
+# ScriptVersion: 2.3.2
 # LastUpdated:   2026-10-15
-# Changes:       v2.2.0 adds fixed closeout actions, a coordinator mutex, and post-lock window checks.
+# Changes:       v2.3.2 aligns runtime version with the fixed-action launcher release.
+#                v2.3.1 separates internal correlation state from the validated input parameter.
+#                v2.3.0 adds a fixed read-only periodic inventory action with its own policy window.
+#                v2.2.0 adds fixed closeout actions, a coordinator mutex, and post-lock window checks.
 #                Weekly repair matches the supplied approval-gated production arguments.
 # Purpose:       Executes only locally allowlisted maintenance actions with
 #                fixed script mappings and fixed arguments.
@@ -45,6 +48,7 @@ param(
         'DisableWindowsUpdateServices',
         'SystemRepairWeekly',
         'EndpointHealthInventory',
+        'EndpointHealthInventoryPeriodic',
         'SyncSystemTime',
         'MicrosoftEdgeUpdateRepair',
         'SundayUpdateCloseoutPass',
@@ -73,7 +77,7 @@ $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 
 $script:ScriptName = 'Invoke-MaintenanceScript.ps1'
-$script:ScriptVersion = '2.2.0'
+$script:ScriptVersion = '2.3.2'
 $script:Root = 'C:\Scripts'
 $script:LogRoot = 'C:\Logs'
 $script:RunId = [guid]::NewGuid().Guid
@@ -86,7 +90,7 @@ $script:LogSession = $null
 $script:WorkingLogPath = $null
 $script:PublishedLogPath = $null
 $script:TargetScriptName = $null
-$script:CorrelationId = $null
+$script:RunCorrelationId = $null
 $script:LegacyInvocation = [bool]($PSCmdlet.ParameterSetName -eq 'Legacy')
 
 $frameworkPath = Join-Path $script:Root 'Maintenance.Framework.psm1'
@@ -94,8 +98,8 @@ $policyPath = Join-Path $script:Root 'Maintenance.Policy.json'
 Import-Module -Name $frameworkPath -Force -DisableNameChecking -ErrorAction Stop
 $policy = Get-MaintenancePolicy -Path $policyPath
 $maintenanceConfig = Initialize-MaintenanceEnvironment -ScriptRoot $script:Root -LogRoot $script:LogRoot
-$script:CorrelationId = Get-MaintenanceCorrelationId -CorrelationId $CorrelationId
-$env:COMPTON_MAINTENANCE_CORRELATION_ID = $script:CorrelationId
+$script:RunCorrelationId = Get-MaintenanceCorrelationId -CorrelationId $CorrelationId
+$env:COMPTON_MAINTENANCE_CORRELATION_ID = $script:RunCorrelationId
 
 # This is the complete execution allowlist. Script names are leaf names only and
 # are resolved beneath C:\Scripts. No caller-controlled paths enter this table.
@@ -154,6 +158,11 @@ $actionCatalog = @{
         ScriptName = '14_Endpoint_Health_Inventory.ps1'
         FixedArguments = [string[]]@()
         Kind = 'ScheduledMaintenance'
+    }
+    EndpointHealthInventoryPeriodic = [pscustomobject]@{
+        ScriptName = '14_Endpoint_Health_Inventory.ps1'
+        FixedArguments = [string[]]@('-InventoryOnly')
+        Kind = 'Reporting'
     }
     SyncSystemTime = [pscustomobject]@{
         ScriptName = '10_Sync_System_Time.ps1'
@@ -246,7 +255,7 @@ function Write-LauncherLog {
         (Get-Date -Format 'yyyy-MM-dd HH:mm:ss.fff'),
         $env:COMPUTERNAME,
         $Level,
-        $script:CorrelationId,
+        $script:RunCorrelationId,
         $ActionId,
         $Message
 
@@ -301,7 +310,7 @@ function Get-ChildArguments {
         }
 
         foreach ($value in @(
-            '-CorrelationId', $script:CorrelationId,
+            '-CorrelationId', $script:RunCorrelationId,
             '-FindingFingerprint', $FindingFingerprint.ToLowerInvariant(),
             '-AttemptNumber', [string]$AttemptNumber
         )) {
@@ -340,10 +349,18 @@ try {
         Write-LauncherLog 'Accepted a legacy scheduled-task invocation after exact allowlist translation; run Register-Tasks_SYSTEM.ps1 to migrate this task to ActionId.' 'WARN'
     }
     Write-MaintenanceEvent -EventId 1000 -Message ("Starting ActionId={0}; Target={1}; RunId={2}; CorrelationId={3}" -f `
-        $ActionId, $script:TargetScriptName, $script:RunId, $script:CorrelationId) | Out-Null
+        $ActionId, $script:TargetScriptName, $script:RunId, $script:RunCorrelationId) | Out-Null
 
     if (-not (Test-Path -LiteralPath $resolvedTarget -PathType Leaf)) {
         throw "Allowlisted target script is missing: $resolvedTarget"
+    }
+
+    if ($ActionId -eq 'EndpointHealthInventoryPeriodic') {
+        $source = Get-Content -LiteralPath $resolvedTarget -Raw -ErrorAction Stop
+        if (-not $source.Contains('[switch]$InventoryOnly')) { throw 'Periodic reporting requires Script 14 v1.10.0 or newer.' }
+        if (-not @($policy.Scripts | Where-Object Name -eq 'EndpointHealthInventory.Periodic').Count) {
+            throw 'Periodic reporting requires its explicit policy entry.'
+        }
     }
 
     if ($ActionId -eq 'SystemRepairWeekly') {
@@ -354,7 +371,8 @@ try {
         }
     }
 
-    $window = Test-MaintenanceWindow -ScriptName $script:TargetScriptName -Policy $policy
+    $windowPolicyName = if ($ActionId -eq 'EndpointHealthInventoryPeriodic') { 'EndpointHealthInventory.Periodic' } else { $script:TargetScriptName }
+    $window = Test-MaintenanceWindow -ScriptName $windowPolicyName -Policy $policy
     if (-not $window.Allowed) {
         $script:Status = 'OutsideMaintenanceWindow'
         $script:ExitCode = 20
@@ -387,7 +405,7 @@ try {
         Write-LauncherLog 'Global maintenance execution lock acquired.' 'INFO'
     }
     # A wait for either mutex must not carry execution past the approved window.
-    $window = Test-MaintenanceWindow -ScriptName $script:TargetScriptName -Policy $policy
+    $window = Test-MaintenanceWindow -ScriptName $windowPolicyName -Policy $policy
     if (-not $window.Allowed) {
         $script:Status = 'OutsideMaintenanceWindow'
         $script:ExitCode = 20
@@ -444,7 +462,7 @@ finally {
         AttemptNumber     = if ($actionCatalog.ContainsKey($ActionId) -and [string]$actionCatalog[$ActionId].Kind -eq 'Remediation') { $AttemptNumber } else { $null }
         LegacyInvocation  = $script:LegacyInvocation
         RunId             = $script:RunId
-        CorrelationId     = $script:CorrelationId
+        CorrelationId     = $script:RunCorrelationId
         Status            = $script:Status
         ExitCode          = $script:ExitCode
         StartTime         = $script:StartTime.ToUniversalTime().ToString('o')
@@ -466,7 +484,7 @@ finally {
         Write-MaintenanceEvent -EventId $eventId -EntryType $eventType `
             -Message ("ActionId={0} completed. Target={1}; Status={2}; ExitCode={3}; RunId={4}; CorrelationId={5}; Failure={6}" -f `
                 $ActionId, $script:TargetScriptName, $script:Status, $script:ExitCode,
-                $script:RunId, $script:CorrelationId, $script:FailureMessage) | Out-Null
+                $script:RunId, $script:RunCorrelationId, $script:FailureMessage) | Out-Null
     }
     catch {}
 

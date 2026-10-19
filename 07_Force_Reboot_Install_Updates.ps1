@@ -1,12 +1,12 @@
 ﻿# =====================================================================
 # ScriptName: 07_Force_Reboot_Install_Updates.ps1
-# ScriptVersion: 2.2.1
+# ScriptVersion: 2.3.0
 # LastUpdated: 2026-10-19
-# ChangeLog: v2.2.1 passes -NoReboot to script 06 so manual repair owns restarts.
-# Previous: v2.2.0 makes -Force a full manual update transaction using scripts
-#            01 (-ManualUpdateRepair) and 06, followed by independent scans,
-#            bounded reboots/startup continuation, and update-service closeout.
-#            ReadyForManualFreeze is true only after successful verification.
+# ChangeLog: v2.3.0 makes -Force one reboot for existing pending work followed by
+#            one verification-only startup check. No update scans/downloads,
+#            installation passes, retry window, or follow-up reboots.
+#            Script 09 closes background update activity before/after reboot.
+#            Ordinary scheduled reboots now require Sunday window and thawed state.
 # Previous: v2.1.3 permits execution and forced reboot only on local Sunday.
 #            Missed weekday runs exit before state/flag changes, regardless of
 #            Deep Freeze state. Shutdown countdown must also finish on Sunday.
@@ -47,7 +47,7 @@ $ErrorActionPreference = 'Stop'
 
 $script:RunStart         = Get-Date
 $script:ScriptName       = '07_Force_Reboot_Install_Updates.ps1'
-$script:ScriptVersion    = '2.2.1'
+$script:ScriptVersion    = '2.3.0'
 $script:RunId            = [guid]::NewGuid().ToString()
 $script:Domain           = if ($env:USERDNSDOMAIN) { $env:USERDNSDOMAIN } else { $env:USERDOMAIN }
 $script:TelemetryPath    = Join-Path $LogDirectory 'Maintenance-Telemetry.ndjson'
@@ -1304,15 +1304,17 @@ function Write-YamlLog {
 function Test-SundayRebootAllowed {
     param([datetime]$Now = (Get-Date), [int]$DelaySeconds = 0)
     if ($Force -or $ManualResume) { return $true }
+    $finish = $Now.AddSeconds($DelaySeconds)
     return ($Now.DayOfWeek -eq [DayOfWeek]::Sunday -and
-        $Now.AddSeconds($DelaySeconds).DayOfWeek -eq [DayOfWeek]::Sunday)
+        $Now.TimeOfDay -ge [timespan]'01:00:00' -and
+        $finish.Date -eq $Now.Date -and $finish.TimeOfDay -lt [timespan]'20:45:00')
 }
 
 function Stop-NonSundayExecution {
     $script:OverallResult = 'DeferredOutsideSunday'
     $script:ExitCode = 0
     $script:RebootIssued = $false
-    Write-Status 'SUNDAY_REBOOT_GUARD: execution deferred. Reboots are permitted only on local Sunday, including the shutdown countdown. Use -Force only for an explicit manual override; normal frozen and thawed runs are both protected.' 'WARN'
+    Write-Status 'SUNDAY_REBOOT_GUARD: execution deferred. Ordinary reboots are permitted only Sunday 01:00-20:45 local time, including the shutdown countdown. Use -Force only for an explicit manual override; normal frozen and thawed runs are both protected.' 'WARN'
     Complete-TextLogPublication -Reason 'Sunday-only execution guard'
     exit 0
 }
@@ -1343,6 +1345,8 @@ function Invoke-ForcedReboot {
     )
 
     if (-not (Test-SundayRebootAllowed -DelaySeconds $RebootDelaySeconds)) { Stop-NonSundayExecution }
+    Assert-RebootTargetThawed
+    if (-not (Test-SundayRebootAllowed -DelaySeconds $RebootDelaySeconds)) { Stop-NonSundayExecution }
     & shutdown.exe @arguments | Out-Null
 
     if ($LASTEXITCODE -ne 0) {
@@ -1353,160 +1357,110 @@ function Invoke-ForcedReboot {
 }
 
 # This task resumes only its own bounded transaction; it never inherits -Force.
+function Assert-RebootTargetThawed {
+    $services = @(Get-CimInstance Win32_Service -ErrorAction Stop | Where-Object { $_.Name -in @('DFServ','DeepFrz') })
+    $drivers = @(Get-CimInstance Win32_SystemDriver -ErrorAction Stop | Where-Object { $_.Name -match '^(DfDiskLo|DeepFrz)' })
+    if ($services.Count -eq 0 -and $drivers.Count -eq 0) { return }
+    $paths = @("$env:WINDIR\System32\DFC.exe", "$env:WINDIR\SysWOW64\DFC.exe", "${env:ProgramFiles(x86)}\Faronics\Deep Freeze\Install C-0\DFC.exe")
+    $exe = $paths | Where-Object { Test-Path -LiteralPath $_ -PathType Leaf } | Select-Object -First 1
+    if (-not $exe) { throw 'Deep Freeze detected but DFC is unavailable; cannot confirm thawed state.' }
+    $process = Start-Process -FilePath $exe -ArgumentList @('get','/ISFROZEN') -PassThru -WindowStyle Hidden
+    try {
+        if (-not $process.WaitForExit(10000)) { try { $process.Kill() } catch {}; throw 'Deep Freeze state query timed out.' }
+        $process.Refresh()
+        if ($process.ExitCode -ne 0) { throw "Deep Freeze is frozen or unknown (DFC=$($process.ExitCode)); reboot refused." }
+    }
+    finally { $process.Dispose() }
+}
+
 function Invoke-ManualUpdateRebootCycle {
     $taskName = 'MIS Script07 Manual Update Verification'
     $manualPath = Join-Path $StateDirectory '07_ManualUpdateRepair.json'
     $reportPath = Join-Path $LogDirectory '07_ManualUpdateRepair.latest.json'
-    $report = [ordered]@{ ComputerName=$env:COMPUTERNAME; ScriptVersion=$script:ScriptVersion; Timestamp=(Get-Date).ToString('o'); Status='Running'; ReadyForManualFreeze=$false; RemainingUpdates=$null; PendingReboot=$null; RebootReasons=@(); RebootsRequested=0; UpdatePasses=0; FailureMessage=$null }
-    $report | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $reportPath -Encoding UTF8
     $manual = $null
-    function Save-ManualTransaction {
-        $temporary = $manualPath + '.tmp'
-        $manual | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $temporary -Encoding UTF8 -ErrorAction Stop
-        Move-Item -LiteralPath $temporary -Destination $manualPath -Force -ErrorAction Stop
+    $report = [ordered]@{
+        ComputerName=$env:COMPUTERNAME; ScriptVersion=$script:ScriptVersion
+        Timestamp=(Get-Date).ToString('o'); Status='Running'; ReadyForManualFreeze=$false
+        PendingReboot=$null; RebootReasons=@(); WindowsUpdateRebootRequired=$null
+        RebootsRequested=0; UpdatePasses=0; DownloadsRequested=$false
+        RebootVerified=$false; FailureMessage=$null
     }
-    function Invoke-RepairChild {
-        param([string]$Name,[string]$ExtraArguments='')
-        $childPath = Join-Path $PSScriptRoot $Name
-        if (-not (Test-Path -LiteralPath $childPath -PathType Leaf)) { throw "Required repair script missing: $childPath" }
-        if ((Get-Date) -ge [datetime]$manual.Deadline) { throw 'Manual update repair deadline reached.' }
-        $childArguments = '-NoProfile -NonInteractive -ExecutionPolicy Bypass -File "{0}" {1}' -f $childPath,$ExtraArguments
-        $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
-        $stdout = Join-Path $LogDirectory ("07-Manual-$Name-$stamp.stdout.log")
-        $stderr = Join-Path $LogDirectory ("07-Manual-$Name-$stamp.stderr.log")
-        Write-Status "Manual repair: running $Name. Child output: $stdout" 'INFO'
-        $child = Start-Process -FilePath "$env:WINDIR\System32\WindowsPowerShell\v1.0\powershell.exe" -ArgumentList $childArguments -PassThru -WindowStyle Hidden -RedirectStandardOutput $stdout -RedirectStandardError $stderr
+    $report | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $reportPath -Encoding UTF8
+    function Close-ManualBackgroundUpdates {
+        # Close background downloads/restarts, without scanning/installing new updates.
+        $closeout = Join-Path $PSScriptRoot '09_Disable_Windows_Update_Services.ps1'
+        if (-not (Test-Path -LiteralPath $closeout -PathType Leaf)) { throw "Missing closeout script: $closeout" }
+        $argsText = '-NoProfile -NonInteractive -ExecutionPolicy Bypass -File "{0}"' -f $closeout
+        $child = Start-Process -FilePath "$env:WINDIR\System32\WindowsPowerShell\v1.0\powershell.exe" -ArgumentList $argsText -PassThru -WindowStyle Hidden
         try {
-            $limit = [math]::Min(2700,([datetime]$manual.Deadline - (Get-Date)).TotalSeconds)
-            if ($limit -le 0 -or -not $child.WaitForExit([int]($limit * 1000))) {
-                try { $child.Kill() } catch {}
-                throw "$Name exceeded the repair time limit. Update work may still be active; inspect child logs before continuing."
-            }
+            if (-not $child.WaitForExit(180000)) { try { $child.Kill() } catch {}; throw 'Background update closeout exceeded three minutes; no additional reboot will be requested.' }
             $child.Refresh()
-            $childCode = $child.ExitCode
-            if ($childCode -notin @(0,3010)) { throw "$Name failed with exit code $childCode. See $stdout and $stderr." }
-            return $childCode
+            if ($child.ExitCode -ne 0) { throw "Script 09 closeout failed with exit code $($child.ExitCode); inspect its logs." }
         }
         finally { $child.Dispose() }
-    }
-    function Get-ManualRemainingUpdates {
-        # Script 06 installs from Microsoft Update; verify against the same source.
-        $session = New-Object -ComObject Microsoft.Update.Session
-        $searcher = $session.CreateUpdateSearcher()
-        $searcher.ServerSelection = 3
-        $searcher.ServiceID = '7971f918-a847-4430-9279-4a52d1efe18d'
-        $scan = $searcher.Search('IsInstalled=0 and IsHidden=0')
-        if ([int]$scan.ResultCode -ne 2) { throw "Independent Microsoft Update scan did not succeed: ResultCode=$($scan.ResultCode)." }
-        Write-Status "Independent Microsoft Update scan: $($scan.Updates.Count) update(s) remain." 'INFO'
-        return [int]$scan.Updates.Count
+        $wrong = @(Get-CimInstance Win32_Service -ErrorAction Stop | Where-Object { $_.Name -in @('wuauserv','BITS','UsoSvc') -and ($_.StartMode -ne 'Disabled' -or $_.State -ne 'Stopped') })
+        if ($wrong.Count -gt 0) { throw 'Core background update services are not stopped and disabled; closeout could not be verified.' }
+        $rebootTask = Get-ScheduledTask -TaskPath '\Microsoft\Windows\UpdateOrchestrator\' -TaskName 'Reboot' -ErrorAction SilentlyContinue
+        if ($null -ne $rebootTask -and $rebootTask.State -ne 'Disabled') { throw 'Update Orchestrator Reboot task remains enabled; closeout could not be verified.' }
     }
     try {
+        if ($Force -and $ManualResume) { throw 'Use -Force to start repair; -ManualResume is internal verification only.' }
         $boot = (Get-CimInstance Win32_OperatingSystem -ErrorAction Stop).LastBootUpTime.ToString('o')
-        if ($Force -and $ManualResume) { throw 'Use -Force or -ManualResume, not both.' }
+        Assert-RebootTargetThawed
         if ($ManualResume) {
-            if (-not (Test-Path -LiteralPath $manualPath)) {
-                Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue
-                $report.Status='NoActiveTransaction'
-                return
-            }
-            $manual = Get-Content -LiteralPath $manualPath -Raw | ConvertFrom-Json
-            if ([int]$manual.SchemaVersion -ne 2) { throw 'An older manual repair transaction exists; restart repair with this version after inspecting its logs.' }
-            if ((Get-Date) -gt [datetime]$manual.Deadline) { throw 'Manual repair expired after six hours; inspect updates before continuing.' }
-            if ($manual.LastBoot -eq $boot) { throw 'No newer boot verified; refusing to advance the repair transaction.' }
-            $script:RebootVerified = $true
+            # Unregister FIRST: this continuation can never queue another reboot.
+            Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue
+            if (-not (Test-Path -LiteralPath $manualPath)) { $report.Status='NoActiveTransaction'; return }
+            $manual = Get-Content -LiteralPath $manualPath -Raw -ErrorAction Stop | ConvertFrom-Json
+            if ([int]$manual.SchemaVersion -ne 3) { throw 'Older multi-pass transaction cancelled. Start the new one-reboot repair explicitly with -Force.' }
+            if ([datetime]$boot -le [datetime]$manual.LastBoot) { throw 'A newer Windows boot was not verified. No additional reboot requested.' }
+            $report.RebootsRequested=1
+            $script:RebootVerified=$true
+            $report.RebootVerified=$true
+            Write-Status 'The one requested reboot occurred. Waiting two minutes, then verifying locally; no downloads, installations, or further reboots will be requested.' 'INFO'
             Start-Sleep -Seconds 120
-        }
-        else {
-            if (Test-Path -LiteralPath $manualPath) { throw 'A repair transaction already exists; allow its startup continuation to finish.' }
-            $manual = [pscustomobject]@{ SchemaVersion=2; Deadline=(Get-Date).AddHours(6).ToString('o'); Reboots=0; UpdatePasses=0; LastBoot=$boot }
-        }
-        # Same DFC query and thawed exit-code contract used by Script 15.
-        $dfServices = @(Get-CimInstance Win32_Service -ErrorAction Stop | Where-Object { $_.Name -in @('DFServ','DeepFrz') })
-        $dfDrivers = @(Get-CimInstance Win32_SystemDriver -ErrorAction Stop | Where-Object { $_.Name -match '^(DfDiskLo|DeepFrz)' })
-        if ($dfServices.Count -or $dfDrivers.Count) {
-            $dfPaths = @("$env:WINDIR\System32\DFC.exe", "$env:WINDIR\SysWOW64\DFC.exe", "${env:ProgramFiles(x86)}\Faronics\Deep Freeze\Install C-0\DFC.exe")
-            $dfExe = $dfPaths | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
-            if (-not $dfExe) { throw 'Deep Freeze detected but DFC query is unavailable. Manual repair requires confirmed thawed state.' }
-            $dfProcess = Start-Process -FilePath $dfExe -ArgumentList @('get','/ISFROZEN') -PassThru -WindowStyle Hidden
-            try {
-                if (-not $dfProcess.WaitForExit(10000)) { try { $dfProcess.Kill() } catch {}; throw 'DFC query timed out.' }
-                $dfProcess.Refresh()
-                if ($dfProcess.ExitCode -ne 0) { throw 'Computer is frozen or its thawed state is unknown. Stop and thaw before repair.' }
+            Assert-RebootTargetThawed
+            Close-ManualBackgroundUpdates
+            $flags = @(Get-PendingRebootFlags)
+            $wuPending = [bool](New-Object -ComObject Microsoft.Update.SystemInfo).RebootRequired
+            $report.WindowsUpdateRebootRequired=$wuPending
+            $report.PendingReboot=($flags.Count -gt 0 -or $wuPending)
+            $report.RebootReasons=@($flags | Select-Object -Property @('Name','Details'))
+            if ($report.PendingReboot) {
+                throw 'Pending reboot indicators remain after the single reboot. No additional reboot or update pass will run. Review RebootReasons; completion could not be verified.'
             }
-            finally { $dfProcess.Dispose() }
+            $report.Status='ReadyForManualFreeze'
+            $report.ReadyForManualFreeze=$true
+            $script:OverallResult='ManualRepairReadyForManualFreeze'
+            Write-Status 'Single reboot verified: no tracked pending-reboot flags or Windows Update reboot requirement remain. Background update closeout completed. You may manually freeze the computer.' 'OK'
+            return
         }
-        if ((Get-Date) -ge [datetime]$manual.Deadline) { throw 'Repair deadline reached.' }
-        Ensure-Folder -Path $StateDirectory
-        # Validate the companion before any service changes or updater bootstrap.
-        $enablePath = Join-Path $PSScriptRoot '01_Enable_Windows_Update_Services.ps1'
-        $enableText = Get-Content -LiteralPath $enablePath -Raw -ErrorAction Stop
-        if ($enableText -notmatch 'param\(\[switch\]\$ManualUpdateRepair\)') { throw 'Install the supplied Script 01 v2.8.9 with -ManualUpdateRepair support first.' }
-        if (-not (Test-Path -LiteralPath (Join-Path $PSScriptRoot '06_Weekend_Windows_Updates.ps1'))) { throw 'Script 06 is missing.' }
-        Save-ManualTransaction
-        $arguments = '-NoProfile -NonInteractive -ExecutionPolicy Bypass -File "{0}" -ManualResume -LogDirectory "{1}" -StateDirectory "{2}" -RebootDelaySeconds {3}' -f $PSCommandPath,$LogDirectory,$StateDirectory,$RebootDelaySeconds
+
+        # An explicit new -Force replaces/cancels the old multi-pass transaction.
+        Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue
+        Remove-Item -LiteralPath $manualPath -Force -ErrorAction SilentlyContinue
+        Reset-State
+        if (Test-Path -LiteralPath $script:StateFilePath) { throw 'Old scheduled reboot-cycle state could not be removed.' }
+        Close-ManualBackgroundUpdates
+        $flags = @(Get-PendingRebootFlags)
+        $wuPending = [bool](New-Object -ComObject Microsoft.Update.SystemInfo).RebootRequired
+        $report.WindowsUpdateRebootRequired=$wuPending
+        $report.PendingReboot=($flags.Count -gt 0 -or $wuPending)
+        $report.RebootReasons=@($flags | Select-Object -Property @('Name','Details'))
+        $manual = [pscustomobject]@{ SchemaVersion=3; LastBoot=$boot; Started=(Get-Date).ToString('o'); RebootsRequested=1 }
+        $manual | ConvertTo-Json | Set-Content -LiteralPath $manualPath -Encoding UTF8 -ErrorAction Stop
+        $arguments = '-NoProfile -NonInteractive -ExecutionPolicy Bypass -File "{0}" -ManualResume -LogDirectory "{1}" -StateDirectory "{2}"' -f $PSCommandPath,$LogDirectory,$StateDirectory
         $action = New-ScheduledTaskAction -Execute "$env:WINDIR\System32\WindowsPowerShell\v1.0\powershell.exe" -Argument $arguments
         $trigger = New-ScheduledTaskTrigger -AtStartup
         $principal = New-ScheduledTaskPrincipal -UserId 'SYSTEM' -LogonType ServiceAccount -RunLevel Highest
-        $settings = New-ScheduledTaskSettingsSet -ExecutionTimeLimit (New-TimeSpan -Hours 2) -MultipleInstances IgnoreNew
+        $settings = New-ScheduledTaskSettingsSet -ExecutionTimeLimit (New-TimeSpan -Minutes 10) -MultipleInstances IgnoreNew
         Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $trigger -Principal $principal -Settings $settings -Force -ErrorAction Stop | Out-Null
-        Reset-State
-        if (Test-Path -LiteralPath $script:StateFilePath) { throw 'Unable to reset old Sunday reboot state.' }
-        [void](Invoke-RepairChild -Name '01_Enable_Windows_Update_Services.ps1' -ExtraArguments '-ManualUpdateRepair')
-        $flags = @(Get-PendingRebootFlags)
-        $wuPending = [bool](New-Object -ComObject Microsoft.Update.SystemInfo).RebootRequired
-        if ($flags.Count -eq 0 -and -not $wuPending) {
-            if ([int]$manual.UpdatePasses -ge 6) { throw 'Six update passes exhausted; inspect remaining updates.' }
-            $manual.UpdatePasses = [int]$manual.UpdatePasses + 1
-            Save-ManualTransaction
-            $updateCode = Invoke-RepairChild -Name '06_Weekend_Windows_Updates.ps1' -ExtraArguments '-OperationTimeoutSeconds 1800 -NoReboot'
-            $flags = @(Get-PendingRebootFlags)
-            $wuPending = [bool](New-Object -ComObject Microsoft.Update.SystemInfo).RebootRequired
-            $report.RemainingUpdates = Get-ManualRemainingUpdates
-            if ($updateCode -eq 3010) { $wuPending = $true }
-            if ($flags.Count -eq 0 -and -not $wuPending -and $report.RemainingUpdates -eq 0 -and [int]$manual.Reboots -gt 0) {
-                Start-Sleep -Seconds 30
-                if ((Get-ManualRemainingUpdates) -ne 0) { throw 'Updates appeared on final verification; run repair again after reviewing the scan.' }
-                if (@(Get-Process -Name @('TiWorker','TrustedInstaller','MoUsoCoreWorker') -ErrorAction SilentlyContinue).Count -gt 0) {
-                    throw 'Servicing processes are still present after the final scan; do not freeze yet. Allow servicing to settle and rerun repair.'
-                }
-                # Close the core update services as Script 15 does, without changing Deep Freeze.
-                foreach ($serviceName in @('wuauserv','BITS','UsoSvc','DoSvc','uhssvc')) {
-                    $service = Get-Service -Name $serviceName -ErrorAction SilentlyContinue
-                    if ($null -eq $service) { continue }
-                    Set-Service -Name $serviceName -StartupType Disabled -ErrorAction Stop
-                    if ($service.Status -ne 'Stopped') { Stop-Service -Name $serviceName -Force -ErrorAction Stop }
-                }
-                Start-Sleep -Seconds 15
-                $wrong = @(Get-CimInstance Win32_Service | Where-Object { $_.Name -in @('wuauserv','BITS','UsoSvc','DoSvc','uhssvc') -and ($_.StartMode -ne 'Disabled' -or $_.State -ne 'Stopped') })
-                if ($wrong.Count) { throw 'Core update-service closeout did not remain enforced.' }
-                $flags = @(Get-PendingRebootFlags)
-                $wuPending = [bool](New-Object -ComObject Microsoft.Update.SystemInfo).RebootRequired
-                if ($flags.Count -or $wuPending) { throw 'Reboot requirement reappeared during closeout; computer is not ready for freeze.' }
-                Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction Stop
-                Remove-Item -LiteralPath $manualPath -Force -ErrorAction Stop
-                $report.Status='ReadyForManualFreeze'
-                $report.ReadyForManualFreeze=$true
-                $report.PendingReboot=$false
-                $script:OverallResult='ManualRepairReadyForManualFreeze'
-                Write-Status 'Repair verified: no offered Microsoft Update updates and no detected pending reboot. Core update services closed. You may manually freeze this computer.' 'OK'
-                return
-            }
-        }
-        $report.PendingReboot = ($flags.Count -gt 0 -or $wuPending)
-        $report.RebootReasons = @($flags | Select-Object -Property @('Name','Details'))
-        if ([int]$manual.Reboots -ge 6) { throw 'Six reboot limit reached; inspect remaining update/reboot reasons. Computer is not ready for freeze.' }
-        if ((Get-Date).AddSeconds($RebootDelaySeconds + 5) -ge [datetime]$manual.Deadline) { throw 'Manual repair deadline reached; no further reboot requested.' }
-        $manual.Reboots = [int]$manual.Reboots + 1
-        $manual.LastBoot = $boot
-        Save-ManualTransaction
         $report.Status='RebootRequested'
-        $script:OverallResult='ManualRepairRebootRequested'
-        Write-Status "Manual repair reboot $($manual.Reboots)/6; keep the computer thawed. Updates will be scanned and installed again after startup." 'WARN'
-        # Publish the report before shutdown; finally publishes it again on exit.
-        $report.RebootsRequested=[int]$manual.Reboots
-        $report.UpdatePasses=[int]$manual.UpdatePasses
+        $report.RebootsRequested=1
+        $script:OverallResult='ManualRepairSingleRebootRequested'
         $report | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $reportPath -Encoding UTF8
-        Invoke-ForcedReboot -Reason 'Manual update repair: apply pending updates and continue after startup.'
+        Write-Status 'Manual repair: requesting exactly one reboot for existing pending work. Startup continuation only verifies and closes background updates; it cannot reboot or install anything.' 'WARN'
+        Invoke-ForcedReboot -Reason 'Manual one-reboot repair: finish existing pending updates; verify once after startup.'
     }
     catch {
         $report.Status='NeedsAttention'
@@ -1514,15 +1468,14 @@ function Invoke-ManualUpdateRebootCycle {
         $script:OverallResult='ManualRepairNeedsAttention'
         $script:FailureMessage=$_.Exception.Message
         $script:ExitCode=2
-        Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue
-        Remove-Item -LiteralPath $manualPath -Force -ErrorAction SilentlyContinue
         Write-Status $script:FailureMessage 'ERROR'
     }
     finally {
-        if ($manual) { $report.RebootsRequested=[int]$manual.Reboots; $report.UpdatePasses=[int]$manual.UpdatePasses }
+        if ($report.Status -ne 'RebootRequested') {
+            Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue
+            Remove-Item -LiteralPath $manualPath -Force -ErrorAction SilentlyContinue
+        }
         $report.Timestamp=(Get-Date).ToString('o')
-        $report.RebootReasons=@($script:CurrentFlags | Select-Object -Property @('Name','Details'))
-        if (@($script:CurrentFlags).Count -gt 0) { $report.PendingReboot=$true }
         $report | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $reportPath -Encoding UTF8
         Write-YamlLog
     }
@@ -1567,6 +1520,14 @@ try {
     if ($Force -or $ManualResume) {
         Invoke-ManualUpdateRebootCycle
         exit $script:ExitCode
+    }
+
+    try { Assert-RebootTargetThawed }
+    catch {
+        $script:OverallResult='DeferredFrozenOrUnknown'
+        Write-Status $_.Exception.Message 'WARN'
+        Write-YamlLog
+        exit 0
     }
 
     Write-Status "Starting reboot flag evaluation..." 'INFO'

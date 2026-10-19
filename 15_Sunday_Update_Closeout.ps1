@@ -1,12 +1,12 @@
 ﻿#requires -Version 5.1
 #requires -RunAsAdministrator
-# ScriptVersion: 1.1.3
+# ScriptVersion: 1.1.4
 # LastUpdated: 2026-10-19
 [CmdletBinding()]
 param([string]$ScriptsRoot='C:\Scripts',[switch]$VerifyOnly,[string]$LogDirectory='C:\Logs',[switch]$SecureBootOnly,[switch]$SecureBootAuditOnly,[switch]$SecureBootStartup)
 $ErrorActionPreference='Stop'
 New-Item -Path $LogDirectory -ItemType Directory -Force|Out-Null
-$start=Get-Date;$result=[ordered]@{ComputerName=$env:COMPUTERNAME;ScriptVersion='1.1.3';StartTime=$start.ToString('o');Status='Running';ReadyToFreeze=$false;RemainingUpdates=$null;RebootRequired=$null;FailureMessage=$null;FreezeScheduleControlled=$false}
+$start=Get-Date;$result=[ordered]@{ComputerName=$env:COMPUTERNAME;ScriptVersion='1.1.4';StartTime=$start.ToString('o');Status='Running';ReadyToFreeze=$false;RemainingUpdates=$null;RebootRequired=$null;FailureMessage=$null;FreezeScheduleControlled=$false}
 $log=Join-Path $LogDirectory ($env:COMPUTERNAME+'-15_Sunday_Update_Closeout-'+$start.ToString('yyyyMMdd-HHmmss')+'.log')
 function Log([string]$Text){$line=(Get-Date -Format s)+' '+$Text;$line|Add-Content -LiteralPath $log -Encoding UTF8;Write-Host $line}
 function Test-Window {
@@ -145,7 +145,7 @@ function Request-SecureBootReboot($State,$Policy,[string]$StatePath) {
  return 'RebootRequested'
 }
 function Invoke-SecureBootMaintenance {
- $report=[ordered]@{EventType='maintenance.secure_boot';ComputerName=$env:COMPUTERNAME;ScriptName='15_Sunday_Update_Closeout.ps1';ScriptVersion='1.1.3';'@timestamp'=(Get-Date).ToUniversalTime().ToString('o');Status='Checking';Ready=$false;Message=$null;Snapshot=$null;BitLockerProtection=$null;DeepFreezeVersion=$null;Phase=$null;RebootsRequested=0;FreezeScheduleControlled=$false}
+ $report=[ordered]@{EventType='maintenance.secure_boot';ComputerName=$env:COMPUTERNAME;ScriptName='15_Sunday_Update_Closeout.ps1';ScriptVersion='1.1.4';'@timestamp'=(Get-Date).ToUniversalTime().ToString('o');Status='Checking';Ready=$false;Message=$null;Snapshot=$null;BitLockerProtection=$null;DeepFreezeVersion=$null;Phase=$null;RebootsRequested=0;FreezeScheduleControlled=$false}
  $state=$null;$statePath=$null;$held=$false;$mutex=$null
  try{
   if(![Environment]::Is64BitProcess -and [Environment]::Is64BitOperatingSystem){throw 'Run the coordinator in native 64-bit Windows PowerShell.'}
@@ -299,7 +299,7 @@ try{
  # Early passes install; the final pass performs an independent scan and closeout.
  if(!$VerifyOnly){
   $enable=Run-Script '01_Enable_Windows_Update_Services.ps1';if($enable -eq 3010){$result.Status='RebootStillRequired';throw 'Startup maintenance requested a reboot; update installation deferred.'};if($enable -ne 0){throw 'Unable to open update services.'}
-  $update=Run-Script '06_Weekend_Windows_Updates.ps1' @('-NoReboot');if($update -notin @(0,3010)){throw 'Windows update pass did not complete successfully; review 06 telemetry.'}
+  $update=Run-Script '06_Weekend_Windows_Updates.ps1';if($update -notin @(0,3010)){throw 'Windows update pass did not complete successfully; review 06 telemetry.'};if($update -eq 3010){$result.RebootRequired=$true;$result.Status='RebootStillRequired';throw 'Script 06 completed its pass and reports a reboot requirement/request. Closeout stops here; no duplicate Script 07 reboot is requested.'}
  }
  Test-Window
  $secureBootResult = Invoke-SecureBootMaintenance

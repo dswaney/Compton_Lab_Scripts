@@ -94,7 +94,7 @@ The updater persists the last working source roots so a self-update does not rev
 
 ### `01_Enable_Windows_Update_Services.ps1`
 
-Normal operation prepares the endpoint for the maintenance window by synchronizing Script 00 first, restoring required Windows Update services and registry startup modes, enabling required update tasks, removing conflicting policy values, and retrying service startup. It records before/after service and policy state, reconciles the master schedule, and can force a controlled reboot if critical services remain unavailable. `-ManualUpdateRepair`, used by Script 07, skips package bootstrap, task reconciliation, and Secure Boot coordination and returns service-recovery failures without scheduling its own reboot.
+Normal operation prepares the endpoint for the maintenance window by synchronizing Script 00 first, restoring required Windows Update services and registry startup modes, enabling required update tasks, removing conflicting policy values, and retrying service startup. It records before/after service and policy state, reconciles the master schedule, and can force a controlled reboot if critical services remain unavailable. `-ManualUpdateRepair` remains available for service-only maintenance and skips package bootstrap, task reconciliation, and Secure Boot coordination and returns service-recovery failures without scheduling its own reboot.
 
 ### `02_Remove_User_Profiles.ps1`
 
@@ -138,13 +138,13 @@ Additional platform controls include:
 
 ### `06_Weekend_Windows_Updates.ps1`
 
-Ensures NuGet/PSWindowsUpdate prerequisites, optionally resets Windows Update components, captures Windows build/update/reboot state, installs available Microsoft updates with an operation timeout, and compares available updates before and after the run. The script is scheduled twice. A direct scheduled pass now automatically requests a required restart during Sunday 01:00–20:45 local time after publishing its results and confirming that Deep Freeze is thawed (or absent). The default countdown is 60 seconds and must finish before 20:45. Outside that window, it reports the reboot requirement without restarting unless `-AllowReboot` is supplied. `-NoReboot` suppresses its restart; Scripts 07 and 15 pass this switch when they own reboot coordination. Script 06 performs one update pass and does not automatically resume itself after startup.
+Ensures NuGet/PSWindowsUpdate prerequisites, optionally resets Windows Update components, captures Windows build/update/reboot state, installs available Microsoft updates with an operation timeout, and compares available updates before and after the run. The script is scheduled twice. A direct scheduled pass now automatically requests a required restart during Sunday 01:00–20:45 local time after publishing its results and confirming that Deep Freeze is thawed (or absent). The default countdown is 60 seconds and must finish before 20:45. Outside that window, it reports the reboot requirement without restarting unless `-AllowReboot` is supplied. `-NoReboot` suppresses its restart; Script 15 now calls Script 06 normally, allowing its required reboot immediately after installation; Script 15 stops that pass on the reported reboot requirement instead of requesting a second reboot from Script 07. Script 06 performs one update pass and does not automatically resume itself after startup.
 
 ### `07_Force_Reboot_Install_Updates.ps1`
 
-Uses a durable state file and single-instance lock to prevent repeated or unverified reboot consumption. Normal runs remain Sunday-only and require proof of a newer boot before advancing through up to three reboots. `-WindowsServicingOnly` limits detection to Windows servicing and refuses flag deletion. The ordinary Sunday/startup path does not itself enforce Script 15's thawed-state check or 20:45 cutoff, and the ordinary state file does not persist the servicing-only switch across startup; these remain separate limitations.
+Normal scheduled operation finishes existing pending work through the ordinary verified reboot cycle; it never downloads or installs newly offered updates. Runs require Sunday 01:00–20:45 local time and a confirmed thawed state when Deep Freeze is detected. The shutdown countdown must finish before 20:45. A clean computer is not rebooted by the ordinary path. Its ordinary state machine still permits up to three verified reboots during maintenance, and `-WindowsServicingOnly` is not persisted in its ordinary state file across `-StartupResume` calls.
 
-`-Force` starts a different, explicit manual repair transaction on any day. It verifies the thawed state, invokes Script 01 with `-ManualUpdateRepair`, completes existing pending reboots, invokes Script 06 with `-NoReboot`, and independently scans Microsoft Update. A temporary SYSTEM startup task continues the transaction after reboots, with a six-hour deadline and limits of six requested reboots and six installation passes. It does not delete servicing/reboot flags. A clean result requires a verified reboot, two successful empty update scans, no tracked reboot requirement, no detected servicing processes at the final check, and successful core update-service closeout. It then removes its temporary task and reports `ReadyForManualFreeze=true`; it does not freeze the computer. Failed checks report `NeedsAttention` and stop the continuation. A failed run can leave update services open, so keep the computer thawed and inspect the report before returning it to class.
+`-Force` is the attended, one-reboot repair for an already-thawed classroom computer. It closes background update activity using Script 09, requests **exactly one reboot** for already-pending work, then runs a temporary SYSTEM startup task that only verifies the result after a two-minute settling wait and reapplies background closeout. It does not invoke Scripts 01/06, scan for offered updates, download updates, install new packages, retry for six hours, or request a second reboot. The verification task removes itself. `ReadyForManualFreeze=true` means the newer boot was verified, the tracked reboot indicators and local Windows Update reboot requirement are absent, and closeout succeeded. If indicators remain, it reports `NeedsAttention` and stops; it does not hide a failed update by deleting its flags. The computer remains under the technician's freeze control.
 
 ### `08_System_Repair.ps1`
 
@@ -341,7 +341,7 @@ The coordinator emits `maintenance.secure_boot` to the existing NDJSON feed and 
 
 Normal closeout mode calls Scripts 01/06, independently scans updates, and requests servicing-only reboots through Script 07. `-VerifyOnly` skips initial enable/install but can still request servicing reboots. Final service closeout runs independently of certificate readiness, then verifies service state and certificate readiness before reporting `ReadyToFreeze=true`. Ordinary closeout operations must start on Sunday before 20:45, with a successful DFC Thawed query when Deep Freeze is detected. A queued Secure Boot reboot defers subsequent installation work in that pass.
 
-Neither this script nor a failed readiness check can hold the computer thawed or override the external Deep Freeze schedule. Arrange a thawed pilot through completion and monitor failures. Existing Script 07 startup-resume cutoff/thaw and direct-child/global-lock limitations remain follow-up work; the Secure Boot coordinator's own guards do not change Script 07.
+Neither this script nor a failed readiness check can hold the computer thawed or override the external Deep Freeze schedule. Arrange a thawed pilot through completion and monitor failures. Script 07 now independently enforces thawed state and the ordinary Sunday cutoff. Direct-child/global-lock limitations and ordinary servicing-only state persistence remain follow-up work.
 
 ### `16_Check_Deep_Freeze_Status.ps1`
 
@@ -357,7 +357,7 @@ These tables cover the declared top-level switches on active numbered scripts an
 
 ### Update and reboot commands
 
-Run these examples in elevated 64-bit Windows PowerShell. Deploy Scripts 01/06/07/15 together with the framework; Script 07's manual repair requires the updated Script 01 and Script 06.
+Run these examples in elevated 64-bit Windows PowerShell. Deploy Scripts 06/07/15 together with the framework. Script 07 manual repair uses Script 09 for background update closeout; it does not run the update installer.
 
 ```powershell
 # Ordinary maintenance: required reboots are automatic within Sunday's window.
@@ -367,28 +367,28 @@ C:\Scripts\06_Weekend_Windows_Updates.ps1
 # Enable update services first; this command does not resume after reboot.
 C:\Scripts\06_Weekend_Windows_Updates.ps1 -AllowReboot
 
-# Install/report only; let a coordinator or technician handle the restart.
+# Optional install/report-only run; suppress this pass's restart.
 C:\Scripts\06_Weekend_Windows_Updates.ps1 -NoReboot
 
-# Full manual repair on an already-thawed computer, including startup continuation.
+# One reboot for already-pending work, then verification only after startup.
 C:\Scripts\07_Force_Reboot_Install_Updates.ps1 -Force
 
 # Inspect the repair result before manually freezing.
 Get-Content C:\Logs\07_ManualUpdateRepair.latest.json -Raw |
     ConvertFrom-Json |
-    Select-Object Status, ReadyForManualFreeze, RemainingUpdates, PendingReboot, FailureMessage
+    Select-Object Status, ReadyForManualFreeze, PendingReboot, RebootsRequested, FailureMessage
 ```
 
-Keep the computer thawed through every repair reboot and verification. `ReadyForManualFreeze=true` records the successful checks at that time; it does not control the external freeze schedule or guarantee that future updates will never be offered. `NeedsAttention` is not a clean result. Forced restart commands close running applications and can discard unsaved work.
+Keep the computer thawed through the single manual repair reboot and verification. `ReadyForManualFreeze=true` records the successful checks at that time; it does not control the external freeze schedule or guarantee that future updates will never be offered. `NeedsAttention` is not a clean result. Forced restart commands close running applications and can discard unsaved work.
 
 | Script | Switch | Default / effect |
 |---|---|---|
-| 01 | `-ManualUpdateRepair` | Off. Opens/restores update services using the existing logic but skips Script 00 bootstrap, task reconciliation, and Script 15 Secure Boot coordination. Service-recovery failure returns an error instead of independently rebooting. Intended for Script 07. |
+| 01 | `-ManualUpdateRepair` | Off. Opens/restores update services using the existing logic but skips Script 00 bootstrap, task reconciliation, and Script 15 Secure Boot coordination. Service-recovery failure returns an error instead of independently rebooting. Retained for service-only manual workflows; Script 07's one-reboot mode no longer invokes Script 01. |
 | 06 | `-AllowReboot` | Off. Explicitly allows a required restart on any day/time, including outside Sunday maintenance; still requires thawed state when Deep Freeze is detected. Does not force a restart when no reboot requirement is detected. |
-| 06 | `-NoReboot` | Off. Suppresses Script 06's restart even during maintenance. Scripts 07 and 15 supply it to avoid competing restart requests. Cannot be combined with `-AllowReboot`. |
+| 06 | `-NoReboot` | Off. Suppresses Script 06's restart even during maintenance for an explicit operator-controlled install-only pass. Script 15 no longer supplies it; Script 07 no longer calls Script 06. Cannot be combined with `-AllowReboot`. |
 | 06 | `-ResetWUComponentsFirst` | Off. Resets Windows Update components before installation using the script's existing reset routine; use for a diagnosed update-client issue, not as a routine completion step. |
-| 07 | `-Force` | Off. Starts a manual thawed update repair on any day, with Script 01/06 installation passes, reboot/startup continuation, independent verification, and core service closeout. Does not delete flags and does not automatically freeze. Cannot be combined with the ordinary mode switches below. |
-| 07 | `-ManualResume` | Internal temporary startup-task switch. Continues only an existing manual transaction after a newer boot, checking its deadline and thawed state; do not use as the operator entry point. Cannot be combined with `-Force` or ordinary modes. |
+| 07 | `-Force` | Off. On any day, closes background updates with Script 09 and requests exactly one reboot for existing pending work. Startup continuation verifies once without scans, downloads, installation passes, or additional reboots. Does not delete flags or automatically freeze. Cannot be combined with the ordinary mode switches below. |
+| 07 | `-ManualResume` | Internal temporary startup-task switch. Verifies an existing one-reboot transaction after a newer boot and a fixed settling wait, then removes itself. Never requests another reboot; do not use as the operator entry point. Cannot be combined with `-Force` or ordinary modes. |
 | 07 | `-StartupResume` | Ordinary scheduled startup continuation. Exits without action if there is no active ordinary reboot cycle; remains Sunday-only. |
 | 07 | `-MaintenanceCloseout` | Selects the ordinary maintenance-closeout invocation mode/telemetry; evaluates flags through the existing staged reboot workflow, remaining Sunday-only. It does not install updates itself. |
 | 07 | `-FinalVerification` | Selects final-verification invocation mode; a clean initial evaluation reports `FinalVerificationClean`. It can still request a reboot when flags require one within the ordinary workflow. Not a read-only guarantee. |
@@ -406,7 +406,7 @@ Keep the computer thawed through every repair reboot and verification. `ReadyFor
 | 06 | `-RebootDelaySeconds` | `60`; range 30–3600. Countdown after the pass. Automatic Sunday reboots must finish before 20:45 local time. |
 | 06 | `-OperationTimeoutSeconds` | `1800`. Timeout passed to the update installation operation. |
 | 06 | `-LogFolder` | System-drive `Logs` directory, normally `C:\Logs`. |
-| 07 | `-RebootDelaySeconds` | `30`; range 0–86400. Countdown for requested reboots; manual repair also enforces its six-hour deadline. |
+| 07 | `-RebootDelaySeconds` | `30`; range 0–86400. Countdown for requested reboots. Manual repair requests one reboot only; there is no multi-hour retry window. |
 | 07 | `-StartupSettlingSeconds` | `120`; range 0–900. Wait for the ordinary `-StartupResume` path. Manual continuation uses its own fixed 120-second settling wait. |
 | 07 | `-AbandonedCycleMinutes` | `10`; range 1–1440. Age threshold for recovering abandoned ordinary non-startup cycles. |
 | 07 | `-LogDirectory` | `C:\Logs`. Includes `07_ManualUpdateRepair.latest.json` for manual repair. |
@@ -556,7 +556,7 @@ Policy v1.1.0 removes retired Scripts 04/11/12/13 entries, explicitly covers act
 
 `SystemRepairWeekly` uses `-AutoRepairOnDetection -AllowComponentStoreEscalation`, matching the supplied production task. Copilot removal remains an explicit manual fallback and is owned by Script 04 in recurring maintenance. The supplied unrestricted legacy launcher was not substituted for the fixed-action launcher, because it does not accept `-ActionId` and would break existing repository-registered tasks.
 
-Script 07 ordinary scheduled/startup mode blocks weekday reboots but does not itself enforce Script 15's 20:45 cutoff or Deep Freeze Thawed state. Its explicit `-Force` manual repair mode is separate and verifies thawed state on each continuation. Startup-resume protection for those conditions and preservation of servicing-only mode across reboot continuation remain separate follow-up work. Script 15 serializes its own invocations through the launcher, but its direct child operations do not participate in the ordinary global maintenance mutex. Confirm the external thaw/freeze window and pilot the complete schedule on Windows; registering tasks does not start them.
+Script 07 ordinary scheduled/startup mode now requires Sunday 01:00–20:45 local time, including countdown completion, and verifies Deep Freeze is thawed. Its explicit `-Force` manual repair runs on any day but requests only one reboot followed by verification. Preservation of servicing-only mode across the ordinary state machine remains follow-up work. Script 15 serializes its own invocations through the launcher, but its direct child operations do not participate in the ordinary global maintenance mutex. Confirm the external thaw/freeze window and pilot the complete schedule on Windows; registering tasks does not start them.
 
 ## Deployment workflow
 
@@ -674,3 +674,13 @@ The following files are retained under [`Retired`](./Retired) for history only. 
 - Copilot module v1.2.3 replaces the failing bulk uninstall-registry read with targeted value reads. The user confirmed this fix on the affected endpoint; it does not broaden removal targets.
 - Deployment manifest and checksum metadata are regenerated for the repository bytes. Do not copy stale metadata alongside the new scripts.
 - Validation: PowerShell grammar parsing of the changed files, diff/caller review, README switch-coverage checks, JSON, and SHA-256 verification. Native Windows PowerShell 5.1 parsing and live update/reboot/DFC/Task Scheduler validation remain pending. Previous release validation records do not establish live validation of this release.
+
+## October 19, 2026 classroom pending-update completion correction (package 3.0.22)
+
+This supersedes the earlier package 3.0.21 manual repair behavior.
+
+- Script 07 v2.3.0 `-Force` now requests one reboot for existing pending work and performs one verification-only startup pass. It never calls Scripts 01/06, scans for updates, downloads new updates, or repeats reboots. Script 09 closes background update activity before and after the reboot. Old multi-pass manual transactions are cancelled rather than continued.
+- Script 07's ordinary scheduled path remains automatic when pending flags exist and now enforces thawed state and the Sunday 01:00–20:45 cutoff. No manual switches are required for scheduled completion.
+- Script 06 v2.1.13 retains automatic required restarts after scheduled installation. Script 15 v1.1.4 removes its `-NoReboot` override and stops the closeout pass when Script 06 reports the reboot requirement/request, preventing a duplicate Script 07 request.
+- Task registration and Sunday trigger times are unchanged. An update that still needs a reboot after the single attended repair is reported as unresolved; readiness is not fabricated by deleting servicing state.
+- Validation: grammar parsing, local workflow invariants and caller/diff review, README switch coverage, manifest/checksum integrity. Live Windows servicing, DFC, and SYSTEM startup verification still require an endpoint test.

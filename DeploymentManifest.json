@@ -1,8 +1,8 @@
 {
   "SchemaVersion": 1,
-  "ManifestVersion": "3.0.21",
-  "PackageVersion": "3.0.21",
-  "GeneratedUtc": "2026-10-19T17:31:28.870029Z",
+  "ManifestVersion": "3.0.22",
+  "PackageVersion": "3.0.22",
+  "GeneratedUtc": "2026-10-19T18:31:03.107489Z",
   "Files": [
     {
       "Name": "00_Update-Scripts-FromShare.ps1",
@@ -43,14 +43,14 @@
     {
       "Name": "06_Weekend_Windows_Updates.ps1",
       "Role": "ManagedFile",
-      "Version": "2.1.12",
-      "SHA256": "438D864E000E0C095DFF7ED3168B968537B46E540F41ADFE11552C52BC0AE70C"
+      "Version": "2.1.13",
+      "SHA256": "B836FC6445B1B358E6877F9ADB218913169BA5AB53004C8DB09D6B7FD55C0561"
     },
     {
       "Name": "07_Force_Reboot_Install_Updates.ps1",
       "Role": "ManagedFile",
-      "Version": "2.2.1",
-      "SHA256": "328E5D590BBEDD0D4FBA18554CE3205A3BAC99AD9C348EB836F5FDF5E4CFBB24"
+      "Version": "2.3.0",
+      "SHA256": "011A00696C576D2856C00676CC16CD8E1887BF742472FFAB24C405B1D72270A2"
     },
     {
       "Name": "08_System_Repair.ps1",
@@ -79,8 +79,8 @@
     {
       "Name": "15_Sunday_Update_Closeout.ps1",
       "Role": "MaintenanceScript",
-      "Version": "1.1.3",
-      "SHA256": "718580769748EBDBF7F37B635BCF3C92402BB181AF58964A8BE5785815EAF2F6"
+      "Version": "1.1.4",
+      "SHA256": "A7EF5E384EF582671E3C1CED13462A180255FF719B8C1CF337D6011FE8ED1C38"
     },
     {
       "Name": "16_Check_Deep_Freeze_Status.ps1",

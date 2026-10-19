@@ -1,8 +1,10 @@
 ﻿# =====================================================================
 # ScriptName: 06_Weekend_Windows_Updates.ps1
-# ScriptVersion: 2.1.12
+# ScriptVersion: 2.1.13
 # LastUpdated: 2026-10-19
-# Changes: v2.1.12 automatically reboots when required during Sunday 01:00-20:45
+# Changes: v2.1.13 clarifies direct automatic restart ownership after installation.
+#          Script 15 no longer suppresses this restart.
+#          v2.1.12 automatically reboots when required during Sunday 01:00-20:45
 #          local maintenance; -NoReboot lets coordinators retain reboot control.
 #          v2.1.11 adds explicit -AllowReboot on any day, with thawed-state
 #          checks, native exit-code validation, and telemetry before restart.
@@ -40,7 +42,7 @@ $ErrorActionPreference = 'Stop'
 if ($AllowReboot -and $NoReboot) { throw '-AllowReboot and -NoReboot cannot be combined.' }
 
 $script:ScriptName       = '06_Weekend_Windows_Updates.ps1'
-$script:ScriptVersion    = '2.1.12'
+$script:ScriptVersion    = '2.1.13'
 $script:RunId            = [guid]::NewGuid().Guid
 $script:RunStart         = Get-Date
 $script:ComputerName     = $env:COMPUTERNAME

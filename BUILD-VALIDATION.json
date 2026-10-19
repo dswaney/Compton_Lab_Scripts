@@ -1,27 +1,53 @@
 {
-  "PackageVersion": "3.0.20",
-  "BaseCommit": "a0d39170d887512c6cf976f47b1b0207c566d513",
-  "PowerShellParserExecuted": true,
-  "PowerShellParserVersion": "7.5.3 (Linux)",
+  "PackageVersion": "3.0.21",
+  "BaseCommit": "6e930c472de62a29abc8258f603fc1a370c01db7",
+  "PowerShellParserExecuted": false,
+  "PowerShellParserVersion": null,
   "RequiresWindowsPowerShellValidation": true,
+  "GrammarParser": "tree-sitter-powershell (syntax tree only; does not execute PowerShell)",
   "StructuralChecks": [
-    "All active root PowerShell files parsed without execution",
-    "Manifest SHA256 values recomputed against all 23 repository managed files",
-    "Updater helper approval and both closeout verification actions preserved",
-    "Fixed periodic action, six Mon-Sat triggers and explicit policy entry present",
-    "Both uploaded Script 02 files identical; hr-ib2130 exclusion preserved; runtime version aligned",
-    "Secure Boot remediation lists remain empty; no automatic decryption enabled"
+    "Five changed PowerShell files pass tree-sitter grammar parsing",
+    "README covers every declared top-level switch on active numbered scripts",
+    "Script06 requires thawed state and Sunday01:00-20:45 countdown completion for automatic reboots; explicit AllowReboot overrides time only",
+    "Scripts07 and15 pass NoReboot to06; manual repair registers startup continuation before invoking children",
+    "Manifest file hashes recomputed; SHA256SUMS covers tracked files except itself",
+    "Git diff reviewed; no registrar, policy, or schedule mutations"
   ],
   "FunctionalTests": {
-    "SecureBootOfflineTestsPassed": 23,
-    "WindowsAuditUserEvidence": "SSC-216-007 SYSTEM audit: AlreadyUpdated; firmware verified; BitLocker On; event observed in Elastic"
+    "LiveWindowsUpdateRebootExecuted": false,
+    "CopilotUserConfirmed": "User confirmed module1.2.3 resolved uninstall registry cast failure on affected endpoint"
   },
   "PendingReconciliation": [
-    "Windows PowerShell 5.1 parsing on final repository bytes",
-    "Attended certificate remediation/reboot/resume/frozen-boot pilot",
-    "External freeze schedule is not controlled by readiness",
-    "Script 07 startup continuation thaw/cutoff and servicing-mode persistence",
-    "Direct coordinator children versus ordinary maintenance global locking",
-    "Pending telemetry events require explicit forwarding if shared append remains locked"
-  ]
+    "Native Windows PowerShell5.1 parsing of final package",
+    "Attended Sunday and weekday repair pilot including DFC, SYSTEM task resume, scan failures and update-service closeout",
+    "External freeze schedule remains independent of readiness",
+    "Ordinary Script07 startup mode still does not persist servicing-only mode or enforce thaw/cutoff checks"
+  ],
+  "PreviousReleaseValidation": {
+    "PackageVersion": "3.0.20",
+    "BaseCommit": "a0d39170d887512c6cf976f47b1b0207c566d513",
+    "PowerShellParserExecuted": true,
+    "PowerShellParserVersion": "7.5.3 (Linux)",
+    "RequiresWindowsPowerShellValidation": true,
+    "StructuralChecks": [
+      "All active root PowerShell files parsed without execution",
+      "Manifest SHA256 values recomputed against all 23 repository managed files",
+      "Updater helper approval and both closeout verification actions preserved",
+      "Fixed periodic action, six Mon-Sat triggers and explicit policy entry present",
+      "Both uploaded Script 02 files identical; hr-ib2130 exclusion preserved; runtime version aligned",
+      "Secure Boot remediation lists remain empty; no automatic decryption enabled"
+    ],
+    "FunctionalTests": {
+      "SecureBootOfflineTestsPassed": 23,
+      "WindowsAuditUserEvidence": "SSC-216-007 SYSTEM audit: AlreadyUpdated; firmware verified; BitLocker On; event observed in Elastic"
+    },
+    "PendingReconciliation": [
+      "Windows PowerShell 5.1 parsing on final repository bytes",
+      "Attended certificate remediation/reboot/resume/frozen-boot pilot",
+      "External freeze schedule is not controlled by readiness",
+      "Script 07 startup continuation thaw/cutoff and servicing-mode persistence",
+      "Direct coordinator children versus ordinary maintenance global locking",
+      "Pending telemetry events require explicit forwarding if shared append remains locked"
+    ]
+  }
 }

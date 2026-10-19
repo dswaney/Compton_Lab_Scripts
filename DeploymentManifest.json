@@ -1,8 +1,8 @@
 {
   "SchemaVersion": 1,
-  "ManifestVersion": "3.0.20",
-  "PackageVersion": "3.0.20",
-  "GeneratedUtc": "2026-10-16T17:40:00Z",
+  "ManifestVersion": "3.0.21",
+  "PackageVersion": "3.0.21",
+  "GeneratedUtc": "2026-10-19T17:31:28.870029Z",
   "Files": [
     {
       "Name": "00_Update-Scripts-FromShare.ps1",
@@ -13,8 +13,8 @@
     {
       "Name": "01_Enable_Windows_Update_Services.ps1",
       "Role": "ManagedFile",
-      "Version": "2.8.8",
-      "SHA256": "9C7EB2053513C0579E9A43F90086182C88F1C0A1AA6F88D8327188737AF62340"
+      "Version": "2.8.9",
+      "SHA256": "B05D5A7B03BD5CBADFD7052FE9FCB794EE6D9E399D54E8FBF8ADD1C6911C05C6"
     },
     {
       "Name": "02_Remove_User_Profiles.ps1",
@@ -43,14 +43,14 @@
     {
       "Name": "06_Weekend_Windows_Updates.ps1",
       "Role": "ManagedFile",
-      "Version": "2.1.10",
-      "SHA256": "513CC29B1C967786F5028B7423BE2D6A8C6CE6747B82742D9194EDCAD1FDDCAE"
+      "Version": "2.1.12",
+      "SHA256": "438D864E000E0C095DFF7ED3168B968537B46E540F41ADFE11552C52BC0AE70C"
     },
     {
       "Name": "07_Force_Reboot_Install_Updates.ps1",
       "Role": "ManagedFile",
-      "Version": "2.1.3",
-      "SHA256": "4326596DF653CD5A7D4C717AA4B03F2A13941A32257EC37950EA1802E5C292CD"
+      "Version": "2.2.1",
+      "SHA256": "328E5D590BBEDD0D4FBA18554CE3205A3BAC99AD9C348EB836F5FDF5E4CFBB24"
     },
     {
       "Name": "08_System_Repair.ps1",
@@ -79,8 +79,8 @@
     {
       "Name": "15_Sunday_Update_Closeout.ps1",
       "Role": "MaintenanceScript",
-      "Version": "1.1.2",
-      "SHA256": "CA2917A5E79CA3E57F89EE73D7661812C92996F8DED054F2018B6E88EE43E04A"
+      "Version": "1.1.3",
+      "SHA256": "718580769748EBDBF7F37B635BCF3C92402BB181AF58964A8BE5785815EAF2F6"
     },
     {
       "Name": "16_Check_Deep_Freeze_Status.ps1",
@@ -103,8 +103,8 @@
     {
       "Name": "Maintenance.Copilot.psm1",
       "Role": "Framework",
-      "Version": "1.2.1",
-      "SHA256": "0731E2E56553A297160500CDFC078BE903C85CC5063CA4F3C7B2F87751DD812B"
+      "Version": "1.2.3",
+      "SHA256": "4351D25DBE5FE1B650FAF7D4EDE1364481A8F331AAE86D152EDE670CF4A8A2FA"
     },
     {
       "Name": "Maintenance.Framework.psm1",

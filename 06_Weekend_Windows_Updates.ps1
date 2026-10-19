@@ -1,8 +1,13 @@
 ﻿# =====================================================================
 # ScriptName: 06_Weekend_Windows_Updates.ps1
-# ScriptVersion: 2.1.10
-# LastUpdated: 2026-08-18
-# Changes: v2.1.10 suppresses unusable COM-backed Category values so telemetry
+# ScriptVersion: 2.1.12
+# LastUpdated: 2026-10-19
+# Changes: v2.1.12 automatically reboots when required during Sunday 01:00-20:45
+#          local maintenance; -NoReboot lets coordinators retain reboot control.
+#          v2.1.11 adds explicit -AllowReboot on any day, with thawed-state
+#          checks, native exit-code validation, and telemetry before restart.
+#          -AllowReboot explicitly permits a manual reboot outside the window.
+#          v2.1.10 suppresses unusable COM-backed Category values so telemetry
 #           records a real category when available, otherwise null.
 #           v2.1.9 normalizes PSWindowsUpdate COM-backed KB/category properties and
 #           derives the pre-update count from unique install candidates when the
@@ -13,20 +18,29 @@
 # Purpose: Installs Microsoft/Windows updates using PSWindowsUpdate,
 #          records detailed YAML and Elastic-compatible JSON telemetry,
 #          validates update compliance before and after installation,
-#          and records when a reboot is required without initiating one.
+#          and optionally reboots after the completed update pass.
+# Usage:   .\06_Weekend_Windows_Updates.ps1 -AllowReboot
+#          Default: automatic required restart Sunday 01:00-20:45 local time.
+#          -AllowReboot permits a manual restart on any day. -NoReboot suppresses it.
+#          This script performs one update pass; it does not resume itself.
+#          Keep Deep Freeze thawed through installation and restart.
 # =====================================================================
 
 [CmdletBinding()]
 param(
     [switch]$ResetWUComponentsFirst = $false,
+    [switch]$AllowReboot,
+    [switch]$NoReboot,
+    [ValidateRange(30,3600)][int]$RebootDelaySeconds = 60,
     [int]$OperationTimeoutSeconds = 1800,
     [string]$LogFolder = "$env:SystemDrive\Logs"
 )
 
 $ErrorActionPreference = 'Stop'
+if ($AllowReboot -and $NoReboot) { throw '-AllowReboot and -NoReboot cannot be combined.' }
 
 $script:ScriptName       = '06_Weekend_Windows_Updates.ps1'
-$script:ScriptVersion    = '2.1.10'
+$script:ScriptVersion    = '2.1.12'
 $script:RunId            = [guid]::NewGuid().Guid
 $script:RunStart         = Get-Date
 $script:ComputerName     = $env:COMPUTERNAME
@@ -46,6 +60,9 @@ $script:OverallResult    = 'Initializing'
 $script:ExitCode         = 0
 $script:FailureMessage   = $null
 $script:RebootInitiated  = $false
+$script:RebootRequested = $false
+$script:ShutdownExitCode = $null
+$requestReboot = $false
 $script:RebootBefore     = $null
 $script:RebootAfter      = $null
 $script:ModuleVersion    = $null
@@ -1002,6 +1019,12 @@ function Write-Telemetry {
             PendingRebootAfter = $script:RebootAfter.Required
             PendingRebootReasonsAfter = $script:RebootAfter.Reasons
             RebootInitiated = $script:RebootInitiated
+            AllowReboot = [bool]$AllowReboot
+            NoReboot = [bool]$NoReboot
+            AutomaticRebootWindow = 'Sunday 01:00-20:45 local time'
+            RebootRequested = $script:RebootRequested
+            RebootDelaySeconds = $RebootDelaySeconds
+            ShutdownExitCode = $script:ShutdownExitCode
             TextLogPath = $script:PublishedLogPath
             UpdateResults = (ConvertTo-NormalArray -InputObject $script:UpdateEntries)
             AvailableUpdatesBefore = (ConvertTo-NormalArray -InputObject $script:UpdatesBefore)
@@ -1050,6 +1073,33 @@ function Complete-Run {
     }
 }
 
+function Test-UpdateRebootAllowed {
+    param([datetime]$Now = (Get-Date))
+    if ($NoReboot) { return $false }
+    if ($AllowReboot) { return $true }
+    $finish = $Now.AddSeconds($RebootDelaySeconds)
+    return ($Now.DayOfWeek -eq [DayOfWeek]::Sunday -and
+        $Now.TimeOfDay -ge [timespan]'01:00:00' -and
+        $finish.Date -eq $Now.Date -and
+        $finish.TimeOfDay -lt [timespan]'20:45:00')
+}
+
+function Assert-UpdateRebootThawed {
+    $services = @(Get-CimInstance Win32_Service -ErrorAction Stop | Where-Object { $_.Name -in @('DFServ','DeepFrz') })
+    $drivers = @(Get-CimInstance Win32_SystemDriver -ErrorAction Stop | Where-Object { $_.Name -match '^(DfDiskLo|DeepFrz)' })
+    if ($services.Count -eq 0 -and $drivers.Count -eq 0) { return }
+    $paths = @("$env:WINDIR\System32\DFC.exe", "$env:WINDIR\SysWOW64\DFC.exe", "${env:ProgramFiles(x86)}\Faronics\Deep Freeze\Install C-0\DFC.exe")
+    $exe = $paths | Where-Object { Test-Path -LiteralPath $_ -PathType Leaf } | Select-Object -First 1
+    if (-not $exe) { throw 'Deep Freeze detected but DFC is unavailable; thawed state cannot be verified.' }
+    $process = Start-Process -FilePath $exe -ArgumentList @('get','/ISFROZEN') -PassThru -WindowStyle Hidden
+    try {
+        if (-not $process.WaitForExit(10000)) { try { $process.Kill() } catch {}; throw 'Deep Freeze state query timed out.' }
+        $process.Refresh()
+        if ($process.ExitCode -ne 0) { throw "Deep Freeze is frozen or unknown (DFC=$($process.ExitCode)); automatic update reboot refused." }
+    }
+    finally { $process.Dispose() }
+}
+
 # Main
 Initialize-Logging
 
@@ -1065,6 +1115,7 @@ try {
     Write-Log "Active staged text log path: $($script:RuntimeLogPath)" 'INFO'
     Write-Log "Completed text log publish path: $($script:PublishedLogPath)" 'INFO'
 
+    if (Test-UpdateRebootAllowed) { Assert-UpdateRebootThawed }
     Ensure-PSWindowsUpdate
 
     $script:BuildBefore = Get-WindowsBuildSnapshot
@@ -1131,11 +1182,18 @@ try {
     }
 
     if ($script:RebootAfter.Required) {
-        Write-Log 'Windows reports that a reboot is required. This script will not initiate the reboot; the dedicated reboot maintenance script will handle it.' 'INFO'
+        if (Test-UpdateRebootAllowed) {
+            Assert-UpdateRebootThawed
+            $requestReboot = $true
+            $script:RebootRequested = $true
+            Write-Log "Update pass complete. A restart will be requested in $RebootDelaySeconds seconds after publishing this run's logs. Keep the computer thawed." 'WARNING'
+        }
+        else {
+            Write-Log 'Windows reports that a reboot is required. Restart deferred by -NoReboot or the Sunday maintenance window; a coordinator may handle it. For manual out-of-window repair, use -AllowReboot.' 'INFO'
+        }
     }
 
     Complete-Run -Status $status -Code $code
-    exit $code
 }
 catch {
     $script:FailureMessage = $_.Exception.Message
@@ -1148,3 +1206,40 @@ catch {
     Complete-Run -Status 'Failed' -Code 2
     exit 2
 }
+
+# The completed text log has been published; do not append to it again.
+if ($requestReboot) {
+    try {
+        Assert-UpdateRebootThawed
+        if (-not (Test-UpdateRebootAllowed)) {
+            $script:RebootRequested = $false
+            $script:OverallResult = 'RebootDeferredOutsideMaintenance'
+            if ($code -eq 0) { $code = 3010 }
+            $script:ExitCode = $code
+            Write-YamlLog
+            Write-Telemetry
+            Write-Warning 'Maintenance reboot cutoff reached while publishing results; restart deferred.'
+            exit $code
+        }
+        & "$env:WINDIR\System32\shutdown.exe" /r /f /t $RebootDelaySeconds /c 'Windows Update installation completed; restart to finish applying pending updates.' | Out-Null
+        $script:ShutdownExitCode = $LASTEXITCODE
+        if ($script:ShutdownExitCode -ne 0) { throw "shutdown.exe returned exit code $($script:ShutdownExitCode)." }
+        $script:RebootInitiated = $true
+        if ($code -eq 0) { $code = 3010 }
+        $script:ExitCode = $code
+        Write-YamlLog
+        Write-Telemetry
+        Write-Host "Restart scheduled in $RebootDelaySeconds seconds. Keep the computer thawed until updates finish."
+    }
+    catch {
+        $script:FailureMessage = $_.Exception.Message
+        $script:OverallResult = 'RebootRequestFailed'
+        $script:ExitCode = 2
+        $script:ErrorCount++
+        Write-YamlLog
+        Write-Telemetry
+        Write-Warning "Update pass finished, but the restart was not scheduled: $($_.Exception.Message)"
+        exit 2
+    }
+}
+exit $code

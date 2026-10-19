@@ -1,6 +1,6 @@
 ﻿#requires -version 5.1
-# ModuleVersion: 1.2.2
-# LastUpdated: 2026-10-06
+# ModuleVersion: 1.2.3
+# LastUpdated: 2026-10-19
 <#
 .SYNOPSIS
     Shared Microsoft Copilot removal and disablement for Compton College endpoints.
@@ -10,6 +10,8 @@
     Copilot packages, stops Copilot processes, disables Copilot tasks, applies
     machine and user policies, cleans shortcuts, and verifies the result.
 .NOTES
+    v1.2.3 reads only required uninstall values, avoiding registry-provider casts
+    of unrelated values while retaining strict Microsoft Copilot matching.
     v1.2.2 reports exclusively staged Appx remnants separately from installed
     user registrations, avoiding repeated removal and false verification failures.
     v1.2.1 safely reads optional uninstall-registry properties under StrictMode
@@ -30,7 +32,7 @@
 
 Set-StrictMode -Version 2.0
 
-$script:CopilotModuleVersion = '1.2.2'
+$script:CopilotModuleVersion = '1.2.3'
 
 function Get-CopilotPropertyValue {
     param(
@@ -132,18 +134,39 @@ function Get-CopilotDesktopRegistrations {
     param()
 
     $uninstallRoots = @(
-        'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*',
-        'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*'
+        'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall',
+        'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall'
     )
 
-    return @(Get-ItemProperty -Path $uninstallRoots -ErrorAction SilentlyContinue |
-        Where-Object {
-            $displayName = [string](Get-CopilotPropertyValue -InputObject $_ -Name 'DisplayName')
-            $publisher = [string](Get-CopilotPropertyValue -InputObject $_ -Name 'Publisher')
-            ($displayName -match '^(?i:Microsoft Copilot|Copilot)$') -and
-            ($publisher -match '^(?i:Microsoft Corporation|Microsoft)$')
-        } |
-        Sort-Object PSPath -Unique)
+    # Get-ItemProperty reads every value, including unrelated malformed values.
+    # RegistryKey.GetValue reads only the fields needed for identification and uninstall.
+    $registrations = foreach ($root in $uninstallRoots) {
+        if (-not (Test-Path -LiteralPath $root)) { continue }
+        foreach ($key in @(Get-ChildItem -LiteralPath $root -ErrorAction Stop)) {
+            try {
+                $displayName = [string]$key.GetValue('DisplayName', '')
+                if ($displayName -notmatch '^(?i:Microsoft Copilot|Copilot)$') { continue }
+                $publisher = [string]$key.GetValue('Publisher', '')
+                if ($publisher -notmatch '^(?i:Microsoft Corporation|Microsoft)$') { continue }
+                [pscustomobject]@{
+                    PSPath = [string]$key.PSPath
+                    DisplayName = $displayName
+                    Publisher = $publisher
+                    DisplayVersion = [string]$key.GetValue('DisplayVersion', '')
+                    QuietUninstallString = [string]$key.GetValue('QuietUninstallString', '')
+                    UninstallString = [string]$key.GetValue('UninstallString', '')
+                }
+            }
+            catch {
+                # An unreadable required field must not become a false clean result.
+                throw ("Unable to read Copilot detection/uninstall values at '{0}': {1}" -f $key.Name, $_.Exception.Message)
+            }
+            finally {
+                $key.Close()
+            }
+        }
+    }
+    return @($registrations | Sort-Object PSPath -Unique)
 }
 
 function Split-CopilotUninstallCommand {

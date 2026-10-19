@@ -17,6 +17,7 @@ The active endpoint scripts are designed primarily for 64-bit Windows PowerShell
 - [Repository inventory](#repository-inventory)
 - [Detailed script descriptions](#detailed-script-descriptions)
 - [Script 08 n8n repair approvals](#n8n-repair-approval-process)
+- [Command-line switches](#command-line-switches)
 - [Supporting files](#supporting-files)
 - [Scheduled task deployment](#scheduled-task-deployment)
 - [Deployment workflow](#deployment-workflow)
@@ -49,7 +50,7 @@ The active endpoint scripts are designed primarily for 64-bit Windows PowerShell
 | [`03_Weekend_Apps_Update.ps1`](./03_Weekend_Apps_Update.ps1) | Inventories available application upgrades, updates supported packages through WinGet, handles pinned/unknown packages according to switches, services Office Click-to-Run, and publishes per-application results. |
 | [`04_Sunday_Lab_Application_Maintenance.ps1`](./04_Sunday_Lab_Application_Maintenance.ps1) | Consolidated Sunday application/configuration runner: restore point, printing, Office migration/activation, Chrome Incognito startup, Elastic Agent, browser defaults/homepages, Adobe lab policy, Stellarium location, startup allowlist, and final Copilot cleanup. Honorlock remains embedded but disabled because GPO owns it. |
 | [`05_Weekend_HP_Drivers_Update.ps1`](./05_Weekend_HP_Drivers_Update.ps1) | Vendor-aware HP/Dell maintenance with safe driver filtering, HPIA/DCU workflows, HP BIOS Internet-update policy, AV scheduled power-on, Dell Wake-on-LAN validation, Dell cleanup of orphaned HP software, and hardware/driver telemetry. |
-| [`06_Weekend_Windows_Updates.ps1`](./06_Weekend_Windows_Updates.ps1) | Installs Microsoft/Windows updates with PSWindowsUpdate, optionally resets Windows Update components, compares pre/post compliance, records detailed results, and reports—but does not itself perform—the required reboot. |
+| [`06_Weekend_Windows_Updates.ps1`](./06_Weekend_Windows_Updates.ps1) | Installs Microsoft/Windows updates with PSWindowsUpdate, optionally resets Windows Update components, compares pre/post compliance, records detailed results, automatically schedules required reboots during Sunday 01:00–20:45 local maintenance while thawed; supports manual overrides and coordinator opt-out. |
 | [`07_Force_Reboot_Install_Updates.ps1`](./07_Force_Reboot_Install_Updates.ps1) | Coordinates a persistent, verified multi-reboot cycle; supports scheduled, startup-resume, maintenance-closeout, and final-verification modes; records the source of persistent reboot flags. |
 | [`08_System_Repair.ps1`](./08_System_Repair.ps1) | Performs DISM/SFC, storage, WMI, RPC, Explorer, Windows Update, management-agent, disk-usage, and cleanup diagnostics/repairs. Persistent corruption requires explicit opt-in plus a matching, unexpired n8n approval before source-WIM/in-place repair escalation. |
 | [`09_Disable_Windows_Update_Services.ps1`](./09_Disable_Windows_Update_Services.ps1) | Applies and verifies the post-maintenance Windows Update service, scheduled-task, and registry-policy state. |
@@ -93,7 +94,7 @@ The updater persists the last working source roots so a self-update does not rev
 
 ### `01_Enable_Windows_Update_Services.ps1`
 
-Prepares the endpoint for the maintenance window by synchronizing Script 00 first, restoring required Windows Update services and registry startup modes, enabling required update tasks, removing conflicting policy values, and retrying service startup. It records before/after service and policy state, reconciles the master schedule, and can force a controlled reboot if critical services remain unavailable.
+Normal operation prepares the endpoint for the maintenance window by synchronizing Script 00 first, restoring required Windows Update services and registry startup modes, enabling required update tasks, removing conflicting policy values, and retrying service startup. It records before/after service and policy state, reconciles the master schedule, and can force a controlled reboot if critical services remain unavailable. `-ManualUpdateRepair`, used by Script 07, skips package bootstrap, task reconciliation, and Secure Boot coordination and returns service-recovery failures without scheduling its own reboot.
 
 ### `02_Remove_User_Profiles.ps1`
 
@@ -137,11 +138,13 @@ Additional platform controls include:
 
 ### `06_Weekend_Windows_Updates.ps1`
 
-Ensures NuGet/PSWindowsUpdate prerequisites, optionally resets Windows Update components, captures Windows build/update/reboot state, installs available Microsoft updates with an operation timeout, and compares available updates before and after the run. The same script is scheduled twice; Script 07 owns reboot coordination.
+Ensures NuGet/PSWindowsUpdate prerequisites, optionally resets Windows Update components, captures Windows build/update/reboot state, installs available Microsoft updates with an operation timeout, and compares available updates before and after the run. The script is scheduled twice. A direct scheduled pass now automatically requests a required restart during Sunday 01:00–20:45 local time after publishing its results and confirming that Deep Freeze is thawed (or absent). The default countdown is 60 seconds and must finish before 20:45. Outside that window, it reports the reboot requirement without restarting unless `-AllowReboot` is supplied. `-NoReboot` suppresses its restart; Scripts 07 and 15 pass this switch when they own reboot coordination. Script 06 performs one update pass and does not automatically resume itself after startup.
 
 ### `07_Force_Reboot_Install_Updates.ps1`
 
-Uses a durable state file and single-instance lock to prevent repeated or unverified reboot consumption. It requires a newer boot time before advancing a reboot stage, can recover an abandoned non-startup cycle, inventories pending-reboot flags and likely causes, optionally clears only approved flags, and stops after the configured maximum. Startup resume exits safely when no active cycle exists; closeout/final-verification modes do not reboot a clean computer. Version 2.1.3 permits execution/reboot only on local Sunday, including the shutdown countdown. `-WindowsServicingOnly` restricts reboot flags to Windows servicing and refuses flag cleanup. This Sunday guard does not enforce a thawed state or an earlier Sunday cutoff; Script 15 adds those checks before invoking it.
+Uses a durable state file and single-instance lock to prevent repeated or unverified reboot consumption. Normal runs remain Sunday-only and require proof of a newer boot before advancing through up to three reboots. `-WindowsServicingOnly` limits detection to Windows servicing and refuses flag deletion. The ordinary Sunday/startup path does not itself enforce Script 15's thawed-state check or 20:45 cutoff, and the ordinary state file does not persist the servicing-only switch across startup; these remain separate limitations.
+
+`-Force` starts a different, explicit manual repair transaction on any day. It verifies the thawed state, invokes Script 01 with `-ManualUpdateRepair`, completes existing pending reboots, invokes Script 06 with `-NoReboot`, and independently scans Microsoft Update. A temporary SYSTEM startup task continues the transaction after reboots, with a six-hour deadline and limits of six requested reboots and six installation passes. It does not delete servicing/reboot flags. A clean result requires a verified reboot, two successful empty update scans, no tracked reboot requirement, no detected servicing processes at the final check, and successful core update-service closeout. It then removes its temporary task and reports `ReadyForManualFreeze=true`; it does not freeze the computer. Failed checks report `NeedsAttention` and stop the continuation. A failed run can leave update services open, so keep the computer thawed and inspect the report before returning it to class.
 
 ### `08_System_Repair.ps1`
 
@@ -348,11 +351,131 @@ Finds `DFC.exe`, queries the installed state, writes one atomic JSON event per r
 
 Validates Edge Update policy, services, tasks, installed updater, and final servicing state. It can restart/repair services and tasks, invoke the installed updater, or use an administrator-supplied Microsoft Edge Enterprise MSI after copying it locally and verifying Microsoft Authenticode. It does not modify Edge profiles, favorites, or user data. The script writes `maintenance.remediation` telemetry and is deployed but not assigned a recurring task.
 
+## Command-line switches
+
+These tables cover the declared top-level switches on active numbered scripts and the exported Copilot cleanup command. A switch normally enables an option when present. For switches whose default is already **on**, use `-SwitchName:$false` to turn them off. Paths, counts, timeouts, and other value parameters are documented separately below for the changed update scripts. Embedded section-script parameters inside Script 04 are not top-level runner switches.
+
+### Update and reboot commands
+
+Run these examples in elevated 64-bit Windows PowerShell. Deploy Scripts 01/06/07/15 together with the framework; Script 07's manual repair requires the updated Script 01 and Script 06.
+
+```powershell
+# Ordinary maintenance: required reboots are automatic within Sunday's window.
+C:\Scripts\06_Weekend_Windows_Updates.ps1
+
+# Attended, single update pass with a required reboot allowed on any day.
+# Enable update services first; this command does not resume after reboot.
+C:\Scripts\06_Weekend_Windows_Updates.ps1 -AllowReboot
+
+# Install/report only; let a coordinator or technician handle the restart.
+C:\Scripts\06_Weekend_Windows_Updates.ps1 -NoReboot
+
+# Full manual repair on an already-thawed computer, including startup continuation.
+C:\Scripts\07_Force_Reboot_Install_Updates.ps1 -Force
+
+# Inspect the repair result before manually freezing.
+Get-Content C:\Logs\07_ManualUpdateRepair.latest.json -Raw |
+    ConvertFrom-Json |
+    Select-Object Status, ReadyForManualFreeze, RemainingUpdates, PendingReboot, FailureMessage
+```
+
+Keep the computer thawed through every repair reboot and verification. `ReadyForManualFreeze=true` records the successful checks at that time; it does not control the external freeze schedule or guarantee that future updates will never be offered. `NeedsAttention` is not a clean result. Forced restart commands close running applications and can discard unsaved work.
+
+| Script | Switch | Default / effect |
+|---|---|---|
+| 01 | `-ManualUpdateRepair` | Off. Opens/restores update services using the existing logic but skips Script 00 bootstrap, task reconciliation, and Script 15 Secure Boot coordination. Service-recovery failure returns an error instead of independently rebooting. Intended for Script 07. |
+| 06 | `-AllowReboot` | Off. Explicitly allows a required restart on any day/time, including outside Sunday maintenance; still requires thawed state when Deep Freeze is detected. Does not force a restart when no reboot requirement is detected. |
+| 06 | `-NoReboot` | Off. Suppresses Script 06's restart even during maintenance. Scripts 07 and 15 supply it to avoid competing restart requests. Cannot be combined with `-AllowReboot`. |
+| 06 | `-ResetWUComponentsFirst` | Off. Resets Windows Update components before installation using the script's existing reset routine; use for a diagnosed update-client issue, not as a routine completion step. |
+| 07 | `-Force` | Off. Starts a manual thawed update repair on any day, with Script 01/06 installation passes, reboot/startup continuation, independent verification, and core service closeout. Does not delete flags and does not automatically freeze. Cannot be combined with the ordinary mode switches below. |
+| 07 | `-ManualResume` | Internal temporary startup-task switch. Continues only an existing manual transaction after a newer boot, checking its deadline and thawed state; do not use as the operator entry point. Cannot be combined with `-Force` or ordinary modes. |
+| 07 | `-StartupResume` | Ordinary scheduled startup continuation. Exits without action if there is no active ordinary reboot cycle; remains Sunday-only. |
+| 07 | `-MaintenanceCloseout` | Selects the ordinary maintenance-closeout invocation mode/telemetry; evaluates flags through the existing staged reboot workflow, remaining Sunday-only. It does not install updates itself. |
+| 07 | `-FinalVerification` | Selects final-verification invocation mode; a clean initial evaluation reports `FinalVerificationClean`. It can still request a reboot when flags require one within the ordinary workflow. Not a read-only guarantee. |
+| 07 | `-WindowsServicingOnly` | Limits ordinary detection to Windows Update/CBS reboot flags and forbids flag cleanup. May accompany an ordinary mode. It is not persisted in the ordinary state file for later `-StartupResume` calls. |
+| 07 | `-AllowUnsafeRebootFlagCleanup` | Off. Opts the ordinary persistent-flag path into registry cleanup after the verified reboot budget is exhausted. Deleting indicators does not install updates; do not use to prove repair completion. It has no cleanup effect in the manual `-Force` branch. |
+| 15 | `-VerifyOnly` | Off. Skips the initial Script 01/06 enable/install pass, then performs closeout checks. Can still request a servicing reboot; disables update services only in the final verification branch. Not read-only. |
+| 15 | `-SecureBootOnly` | Off. Runs only the Secure Boot coordinator path instead of normal update closeout; preserves its policy/target/window/protection gates. May change certificate/protection state or request a reboot when authorized by that policy. |
+| 15 | `-SecureBootAuditOnly` | Off. Selects the Secure Boot audit path, reporting certificate/firmware/protection/readiness without remediation. Prefer this for inspection. |
+| 15 | `-SecureBootStartup` | Internal Secure Boot startup continuation. Operates on an existing certificate transaction; reports `NoActiveTransaction` when absent. Not an update-repair entry point. |
+
+`-StartupResume`, `-MaintenanceCloseout`, and `-FinalVerification` are mutually exclusive. `-Force`/`-ManualResume` cannot be combined with any of those three or with `-WindowsServicingOnly`. For Script 15, use one Secure Boot entry mode at a time; `-VerifyOnly` belongs to normal closeout.
+
+| Script | Value parameter | Default / effect |
+|---|---|---|
+| 06 | `-RebootDelaySeconds` | `60`; range 30–3600. Countdown after the pass. Automatic Sunday reboots must finish before 20:45 local time. |
+| 06 | `-OperationTimeoutSeconds` | `1800`. Timeout passed to the update installation operation. |
+| 06 | `-LogFolder` | System-drive `Logs` directory, normally `C:\Logs`. |
+| 07 | `-RebootDelaySeconds` | `30`; range 0–86400. Countdown for requested reboots; manual repair also enforces its six-hour deadline. |
+| 07 | `-StartupSettlingSeconds` | `120`; range 0–900. Wait for the ordinary `-StartupResume` path. Manual continuation uses its own fixed 120-second settling wait. |
+| 07 | `-AbandonedCycleMinutes` | `10`; range 1–1440. Age threshold for recovering abandoned ordinary non-startup cycles. |
+| 07 | `-LogDirectory` | `C:\Logs`. Includes `07_ManualUpdateRepair.latest.json` for manual repair. |
+| 07 | `-StateDirectory` | `C:\ProgramData\MISMaintenance\State`. Stores ordinary and separate manual transaction state. |
+| 07 | `-StateFileName` | `07_Force_Reboot_Install_Updates_State.json`; ordinary state filename. Manual repair uses the fixed `07_ManualUpdateRepair.json` within the state directory. |
+| 15 | `-ScriptsRoot` | `C:\Scripts`; companion-script directory. |
+| 15 | `-LogDirectory` | `C:\Logs`; closeout/secure-boot logs and reports. |
+
+### Other numbered-script switches
+
+| Script | Switch | Default / effect |
+|---|---|---|
+| 00 | `-Relaunched` | Internal updater self-relaunch marker; do not supply for an ordinary initial synchronization. |
+| 02 | `-SkipLoadedProfiles` | **On**. Protects loaded profiles from normal cleanup selection. |
+| 02 | `-SkipSpecialProfiles` | **On**. Protects Windows special profiles from normal cleanup selection. |
+| 03 | `-IncludeUnknown` | **On**. Includes upgrade candidates whose installed version is unknown to WinGet. |
+| 03 | `-IncludePinned` | Off. Includes pinned package upgrades where supported by the WinGet workflow. |
+| 03 | `-AttemptMSStore` | Off. Adds Microsoft Store source attempts. |
+| 03 | `-UpdateOffice` | **On**. Runs the Office Click-to-Run update portion. |
+| 04 | `-ForceElasticAgentReinstall` | Off. Requests Elastic Agent reinstall even when an existing installation appears healthy. Section enable/disable settings are configuration variables, not command-line switches. |
+| 05 | `-IncludeSoftware` | Off. Records a software-update request in logs/telemetry. Current selection logic does not consult this switch, so it does not independently broaden update classes. |
+| 05 | `-IncludeBIOS` | Off. Permits BIOS/firmware update classes subject to remaining vendor checks; does not enable every boot-sensitive driver class. |
+| 05 | `-All` | Off. Broadens selection to all permitted vendor update classes, including BIOS/firmware and otherwise-blocked storage/chipset/controller classes. |
+| 05 | `-SkipAvAutoPowerOn` | Off. Skips the AV computer scheduled power-on configuration. |
+| 08 | `-AutoRepairOnDetection` | Off. Enables the ordinary automatic repair workflow when faults are detected; separate disruptive-repair gates still apply. |
+| 08 | `-AllowWmiRepair` | **On**. Permits the WMI repair path when its detection/repair conditions are met. |
+| 08 | `-AllowNetworkReset` | Off. Permits network reset operations. |
+| 08 | `-AllowWindowsUpdateReset` | Off. Permits the Windows Update reset repair path. |
+| 08 | `-AllowDiskRepair` | Off. Permits filesystem repair separately from general automatic repair. |
+| 08 | `-AllowOfflineDiskRepair` | Off. Permits offline filesystem-repair handling subject to the additional maintenance/reboot gates. |
+| 08 | `-ConfirmThawedMaintenanceWindow` | Off. Operator confirmation that the computer will remain thawed through disruptive filesystem repair/reboots and verification; does not thaw it. |
+| 08 | `-AllowFirewallReset` | Off. Permits firewall reset operations. |
+| 08 | `-AllowIconCacheRebuild` | Off. Permits icon-cache rebuild repair. |
+| 08 | `-AllowExplorerHealthRepair` | **On**. Permits the Explorer health repair path. |
+| 08 | `-AllowSearchServiceRestart` | **On**. Permits Windows Search service restart when the workflow calls for it. |
+| 08 | `-AllowHpDriverRepairFromCbs` | Off. Permits HP driver-only repair when CBS evidence meets the script's conditions. |
+| 08 | `-AllowComponentStoreEscalation` | Off. Permits escalation after ordinary repair/verification fails; a matching unexpired n8n approval is also required. This switch alone is insufficient. |
+| 08 | `-AllowCopilotRemoval` | Off. Enables shared-module Copilot cleanup as a manual fallback; recurring ownership remains Script 04. |
+| 08 | `-AggressiveCleanup` | Off. Enables additional aggressive cleanup paths. |
+| 08 | `-ClearEventLogs` | Off. Enables event-log clearing; removes diagnostic history. |
+| 08 | `-AutoRebootIfNeeded` | Off. Permits a reboot when the repair workflow reports it is needed; repair-specific gates still apply. |
+| 09 | `-KeepBITSAvailable` | Off. Keeps BITS available instead of applying the ordinary disabled closeout state to it. |
+| 09 | `-SkipScheduledTasks` | Off. Skips the update-related scheduled-task closeout portion. |
+| 09 | `-SkipUpdatePolicy` | Off. Skips the registry update-policy closeout portion. |
+| 14 | `-InventoryOnly` | Off. Uses periodic inventory/reporting mode with the script's cache behavior; not the ordinary full scheduled maintenance run. |
+| 14 | `-ForceHPWarrantyRefresh` | Off. Forces HP warranty refresh instead of relying on the normal cached result. |
+| 14 | `-ForceDellWarrantyRefresh` | Off. Forces Dell warranty refresh instead of relying on the normal cached result. |
+| 14 | `-ShowCollectorProgress` | **On**. Displays collector progress; disable with `-ShowCollectorProgress:$false`. |
+
+Scripts 10 and 16 declare no top-level switch parameters. Script 10 uses value parameters such as `-SyncMode`; Script 16 currently uses in-script configuration. Script 00's source roots are string parameters, not switches.
+
+### Shared Copilot cleanup command
+
+After `Import-Module C:\Scripts\Maintenance.Copilot.psm1 -Force`, call `Invoke-ComprehensiveCopilotRemoval`:
+
+| Switch | Default / effect |
+|---|---|
+| `-SkipOfflineUserHives` | Off. Skips loading offline profiles and Default User; loaded-user and machine operations still run. |
+| `-SkipExplorerRestart` | Off. Suppresses the module's final Explorer-process restart/termination step when a reboot is required; useful during attended diagnostics. |
+| `-WhatIf` | PowerShell ShouldProcess preview for supported operations. |
+| `-Confirm` | PowerShell ShouldProcess confirmation behavior for supported operations. |
+
+PowerShell also supplies common parameters such as `-Verbose` and `-ErrorAction` on advanced scripts/functions. Those do not override maintenance windows, thawed-state checks, approvals, or reboot limits. The `-Force` on `Import-Module` reloads the module; it is unrelated to Script 07's `-Force` repair mode.
+
 ## Supporting files
 
 ### `Maintenance.Copilot.psm1`
 
-The sole Copilot implementation stops Copilot processes, removes the Microsoft-published system-level Win32 Copilot application, removes approved Copilot Appx/provisioned packages and `Microsoft.MicrosoftOfficeHub`, disables related startup/task entries, applies machine and current/offline/default-user policies, removes shortcuts, disables Edge Copilot entry points, cleans residual directories, and verifies the result. Removing `Microsoft.MicrosoftOfficeHub` does not uninstall Office LTSC desktop applications.
+Version 1.2.3 reads only the uninstall-registry values needed for Copilot detection/removal, avoiding the bulk `Get-ItemProperty` cast failure observed on an endpoint. Its existing Microsoft Copilot name/publisher filters remain unchanged. The sole Copilot implementation stops Copilot processes, removes the Microsoft-published system-level Win32 Copilot application, removes approved Copilot Appx/provisioned packages and `Microsoft.MicrosoftOfficeHub`, disables related startup/task entries, applies machine and current/offline/default-user policies, removes shortcuts, disables Edge Copilot entry points, cleans residual directories, and verifies the result. Removing `Microsoft.MicrosoftOfficeHub` does not uninstall Office LTSC desktop applications.
 
 ### `Maintenance.Framework.psm1`
 
@@ -433,7 +556,7 @@ Policy v1.1.0 removes retired Scripts 04/11/12/13 entries, explicitly covers act
 
 `SystemRepairWeekly` uses `-AutoRepairOnDetection -AllowComponentStoreEscalation`, matching the supplied production task. Copilot removal remains an explicit manual fallback and is owned by Script 04 in recurring maintenance. The supplied unrestricted legacy launcher was not substituted for the fixed-action launcher, because it does not accept `-ActionId` and would break existing repository-registered tasks.
 
-Script 07 v2.1.3 blocks weekday reboots but does not itself enforce Script 15's 20:45 cutoff or Deep Freeze Thawed state. Startup-resume protection for those conditions and preservation of servicing-only mode across reboot continuation remain separate follow-up work. Script 15 serializes its own invocations through the launcher, but its direct child operations do not participate in the ordinary global maintenance mutex. Confirm the external thaw/freeze window and pilot the complete schedule on Windows; registering tasks does not start them.
+Script 07 ordinary scheduled/startup mode blocks weekday reboots but does not itself enforce Script 15's 20:45 cutoff or Deep Freeze Thawed state. Its explicit `-Force` manual repair mode is separate and verifies thawed state on each continuation. Startup-resume protection for those conditions and preservation of servicing-only mode across reboot continuation remain separate follow-up work. Script 15 serializes its own invocations through the launcher, but its direct child operations do not participate in the ordinary global maintenance mutex. Confirm the external thaw/freeze window and pilot the complete schedule on Windows; registering tasks does not start them.
 
 ## Deployment workflow
 
@@ -542,3 +665,12 @@ The following files are retained under [`Retired`](./Retired) for history only. 
 - Secure Boot remediation lists remain empty. An encrypted updated endpoint passed the SYSTEM audit and its `AlreadyUpdated`/firmware-verified/BitLocker-On event was observed in Elastic. This validates audit/reporting only; update, suspension, restart, protection-resume and frozen-boot remediation still require an attended pilot.
 - Public deployment/status paths retain repository placeholders. Manifest and checksums describe repository bytes and must be regenerated after local site configuration.
 - PowerShell 7.5.3 parsing and 23 isolated offline Secure Boot tests pass; Windows PowerShell 5.1 parsing and broader Windows integration remain required.
+
+## October 19, 2026 update completion and manual repair (package 3.0.21)
+
+- Script 01 v2.8.9 adds `-ManualUpdateRepair` so Script 07 can open update services without package refresh, task reconciliation, certificate servicing, or independent recovery reboots.
+- Script 06 v2.1.12 automatically requests required restarts during Sunday 01:00–20:45 local maintenance while thawed. `-AllowReboot` permits an explicit out-of-window restart; `-NoReboot` leaves reboot control with a coordinator.
+- Script 07 v2.2.1 adds the bounded install/reboot/resume/verify `-Force` transaction and passes `-NoReboot` to Script 06. Script 15 v1.1.3 also passes `-NoReboot`; existing task arguments and the registrar are unchanged.
+- Copilot module v1.2.3 replaces the failing bulk uninstall-registry read with targeted value reads. The user confirmed this fix on the affected endpoint; it does not broaden removal targets.
+- Deployment manifest and checksum metadata are regenerated for the repository bytes. Do not copy stale metadata alongside the new scripts.
+- Validation: PowerShell grammar parsing of the changed files, diff/caller review, README switch-coverage checks, JSON, and SHA-256 verification. Native Windows PowerShell 5.1 parsing and live update/reboot/DFC/Task Scheduler validation remain pending. Previous release validation records do not establish live validation of this release.

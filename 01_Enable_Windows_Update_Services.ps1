@@ -1,13 +1,15 @@
 ﻿# =====================================================================
 # ScriptName: 01_Enable_Windows_Update_Services.ps1
-# ScriptVersion: 2.8.8
-# LastUpdated: 2026-10-16
+# ScriptVersion: 2.8.9
+# LastUpdated: 2026-10-19
 # Purpose: Restore Windows Update services, tasks, policy settings,
 #          Windows 11 UI preferences, and classic right-click context menu behavior for all users;
 #          verify required services are running, retry startup failures
 #          up to 4 total attempts, and force a reboot if critical
 #          services still refuse to start.
-# Changes:  v2.8.8 restores the optional Microsoft Update Health service.
+# Changes:  v2.8.9 adds -ManualUpdateRepair: skip script refresh, task registration,
+#           and Secure Boot coordination; leave reboot decisions to script 07.
+#           v2.8.8 restores the optional Microsoft Update Health service.
 #           v2.8.6 verifies Medic native exit codes and restores SIH healing tasks.
 #           v2.8.5 aligns updater-task validation and repair with the 01:00 Sunday master schedule.
 #           v2.8.4 guarantees structured failure telemetry for bootstrap/framework/privilege/runtime failures.
@@ -17,12 +19,12 @@
 # =====================================================================
 
 [CmdletBinding()]
-param()
+param([switch]$ManualUpdateRepair)
 
 $ErrorActionPreference = 'Stop'
 
 $script:ScriptName       = '01_Enable_Windows_Update_Services.ps1'
-$script:ScriptVersion    = '2.8.8'
+$script:ScriptVersion    = '2.8.9'
 $script:ExecutionStart   = Get-Date
 $script:WarningCount     = 0
 $script:ErrorCount       = 0
@@ -349,7 +351,7 @@ function Invoke-LatestUpdaterBootstrap {
 }
 
 try {
-    Invoke-LatestUpdaterBootstrap
+    if (-not $ManualUpdateRepair) { Invoke-LatestUpdaterBootstrap }
 }
 catch {
     $script:FinalStatus = 'Failed'
@@ -775,6 +777,8 @@ function Force-RebootNow {
     param(
         [string]$Reason = 'Required Windows Update services failed to start after multiple attempts.'
     )
+
+    if ($ManualUpdateRepair) { throw $Reason }
 
     $script:RebootInitiated = $true
     $script:RebootReason = $Reason
@@ -1266,6 +1270,7 @@ if ($failedServices.Count -gt 0) {
 # The register script is idempotent: it creates missing tasks and changes only
 # managed tasks whose action, trigger, principal, or settings differ.
 # ------------------------------------------------------------
+if (-not $ManualUpdateRepair) {
 $RegisterTasksScript = 'C:\Scripts\Register-Tasks_SYSTEM.ps1'
 
 if (Test-Path -LiteralPath $RegisterTasksScript -PathType Leaf) {
@@ -1307,6 +1312,12 @@ if (Test-Path -LiteralPath $secureBootCoordinator -PathType Leaf) {
     if ($secureBootCode -eq 3010) { $script:ExitCode=3010; Write-Status 'Secure Boot coordinator requested a bounded Sunday reboot. See SecureBoot-Maintenance.latest.json.' 'WARN' }
     elseif ($secureBootCode -ne 0) { Write-Status 'Secure Boot certificate verification/remediation is blocked or incomplete. See SecureBoot-Maintenance.latest.json.' 'WARN' }
 } else { Write-Status 'Secure Boot coordinator (Script 15) is missing.' 'WARN' }
+
+}
+else {
+    $script:TaskReconcileStatus = 'SkippedManualUpdateRepair'
+    Write-Status 'Manual repair: script refresh, task reconciliation, and Secure Boot coordination skipped; Script 07 owns reboots.' 'INFO'
+}
 
 # Final enforcement pass. This runs after any task rebuild so older register scripts
 # cannot leave "Run task as soon as possible after a scheduled start is missed" enabled.

@@ -1,14 +1,13 @@
+# Changes v4.12.3: deploy watchdog runtime files and reconcile its protected tasks via -Deploy.
 #requires -version 5.1
 # =====================================================================
 # ScriptName: 00_Update-Scripts-FromShare.ps1
-# ScriptVersion: 4.12.2
-# LastUpdated: 2026-10-15
-# Changes: v4.12.2 verifies both registered Sunday closeout actions after sync.
-# Previous: v4.12.1 approves manifest deployment of 15_Sunday_Update_Closeout.ps1.
-# Previous: v4.12.0 verifies the current share registrar after updater self-relaunch,
-#          reconciles every successful sync and verifies direct or fixed launcher actions.
-# Changes: v4.11.2 approves the component-store repair helper used by Script 08
-#          for source-WIM repair and guarded Windows in-place repair escalation.
+# ScriptVersion: 4.12.3
+# LastUpdated: 2026-10-12
+# Changes: v4.12.3 recognizes fixed launcher actions in post-registration verification.
+#          v4.12.1 approves manifest deployment of Script 15 Sunday update closeout.
+#          v4.12.0 verifies and runs the current share task registrar on every
+#          successful sync, then verifies the updater, Sunday apps and inventory actions.
 # Changes: v4.11.0 approves and supplementally deploys SoftwareInventory.Policy.json
 #          so Script 14 software filtering remains centrally managed even during
 #          a manifest-transition deployment.
@@ -45,9 +44,9 @@ $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 
 $ScriptName = '00_Update-Scripts-FromShare.ps1'
-$ScriptVersion = '4.12.2'
+$ScriptVersion = '4.12.3'
 $DefaultPreferredSourceRoot = '\\SERVER\DeploymentShare'
-$DefaultFallbackSourceRoot = '\\FALLBACK-SERVER\DeploymentShare'
+$DefaultFallbackSourceRoot = '\\10.2.3.30\Labscripts'
 $SourceConfigurationPath = Join-Path $env:ProgramData 'ComptonMaintenance\Updater.Source.json'
 $ManifestName = 'DeploymentManifest.json'
 $FrameworkName = 'Maintenance.Framework.psm1'
@@ -102,7 +101,10 @@ $SoftwareInventoryPolicyName = 'SoftwareInventory.Policy.json'
     'SoftwareInventory.Policy.json',
     'Repair-MicrosoftEdgeUpdate.ps1',
     'Repair-Windows-ComponentStore.ps1',
-    'Register-Tasks_SYSTEM.ps1'
+    'Register-Tasks_SYSTEM.ps1',
+    'Watch-RebootRecovery.ps1',
+    'RepairScreen.psm1',
+    'Show-RecoveryNotice.ps1'
 )
 $LocalRoot = 'C:\Scripts'
 $LogRoot = 'C:\Logs'
@@ -727,6 +729,48 @@ function Invoke-TaskReconciliation {
     Write-UpdaterStatus 'Scheduled task reconciliation completed and required actions verified. Tasks were not started.' 'OK'
 }
 
+
+function Install-RebootRecoveryDeployment {
+    $path = Join-Path $LocalRoot 'Watch-RebootRecovery.ps1'
+    if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
+        Write-UpdaterStatus 'Watchdog deployment not present in this manifest; existing installation retained.' 'INFO'
+        return
+    }
+    foreach ($name in @('RepairScreen.psm1','Show-RecoveryNotice.ps1')) {
+        if (-not (Test-Path -LiteralPath (Join-Path $LocalRoot $name) -PathType Leaf)) {
+            throw "Watchdog deployment dependency missing: $name"
+        }
+    }
+    $process = New-Object Diagnostics.Process
+    $process.StartInfo.FileName = $PowerShellExe
+    $process.StartInfo.Arguments = '-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "' + $path + '" -Deploy'
+    $process.StartInfo.UseShellExecute = $false
+    $process.StartInfo.CreateNoWindow = $true
+    $process.StartInfo.RedirectStandardOutput = $true
+    $process.StartInfo.RedirectStandardError = $true
+    try {
+        if (-not $process.Start()) { throw 'Could not start watchdog deployment.' }
+        $stdout = $process.StandardOutput.ReadToEndAsync()
+        $stderr = $process.StandardError.ReadToEndAsync()
+        if (-not $process.WaitForExit(120000)) {
+            try { $process.Kill() } catch { }
+            throw 'Watchdog deployment exceeded 120 seconds.'
+        }
+        $process.WaitForExit()
+        if ($null -eq $process.ExitCode -or $process.ExitCode -ne 0) {
+            throw 'Watchdog deployment failed. Inspect C:\Logs\RebootRecovery.latest.json for its redacted diagnostic.'
+        }
+        # Never copy child output/configuration into updater logs.
+        if ($stdout.Result -match 'DeploymentDeferred:') {
+            Write-UpdaterStatus 'Watchdog installation deferred; not configured, not thawed, or recovery active. Existing watchdog retained. See deployment instructions.' 'WARN'
+        }
+        else {
+            Write-UpdaterStatus 'Watchdog deployment check completed. No repair or reboot was requested.' 'OK'
+        }
+    }
+    finally { $process.Dispose() }
+}
+
 try {
     Ensure-Directory -Path $LocalRoot
     Ensure-Directory -Path $LogRoot
@@ -793,6 +837,7 @@ try {
     }
 
     Invoke-TaskReconciliation -SourceRoot $sourceRoot
+    Install-RebootRecoveryDeployment
     Write-UpdaterStatus 'Manifest synchronization completed successfully.' 'OK'
     Write-ExecutionRecord -Status 'Success' -ExitCode 0 -FailureMessage $null
     exit 0
@@ -818,4 +863,3 @@ finally {
         }
     } catch { }
 }
-

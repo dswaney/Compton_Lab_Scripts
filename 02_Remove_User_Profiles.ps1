@@ -1,8 +1,9 @@
 ﻿# =====================================================================
 # ScriptName: 02_Remove_User_Profiles.ps1
-# ScriptVersion: 2.5.22
-# LastUpdated: 2026-10-16
-# Changes: v2.5.22 preserves the manually added hr-ib2130 profile exclusion and aligns telemetry version.
+# ScriptVersion: 2.5.24
+# LastUpdated: 2026-10-27
+# Changes: v2.5.23 skips all profile deletion on hostnames beginning with
+#          CP, CCDP, or PD (case-insensitive); other preferences still apply.
 #          v2.5.1 removes only ForceAutoLogon for enabled CC-Students autologon.
 #          All other Winlogon/autologon values remain unchanged.
 #          v2.5.0 removes Copilot removal/policies and Edge InPrivate startup
@@ -32,7 +33,8 @@ param(
         'MISAdmin',
         'CC-Student',
         'dswaney',
-		'hr-ib2130'
+		'hr-ib2130',
+		'212-AV'
     ),
 
     [string]$UsersRoot = 'C:\Users',
@@ -63,7 +65,7 @@ $script:BaseFileName = "{0}-RemoveUserProfiles-{1}" -f $script:ComputerName, $sc
 $script:YamlLogPath = Join-Path $LogDirectory ($script:BaseFileName + '.yaml')
 $script:RunId = [guid]::NewGuid().ToString('N')
 $script:ScriptName = '02_Remove_User_Profiles.ps1'
-$script:ScriptVersion = '2.5.22'
+$script:ScriptVersion = '2.5.23'
 $script:Domain = $env:USERDNSDOMAIN
 $script:TextLogPath = $null
 $script:PublishedTextLogPath = $null
@@ -1468,143 +1470,150 @@ Write-Log "Active staged text log path: $($script:TextLogPath)" 'INFO'
 Write-Log "Completed text log publish path: $($script:PublishedTextLogPath)" 'INFO'
 Write-Log "YAML log path: $($script:YamlLogPath)" 'INFO'
 
-try {
-    $allUserProfiles = Get-CimInstance -ClassName Win32_UserProfile -ErrorAction Stop | Where-Object {
-        -not [string]::IsNullOrWhiteSpace($_.LocalPath) -and
-        $_.LocalPath -like "$UsersRoot\*"
-    }
-}
-catch {
-    Write-Log "Failed to enumerate Win32_UserProfile instances: $($_.Exception.Message)" 'ERROR'
-    $script:Summary.EndTime = Get-Date
-    Complete-ScriptExecution -ExitCode 2
-}
-
-$script:Summary.FoundProfiles = @($allUserProfiles).Count
-Write-Log "Found $($script:Summary.FoundProfiles) profile(s) under $UsersRoot." 'INFO'
-
-$profilesToDelete = New-Object System.Collections.ArrayList
-
-foreach ($profile in $allUserProfiles) {
-    $profilePath = $profile.LocalPath
-    $profileName = Get-ProfileFolderName -Path $profilePath
-
-    if ([string]::IsNullOrWhiteSpace($profileName)) {
-        Write-Log "Skipping profile with invalid path: $profilePath" 'WARN'
-        continue
-    }
-
-    $ageData = Get-ProfileAgeData -ProfilePath $profilePath -LastUseTime $profile.LastUseTime
-
-    if ($ExcludedProfiles -icontains $profileName) {
-        $script:Summary.ExcludedProfiles++
-        Write-Log "Skipping excluded profile: $profileName" 'WARN'
-        $script:SkippedProfileDetails.Add([PSCustomObject]@{
-            ProfileName  = $profileName
-            LocalPath    = $profilePath
-            SID          = $profile.SID
-            Reason       = 'Excluded'
-            CreatedTime  = $ageData.CreatedTime
-            LastUseTime  = $ageData.LastUseTime
-            DaysOnSystem = $ageData.DaysOnSystem
-        }) | Out-Null
-        continue
-    }
-
-    if ($SkipSpecialProfiles -and $profile.Special) {
-        $script:Summary.SkippedSpecial++
-        Write-Log "Skipping special/system profile: $profileName ($profilePath)" 'WARN'
-        $script:SkippedProfileDetails.Add([PSCustomObject]@{
-            ProfileName  = $profileName
-            LocalPath    = $profilePath
-            SID          = $profile.SID
-            Reason       = 'SpecialProfile'
-            CreatedTime  = $ageData.CreatedTime
-            LastUseTime  = $ageData.LastUseTime
-            DaysOnSystem = $ageData.DaysOnSystem
-        }) | Out-Null
-        continue
-    }
-
-    if ($SkipLoadedProfiles -and $profile.Loaded) {
-        $script:Summary.SkippedLoaded++
-        Write-Log "Skipping loaded profile: $profileName ($profilePath)" 'WARN'
-        $script:SkippedProfileDetails.Add([PSCustomObject]@{
-            ProfileName  = $profileName
-            LocalPath    = $profilePath
-            SID          = $profile.SID
-            Reason       = 'LoadedProfile'
-            CreatedTime  = $ageData.CreatedTime
-            LastUseTime  = $ageData.LastUseTime
-            DaysOnSystem = $ageData.DaysOnSystem
-        }) | Out-Null
-        continue
-    }
-
-    if ($OlderThanDays -gt 0) {
-        try {
-            $cutoff = (Get-Date).AddDays(-$OlderThanDays)
-            $lastUse = $ageData.LastUseTime
-            if ($lastUse -and $lastUse -gt $cutoff) {
-                $script:Summary.SkippedByAge++
-                Write-Log "Skipping recent profile: $profileName (LastUseTime: $lastUse)" 'WARN'
-                $script:SkippedProfileDetails.Add([PSCustomObject]@{
-                    ProfileName  = $profileName
-                    LocalPath    = $profilePath
-                    SID          = $profile.SID
-                    Reason       = 'TooRecent'
-                    CreatedTime  = $ageData.CreatedTime
-                    LastUseTime  = $ageData.LastUseTime
-                    DaysOnSystem = $ageData.DaysOnSystem
-                }) | Out-Null
-                continue
-            }
-        }
-        catch {
-            Write-Log "Could not evaluate LastUseTime for ${profileName}: $($_.Exception.Message)" 'WARN'
-        }
-    }
-
-    $targetDescription = "$profileName ($profilePath)"
-    Write-Log "Measuring profile size before deletion: $profileName ($profilePath)" 'INFO'
-    $profileSize = Get-ProfileSizeData -ProfilePath $profilePath
-    if ($profileSize.MeasurementComplete) {
-        Write-Log "Profile size measured: $profileName ($profilePath) | $($profileSize.GB) GB ($($profileSize.Bytes) bytes)" 'INFO'
-    }
-    else {
-        Write-Log "Profile size was only partially measured because $($profileSize.ErrorCount) item(s) could not be read: $profileName ($profilePath) | Partial size: $($profileSize.GB) GB ($($profileSize.Bytes) bytes)" 'WARN'
-    }
-
-    if ($PSCmdlet.ShouldProcess($targetDescription, 'Queue profile folder for capped parallel timeout-safe deletion and remove profile registration')) {
-        $profilesToDelete.Add([PSCustomObject]@{
-            ProfileName  = $profileName
-            LocalPath    = $profilePath
-            SID          = $profile.SID
-            Loaded       = $profile.Loaded
-            Special      = $profile.Special
-            CreatedTime  = $ageData.CreatedTime
-            LastUseTime  = $ageData.LastUseTime
-            DaysOnSystem = $ageData.DaysOnSystem
-            ProfileSizeBytes = $profileSize.Bytes
-            ProfileSizeGB = $profileSize.GB
-            SizeMeasurementComplete = $profileSize.MeasurementComplete
-        }) | Out-Null
-    }
-}
-
-$script:Summary.QueuedProfiles = $profilesToDelete.Count
-$script:Summary.TotalQueuedProfileSizeGB = [math]::Round((
-    @($profilesToDelete | Measure-Object -Property ProfileSizeGB -Sum).Sum
-), 3)
-Write-Log "Queued $($profilesToDelete.Count) profile(s) for capped parallel deletion." 'INFO'
-Write-Log "Total measured size of queued profiles: $($script:Summary.TotalQueuedProfileSizeGB) GB" 'INFO'
-Write-YamlLog
-
-if ($profilesToDelete.Count -gt 0) {
-    Invoke-ParallelProfileDeletion -ProfilesToDelete @($profilesToDelete.ToArray())
+# Protect these computer groups from every profile-deletion path, including
+# profile registration removal, folder deletion, and cleanup-state processing.
+if ($script:ComputerName -imatch '^(CP|CCDP|PD)') {
+    Write-Log "Profile deletion skipped: hostname '$($script:ComputerName)' begins with a protected prefix (CP, CCDP, or PD). No profiles will be deleted." 'INFO'
 }
 else {
-    Write-Log 'No eligible profiles were queued for deletion.' 'OK'
+    try {
+        $allUserProfiles = Get-CimInstance -ClassName Win32_UserProfile -ErrorAction Stop | Where-Object {
+            -not [string]::IsNullOrWhiteSpace($_.LocalPath) -and
+            $_.LocalPath -like "$UsersRoot\*"
+        }
+    }
+    catch {
+        Write-Log "Failed to enumerate Win32_UserProfile instances: $($_.Exception.Message)" 'ERROR'
+        $script:Summary.EndTime = Get-Date
+        Complete-ScriptExecution -ExitCode 2
+    }
+
+    $script:Summary.FoundProfiles = @($allUserProfiles).Count
+    Write-Log "Found $($script:Summary.FoundProfiles) profile(s) under $UsersRoot." 'INFO'
+
+    $profilesToDelete = New-Object System.Collections.ArrayList
+
+    foreach ($profile in $allUserProfiles) {
+        $profilePath = $profile.LocalPath
+        $profileName = Get-ProfileFolderName -Path $profilePath
+
+        if ([string]::IsNullOrWhiteSpace($profileName)) {
+            Write-Log "Skipping profile with invalid path: $profilePath" 'WARN'
+            continue
+        }
+
+        $ageData = Get-ProfileAgeData -ProfilePath $profilePath -LastUseTime $profile.LastUseTime
+
+        if ($ExcludedProfiles -icontains $profileName) {
+            $script:Summary.ExcludedProfiles++
+            Write-Log "Skipping excluded profile: $profileName" 'WARN'
+            $script:SkippedProfileDetails.Add([PSCustomObject]@{
+                ProfileName  = $profileName
+                LocalPath    = $profilePath
+                SID          = $profile.SID
+                Reason       = 'Excluded'
+                CreatedTime  = $ageData.CreatedTime
+                LastUseTime  = $ageData.LastUseTime
+                DaysOnSystem = $ageData.DaysOnSystem
+            }) | Out-Null
+            continue
+        }
+
+        if ($SkipSpecialProfiles -and $profile.Special) {
+            $script:Summary.SkippedSpecial++
+            Write-Log "Skipping special/system profile: $profileName ($profilePath)" 'WARN'
+            $script:SkippedProfileDetails.Add([PSCustomObject]@{
+                ProfileName  = $profileName
+                LocalPath    = $profilePath
+                SID          = $profile.SID
+                Reason       = 'SpecialProfile'
+                CreatedTime  = $ageData.CreatedTime
+                LastUseTime  = $ageData.LastUseTime
+                DaysOnSystem = $ageData.DaysOnSystem
+            }) | Out-Null
+            continue
+        }
+
+        if ($SkipLoadedProfiles -and $profile.Loaded) {
+            $script:Summary.SkippedLoaded++
+            Write-Log "Skipping loaded profile: $profileName ($profilePath)" 'WARN'
+            $script:SkippedProfileDetails.Add([PSCustomObject]@{
+                ProfileName  = $profileName
+                LocalPath    = $profilePath
+                SID          = $profile.SID
+                Reason       = 'LoadedProfile'
+                CreatedTime  = $ageData.CreatedTime
+                LastUseTime  = $ageData.LastUseTime
+                DaysOnSystem = $ageData.DaysOnSystem
+            }) | Out-Null
+            continue
+        }
+
+        if ($OlderThanDays -gt 0) {
+            try {
+                $cutoff = (Get-Date).AddDays(-$OlderThanDays)
+                $lastUse = $ageData.LastUseTime
+                if ($lastUse -and $lastUse -gt $cutoff) {
+                    $script:Summary.SkippedByAge++
+                    Write-Log "Skipping recent profile: $profileName (LastUseTime: $lastUse)" 'WARN'
+                    $script:SkippedProfileDetails.Add([PSCustomObject]@{
+                        ProfileName  = $profileName
+                        LocalPath    = $profilePath
+                        SID          = $profile.SID
+                        Reason       = 'TooRecent'
+                        CreatedTime  = $ageData.CreatedTime
+                        LastUseTime  = $ageData.LastUseTime
+                        DaysOnSystem = $ageData.DaysOnSystem
+                    }) | Out-Null
+                    continue
+                }
+            }
+            catch {
+                Write-Log "Could not evaluate LastUseTime for ${profileName}: $($_.Exception.Message)" 'WARN'
+            }
+        }
+
+        $targetDescription = "$profileName ($profilePath)"
+        Write-Log "Measuring profile size before deletion: $profileName ($profilePath)" 'INFO'
+        $profileSize = Get-ProfileSizeData -ProfilePath $profilePath
+        if ($profileSize.MeasurementComplete) {
+            Write-Log "Profile size measured: $profileName ($profilePath) | $($profileSize.GB) GB ($($profileSize.Bytes) bytes)" 'INFO'
+        }
+        else {
+            Write-Log "Profile size was only partially measured because $($profileSize.ErrorCount) item(s) could not be read: $profileName ($profilePath) | Partial size: $($profileSize.GB) GB ($($profileSize.Bytes) bytes)" 'WARN'
+        }
+
+        if ($PSCmdlet.ShouldProcess($targetDescription, 'Queue profile folder for capped parallel timeout-safe deletion and remove profile registration')) {
+            $profilesToDelete.Add([PSCustomObject]@{
+                ProfileName  = $profileName
+                LocalPath    = $profilePath
+                SID          = $profile.SID
+                Loaded       = $profile.Loaded
+                Special      = $profile.Special
+                CreatedTime  = $ageData.CreatedTime
+                LastUseTime  = $ageData.LastUseTime
+                DaysOnSystem = $ageData.DaysOnSystem
+                ProfileSizeBytes = $profileSize.Bytes
+                ProfileSizeGB = $profileSize.GB
+                SizeMeasurementComplete = $profileSize.MeasurementComplete
+            }) | Out-Null
+        }
+    }
+
+    $script:Summary.QueuedProfiles = $profilesToDelete.Count
+    $script:Summary.TotalQueuedProfileSizeGB = [math]::Round((
+        @($profilesToDelete | Measure-Object -Property ProfileSizeGB -Sum).Sum
+    ), 3)
+    Write-Log "Queued $($profilesToDelete.Count) profile(s) for capped parallel deletion." 'INFO'
+    Write-Log "Total measured size of queued profiles: $($script:Summary.TotalQueuedProfileSizeGB) GB" 'INFO'
+    Write-YamlLog
+
+    if ($profilesToDelete.Count -gt 0) {
+        Invoke-ParallelProfileDeletion -ProfilesToDelete @($profilesToDelete.ToArray())
+    }
+    else {
+        Write-Log 'No eligible profiles were queued for deletion.' 'OK'
+    }
 }
 
 # ---------------------------------------------------------------------

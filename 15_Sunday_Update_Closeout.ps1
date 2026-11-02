@@ -1,17 +1,41 @@
 ﻿#requires -Version 5.1
 #requires -RunAsAdministrator
-# ScriptVersion: 1.1.4
-# LastUpdated: 2026-10-19
+# ScriptVersion: 1.1.7
+# LastUpdated: 2026-11-02
+# Changes: v1.1.7 uses unique per-run logs and retries temporary log sharing violations.
+# Previous: Manual -Force bypasses the closeout calendar gate; thaw/servicing/Secure Boot safeguards remain.
+# Previous: Bounded servicing assessment replaces process-presence-only closeout block.
+# Idle workers require stable CPU/I/O, stable CBS log and a successful finalized CBS session.
+# No servicing processes are terminated; unknown/busy states defer closeout.
 [CmdletBinding()]
-param([string]$ScriptsRoot='C:\Scripts',[switch]$VerifyOnly,[string]$LogDirectory='C:\Logs',[switch]$SecureBootOnly,[switch]$SecureBootAuditOnly,[switch]$SecureBootStartup)
+param([string]$ScriptsRoot='C:\Scripts',[switch]$VerifyOnly,[string]$LogDirectory='C:\Logs',[switch]$SecureBootOnly,[switch]$SecureBootAuditOnly,[switch]$SecureBootStartup,[switch]$Force)
 $ErrorActionPreference='Stop'
 New-Item -Path $LogDirectory -ItemType Directory -Force|Out-Null
-$start=Get-Date;$result=[ordered]@{ComputerName=$env:COMPUTERNAME;ScriptVersion='1.1.4';StartTime=$start.ToString('o');Status='Running';ReadyToFreeze=$false;RemainingUpdates=$null;RebootRequired=$null;FailureMessage=$null;FreezeScheduleControlled=$false}
-$log=Join-Path $LogDirectory ($env:COMPUTERNAME+'-15_Sunday_Update_Closeout-'+$start.ToString('yyyyMMdd-HHmmss')+'.log')
-function Log([string]$Text){$line=(Get-Date -Format s)+' '+$Text;$line|Add-Content -LiteralPath $log -Encoding UTF8;Write-Host $line}
+$start=Get-Date;$result=[ordered]@{ComputerName=$env:COMPUTERNAME;ScriptVersion='1.1.7';StartTime=$start.ToString('o');Status='Running';ReadyToFreeze=$false;RemainingUpdates=$null;RebootRequired=$null;FailureMessage=$null;FreezeScheduleControlled=$false;ForceRequested=[bool]$Force}
+$logRunId=[guid]::NewGuid().ToString('N')
+$log=Join-Path $LogDirectory ($env:COMPUTERNAME+'-15_Sunday_Update_Closeout-'+$start.ToString('yyyyMMdd-HHmmss')+'-'+$PID+'-'+$logRunId+'.log')
+function Log([string]$Text){
+ $line=(Get-Date -Format s)+' '+$Text
+ # Shared append allows log readers; unique names prevent separate runs colliding.
+ $bytes=([System.Text.UTF8Encoding]::new($false)).GetBytes($line+[Environment]::NewLine)
+ for($attempt=1;$attempt -le 5;$attempt++){
+  $stream=$null
+  try {
+   $stream=[System.IO.File]::Open($log,[System.IO.FileMode]::Append,[System.IO.FileAccess]::Write,[System.IO.FileShare]::ReadWrite)
+   $stream.Write($bytes,0,$bytes.Length)
+   break
+  } catch [System.IO.IOException] {
+   if($attempt -eq 5){throw}
+   Start-Sleep -Milliseconds 200
+  } finally {
+   if($null -ne $stream){$stream.Dispose()}
+  }
+ }
+ Write-Host $line
+}
 function Test-Window {
  $now=Get-Date
- if($now.DayOfWeek -ne 'Sunday' -or $now.TimeOfDay -ge [timespan]'20:45:00'){throw 'Outside Sunday closeout window; no update or reboot action permitted.'}
+ if(!$Force -and ($now.DayOfWeek -ne 'Sunday' -or $now.TimeOfDay -ge [timespan]'20:45:00')){throw 'Outside Sunday closeout window; no update or reboot action permitted.'}
  $df=@(Get-CimInstance Win32_Service -ErrorAction Stop|Where-Object Name -in @('DFServ','DeepFrz'))
  $driver=@(Get-CimInstance Win32_SystemDriver -ErrorAction Stop|Where-Object Name -match '^(DfDiskLo|DeepFrz)')
  if($df.Count -or $driver.Count){
@@ -29,13 +53,107 @@ function Run-Script([string]$Name,[string[]]$Extra=@()){
  $path=Join-Path $ScriptsRoot $Name
  if(!(Test-Path -LiteralPath $path)){throw "Missing script: $path"}
  $exe=Join-Path $env:WINDIR 'System32\WindowsPowerShell\v1.0\powershell.exe'
- & $exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $path @Extra | Out-Host
+ # Forward -Force only when the actual child script declares that parameter.
+ # Child scripts retain their own implementation-specific safeguards.
+ $childArguments=@($Extra)
+ if($Force){
+  $tokens=$null;$parseErrors=$null
+  $ast=[System.Management.Automation.Language.Parser]::ParseFile($path,[ref]$tokens,[ref]$parseErrors)
+  if($parseErrors.Count -gt 0){throw "Child script syntax errors: $Name"}
+  $declaresForce=$false
+  if($ast.ParamBlock){
+   $declaresForce=@($ast.ParamBlock.Parameters | Where-Object {$_.Name.VariablePath.UserPath -ieq 'Force'}).Count -gt 0
+  }
+  if($declaresForce -and $childArguments -notcontains '-Force'){$childArguments+='-Force'}
+  Log ("Manual Force invocation: child={0}; ForceForwarded={1}" -f $Name,$declaresForce)
+ }
+ & $exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $path @childArguments | Out-Host
  $code=$LASTEXITCODE;Log "$Name exit=$code";return $code
 }
 function Servicing-RebootRequired {
  $system=New-Object -ComObject Microsoft.Update.SystemInfo
  return ([bool]$system.RebootRequired -or (Test-Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending') -or (Test-Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired'))
 }
+
+function Get-CloseoutServicingSample {
+ Test-Window
+ $session=New-Object -ComObject Microsoft.Update.Session
+ $installer=$session.CreateUpdateInstaller()
+ $busy=[bool]$installer.IsBusy
+ $reboot=Servicing-RebootRequired
+ $workers=@(Get-CimInstance Win32_Process -Filter "Name='TiWorker.exe' OR Name='TrustedInstaller.exe' OR Name='MoUsoCoreWorker.exe'" -OperationTimeoutSec 10 -ErrorAction Stop | ForEach-Object {
+  [pscustomobject]@{
+   Name=[string]$_.Name;Id=[int]$_.ProcessId
+   Created=([datetime]$_.CreationDate).ToUniversalTime().ToString('o')
+   CpuTicks=([decimal]$_.KernelModeTime+[decimal]$_.UserModeTime)
+   ReadBytes=[decimal]$_.ReadTransferCount;WriteBytes=[decimal]$_.WriteTransferCount
+   OtherBytes=[decimal]$_.OtherTransferCount
+  }
+ })
+ $cbsPath=Join-Path $env:WINDIR 'Logs\CBS\CBS.log'
+ $cbsError=$null;$stamp=$null;$length=$null;$finalized=$false
+ try {
+  $item=Get-Item -LiteralPath $cbsPath -ErrorAction Stop
+  $stamp=$item.LastWriteTimeUtc.ToString('o');$length=$item.Length
+  $tail=@(Get-Content -LiteralPath $cbsPath -Tail 80 -ErrorAction Stop)
+  # A finalized session must follow the latest session initialization in this tail.
+  $sessionLines=@($tail | Where-Object {$_ -match '(?i)Session:.*(initialized|finalized)'})
+  if($sessionLines.Count){
+   $finalized=([string]$sessionLines[-1] -match '(?i)finalized\. Reboot required: no, RepairNeeded: no.*0x00000000')
+  }
+ } catch {$cbsError=$_.Exception.Message}
+ [pscustomobject]@{
+  CheckedUtc=[datetime]::UtcNow.ToString('o');InstallerBusy=$busy;RebootRequired=$reboot
+  Workers=[object[]]$workers;CbsLastWriteUtc=$stamp;CbsLength=$length
+  CbsFinalizedSuccessfully=$finalized;CbsQueryError=$cbsError
+ }
+}
+function Wait-CloseoutServicing {
+ # Maximum two minutes; three consecutive quiet 15-second intervals required.
+ # This is a conservative heuristic, not an exclusive CBS servicing lock.
+ $samples=New-Object 'System.Collections.Generic.List[object]'
+ $previous=$null;$quiet=0;$ready=$false;$reason='AssessmentTimedOut';$errorText=$null
+ $deadline=(Get-Date).AddSeconds(120)
+ try {
+  while((Get-Date) -lt $deadline){
+   $sample=Get-CloseoutServicingSample
+   [void]$samples.Add($sample)
+   if($sample.RebootRequired){$reason='RebootRequired';break}
+   if($sample.InstallerBusy){$quiet=0;$reason='UpdateInstallerBusy'}
+   elseif($sample.Workers.Count -eq 0){$ready=$true;$reason='NoServicingWorkers';break}
+   else {
+    $stable=$null -ne $previous -and -not $previous.InstallerBusy -and
+     $sample.Workers.Count -eq $previous.Workers.Count -and
+     $null -eq $sample.CbsQueryError -and $null -eq $previous.CbsQueryError -and
+     $sample.CbsLastWriteUtc -eq $previous.CbsLastWriteUtc -and
+     $sample.CbsLength -eq $previous.CbsLength -and $sample.CbsFinalizedSuccessfully
+    if($stable){
+     foreach($worker in $sample.Workers){
+      $old=@($previous.Workers | Where-Object {$_.Id -eq $worker.Id -and $_.Created -eq $worker.Created})
+      if($old.Count -ne 1 -or $old[0].CpuTicks -ne $worker.CpuTicks -or
+       $old[0].ReadBytes -ne $worker.ReadBytes -or $old[0].WriteBytes -ne $worker.WriteBytes -or
+       $old[0].OtherBytes -ne $worker.OtherBytes){$stable=$false;break}
+     }
+    }
+    if($stable){$quiet++}else{$quiet=0}
+    $reason='WorkersPresentActivityOrCompletionUnconfirmed'
+    if($quiet -ge 3){$ready=$true;$reason='IdleWorkersAfterFinalizedCbsSession';break}
+   }
+   Log ("Servicing check: Busy={0}; Workers={1}; QuietIntervals={2}; CBSFinalized={3}" -f $sample.InstallerBusy,($sample.Workers.Name -join ','),$quiet,$sample.CbsFinalizedSuccessfully)
+   $previous=$sample
+   Start-Sleep -Seconds 15
+  }
+  Test-Window
+ } catch {$ready=$false;$reason='AssessmentFailedOrWindowClosed';$errorText=$_.Exception.Message}
+ $assessment=[pscustomobject]@{
+  Ready=$ready;Reason=$reason;Error=$errorText;QuietIntervals=$quiet
+  Samples=[object[]]$samples.ToArray()
+  Limitation='Observational checks do not acquire an exclusive servicing lock.'
+ }
+ Log ("Servicing assessment: Ready={0}; Reason={1}; Evidence={2}" -f $ready,$reason,($assessment | ConvertTo-Json -Depth 6 -Compress))
+ return $assessment
+}
+
 # Open explicitly with read/write/delete sharing so Elastic readers can coexist.
 # An exclusive external lock still requires retries or a separate durable spool file.
 function Write-CloseoutTelemetry {
@@ -78,7 +196,8 @@ function Test-SecureBootPolicyHost($Policy,[string]$List,[string]$Computer) {
  return @($Policy.$List | Where-Object { [string]$_ -ieq $Computer }).Count -gt 0
 }
 function Assert-SecureBootWindow($Policy,[switch]$NewUpdate) {
- Test-Window # Includes live DFC /ISFROZEN proof, not just a calendar assumption.
+ Test-Window # Includes live DFC /ISFROZEN proof.
+ if((Get-Date).DayOfWeek -ne 'Sunday'){throw 'Secure Boot certificate remediation remains restricted to Sunday, including manual -Force closeout.'}
  $now=Get-Date
  $cutoff=[timespan]::Parse([string]$Policy.RebootCutoff)
  if($now.AddSeconds(60).TimeOfDay -ge $cutoff){throw 'Secure Boot reboot cutoff reached; manual follow-up required.'}
@@ -145,7 +264,7 @@ function Request-SecureBootReboot($State,$Policy,[string]$StatePath) {
  return 'RebootRequested'
 }
 function Invoke-SecureBootMaintenance {
- $report=[ordered]@{EventType='maintenance.secure_boot';ComputerName=$env:COMPUTERNAME;ScriptName='15_Sunday_Update_Closeout.ps1';ScriptVersion='1.1.4';'@timestamp'=(Get-Date).ToUniversalTime().ToString('o');Status='Checking';Ready=$false;Message=$null;Snapshot=$null;BitLockerProtection=$null;DeepFreezeVersion=$null;Phase=$null;RebootsRequested=0;FreezeScheduleControlled=$false}
+ $report=[ordered]@{EventType='maintenance.secure_boot';ComputerName=$env:COMPUTERNAME;ScriptName='15_Sunday_Update_Closeout.ps1';ScriptVersion='1.1.7';'@timestamp'=(Get-Date).ToUniversalTime().ToString('o');Status='Checking';Ready=$false;Message=$null;Snapshot=$null;BitLockerProtection=$null;DeepFreezeVersion=$null;Phase=$null;RebootsRequested=0;FreezeScheduleControlled=$false}
  $state=$null;$statePath=$null;$held=$false;$mutex=$null
  try{
   if(![Environment]::Is64BitProcess -and [Environment]::Is64BitOperatingSystem){throw 'Run the coordinator in native 64-bit Windows PowerShell.'}
@@ -295,6 +414,7 @@ if($SecureBootOnly -or $SecureBootAuditOnly -or $SecureBootStartup){
 }
 
 try{
+ if($Force){Log 'Manual -Force: closeout day/time restriction bypassed; thaw checks remain mandatory. Secure Boot retains its own policy/window safeguards. Child -Force is forwarded only if declared.'}
  Test-Window
  # Early passes install; the final pass performs an independent scan and closeout.
  if(!$VerifyOnly){
@@ -318,12 +438,27 @@ try{
   $result.RemainingUpdates=$scan.Updates.Count
   Test-Window
   $result.RebootRequired=Servicing-RebootRequired
+  $servicing=$null
+  if($result.RemainingUpdates -eq 0 -and !$result.RebootRequired){
+   $servicing=Wait-CloseoutServicing
+   $result['ServicingAssessment']=$servicing
+   if($servicing.Samples.Count){$result.RebootRequired=[bool]$servicing.Samples[-1].RebootRequired}
+  }
   if($result.RemainingUpdates -gt 0){$result.Status='UpdatesRemaining'}
   elseif($result.RebootRequired){$result.Status='RebootStillRequired'}
-  elseif(@(Get-Process -Name @('TiWorker','TrustedInstaller','MoUsoCoreWorker') -ErrorAction SilentlyContinue).Count -gt 0){$result.Status='ServicingProcessesPresent_Review'}
+  elseif(!$servicing -or !$servicing.Ready){
+   $result.Status='ServicingProcessesPresent_Review'
+   $result.FailureMessage=if($servicing){$servicing.Reason+'; '+$servicing.Error}else{'Servicing assessment unavailable.'}
+  }
   elseif(!$VerifyOnly){$result.Status='UpdatePassVerified_NoPendingReboot'}
   else{
+   Test-Window
+   if(Servicing-RebootRequired){$result.Status='RebootStillRequired';throw 'Reboot became required before disabling update services.'}
+   $finalSession=New-Object -ComObject Microsoft.Update.Session
+   if($finalSession.CreateUpdateInstaller().IsBusy){throw 'Update installer became busy before disabling update services.'}
+   $result['DisableServicesAttempted']=$true
    $disable=Run-Script '09_Disable_Windows_Update_Services.ps1'
+   $result['DisableServicesExitCode']=$disable
    if($disable -notin @(0,3010)){throw '09 closeout failed.'}
    $wrong=@(Get-CimInstance Win32_Service -ErrorAction Stop|Where-Object {$_.Name -in @('wuauserv','UsoSvc','BITS') -and ($_.StartMode -ne 'Disabled' -or $_.State -ne 'Stopped')})
    if($wrong.Count){throw 'Update-service closeout verification failed.'}
@@ -335,7 +470,7 @@ try{
 }catch{if($result.Status -ne 'RebootStillRequired'){$result.Status='VerificationFailed'};$result.FailureMessage=$_.Exception.Message;Log $_.Exception.Message}
 finally{
  $result['EndTime']=(Get-Date).ToString('o')
- $result|ConvertTo-Json -Depth 6|Set-Content (Join-Path $LogDirectory '15_Sunday_Update_Closeout.latest.json') -Encoding UTF8
+ $result|ConvertTo-Json -Depth 10|Set-Content (Join-Path $LogDirectory '15_Sunday_Update_Closeout.latest.json') -Encoding UTF8
  $event=[ordered]@{EventType='maintenance.sunday_update_closeout';Timestamp=(Get-Date).ToUniversalTime().ToString('o');ComputerName=$env:COMPUTERNAME;ScriptName='15_Sunday_Update_Closeout.ps1';Details=$result}
  try{$null=Write-CloseoutTelemetry -Event $event -Directory $LogDirectory}catch{Write-Warning ('Closeout telemetry write failed: '+$_.Exception.Message)}
 }

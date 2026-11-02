@@ -1,0 +1,113 @@
+CURRENT PUBLIC PACKAGE NOTES — 2026-11-02
+Runtime Watch-RebootRecovery.ps1: 1.5.4. Read the root README first.
+Configured credentials are blank in this public package. Configure only in a
+restricted private deployment copy; never commit a DFC password/enrollment token.
+AutomaticFreezeAfterVerifiedRepair is TRUE in the supplied runtime: verified
+recovery may request one final frozen restart, in addition to the bounded thaw
+and optional repair restart. Older text below describing a mandatory thawed end
+state or a two-restart total is superseded by this note and the current code.
+Review production script hash pins explicitly; public sanitization changes bytes.
+Configure-RecoveryShare.py is referenced in supplied notes but was NOT included.
+New-RebootRecoveryShare.ps1 is the supplied Windows share setup helper.
+The root RepairScreen.psm1 carries newer version metadata than this folder copy.
+Offline tests and old validation text do not establish live Windows validation.
+
+--- Supplied historical instructions follow ---
+
+Compton watchdog deployment integration - 2026-10-29
+00 updater 4.12.3 / manifest updater 2.4.2 / watchdog 1.5.4
+
+1. Extract this ZIP into a working folder. Edit Watch-RebootRecovery.ps1 and
+   enter the Deep Freeze command-line password in its top settings section.
+   PersistentStateRoot is prefilled as \\SERVER\ComptonRebootRecovery$.
+   Keep source and local script access restricted to trusted administrators
+   and SYSTEM because the configured script contains the command-line password.
+
+2. Run Configure-RecoveryShare.py with sudo on Elastic first (see below).
+   SYSTEM now creates its computer-named folder through SMB when absent.
+   Owner SID must match COMPTON\COMPUTER$ before any state is trusted.
+   First-time creation must run as SYSTEM, not as your administrator account.
+   The server script migrates existing pilot 03/08 folder owners without
+   deleting data. Other pre-existing root-owned folders need individual review.
+
+3. Copy these FIVE runtime files into the ROOT of \\SERVER\DeploymentShare:
+   00_Update-Scripts-FromShare.ps1
+   Update-DeploymentManifest.ps1
+   Watch-RebootRecovery.ps1
+   RepairScreen.psm1
+   Show-RecoveryNotice.ps1
+   Do not put the watchdog files in a nested folder for this updater version.
+   Tests can remain in your extracted working folder.
+
+4. Validate on Windows PowerShell 5.1 before publishing:
+   & {
+       $files = @('00_Update-Scripts-FromShare.ps1','Update-DeploymentManifest.ps1',
+           'Watch-RebootRecovery.ps1','RepairScreen.psm1','Show-RecoveryNotice.ps1')
+       foreach ($name in $files) {
+           $tokens=$null; $parseErrors=$null
+           [void][System.Management.Automation.Language.Parser]::ParseFile(
+               (Join-Path $PWD $name),[ref]$tokens,[ref]$parseErrors)
+           if ($parseErrors.Count) {throw ($name+': '+($parseErrors.Message -join '; '))}
+           Write-Host ('PASS: '+$name)
+       }
+   }
+   .\Test-RebootRecoveryWatchdog.ps1
+   .\Test-RepairScreen.ps1
+
+5. Regenerate the manifest AFTER configuring the password and copying files:
+   & '\\SERVER\DeploymentShare\Update-DeploymentManifest.ps1'
+   Keep approved 07 and 09 versions on the share; their existing watchdog
+   SHA256 approvals remain unchanged. This package approves the included
+   00 updater hash. If 00, 07 or 09 changes later, review and update the
+   corresponding watchdog hash allowlist before enabling that replacement.
+
+6. Existing pilot 08: run while THAWED with no active recovery, using elevated PowerShell:
+   & '\\SERVER\DeploymentShare\00_Update-Scripts-FromShare.ps1'
+   Get-ScheduledTask -TaskName 'Compton. Reboot Loop Recovery Watchdog',
+       'Compton. Recovery Notice at Startup' |
+       Select-Object TaskName,State
+   Get-Content 'C:\Logs\RebootRecovery.latest.json' -Raw
+
+7. When verified, normal Sunday 00 runs deploy the three files into C:\Scripts
+   and invoke watchdog -Deploy to install into protected ProgramData and
+   register the one-minute watchdog plus startup notice task.
+   Installation does NOT call -Force, thaw, freeze or reboot. The installed
+   watchdog begins its normal checks on its scheduled triggers.
+   -Deploy defers for a running watchdog, missing configuration, unavailable
+   DFC state, frozen computer, inaccessible receipt storage, or an active/
+   latched incident. Existing protected installation/receipt is retained.
+   A deferred installation is a warning in the 00 updater log, not a fatal
+   updater failure that would stop Script 01. Retry on a later thawed 00 run.
+   Completed receipts and cooldown are preserved; deployment does not archive
+   incidents or reset attempt budgets. Deployment during recovery is deferred.
+
+Validation performed here: static syntax for watchdog, module, startup helper,
+manifest updater and tests; catalog consistency and exact 00 hash approval.
+00's pre-existing Sort-Object syntax exceeds this environment's static parser;
+new deployment function parses separately. No Windows/DFC/SMB live tests here.
+
+SERVER SETUP (Linux server only; no Python required on endpoints)
+Copy Configure-RecoveryShare.py to /home/dswaney on 10.2.12.4, then:
+  sudo python3 /home/dswaney/Configure-RecoveryShare.py
+The script finds exactly one existing share section under /etc/samba/*.conf,
+backs it up plus root/pilot ACLs under /root/recovery-share-backup-*, changes
+only that share, validates testparm and reloads Samba without a service restart.
+
+Root Domain Computers permission is write/traverse without listing. Sticky bit
+blocks deleting/renaming folders owned by other accounts. Default child ACLs
+allow creator owner plus dswaney and Domain Admins, with no broad computer
+group grant. Administrators can use sudo on Linux for root-level cleanup.
+Existing child contents and permissions are not recursively rewritten.
+A name squatter can deny service by reserving another computer's folder name,
+but the ownership checks refuse to trust that folder. Investigate owner mismatch.
+
+For a NEW pilot, copy the runtime files and run 00 through Action1 as SYSTEM
+while thawed. Check the Installed watchdog event and verify the new folder's
+owner on Elastic with: sudo getfacl -p /srv/compton-reboot-recovery/COMPUTERNAME
+Then test that another computer account cannot read that folder.
+
+After updating these watchdog files on the source share, regenerate the manifest
+again. Password is intentionally blank in the package; configure it before
+regenerating the manifest. The included 00 hash approval is unchanged.
+Static parsing passed for the modified watchdog and startup helper; Linux
+setup compiled. No live Samba ownership or Windows SYSTEM tests performed here.

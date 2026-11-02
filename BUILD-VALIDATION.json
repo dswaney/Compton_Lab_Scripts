@@ -1,55 +1,33 @@
 {
-  "PackageVersion": "3.0.22",
-  "BaseCommit": "2f7574cfff11fd4011072894061b39d57eada601",
-  "PowerShellParserExecuted": false,
-  "PowerShellParserVersion": null,
+  "PackageVersion": "3.0.23",
+  "BaseCommit": "1f4dccee52d4e40a036cc7e84cd26cb7c71cdc5e",
+  "PowerShellParserExecuted": true,
+  "PowerShellParserVersion": "7.5.3 (Linux; parsing only)",
+  "PowerShellFilesParsed": 41,
+  "PowerShellParserErrors": 0,
   "RequiresWindowsPowerShellValidation": true,
-  "GrammarParser": "tree-sitter-powershell (syntax tree only; does not execute PowerShell)",
   "StructuralChecks": [
-    "Three changed PowerShell files pass tree-sitter grammar parsing (not native PowerShell execution)",
-    "ManualForce contains one reboot call and no update search, install, download, cleanup or retry-loop call sites; ManualResume branch contains no reboot call",
-    "ManualForce uses Script09 closeout; schema3 replaces old multi-pass state; verification removes its task and cannot request another reboot",
-    "Ordinary Script07 checks thawed state and Sunday01:00-20:45 with countdown cutoff before restart",
-    "Script15 calls06 without NoReboot and stops on3010, preventing its duplicate07 request",
-    "README switch coverage, manifest SHA256 and tracked-file checksum inventory verified",
-    "No registrar, policy, or Sunday schedule changes"
+    "All 41 active/support PowerShell files parsed without execution",
+    "Manifest hashes recomputed for final public files; updater and builder catalogs preserve component-store repair helper",
+    "Both closeout task action checks and existing Edge remediation-specific lock retained",
+    "Public configured DFC password and Elastic enrollment token removed, including embedded technician bundle; component hashes rebuilt",
+    "JSON and embedded bundle integrity checked; SHA256 inventory regenerated",
+    "Unchanged same-version scripts retained; no firmware rollout or Sunday timetable change"
   ],
-  "FunctionalTests": {
-    "LiveWindowsUpdateRebootExecuted": false,
-    "CopilotUserConfirmed": "User confirmed module1.2.3 resolved uninstall registry cast failure on affected endpoint"
+  "OfflineTests": {
+    "RepairScreen": "16 assertions passed on PowerShell 7.5.3 Linux using in-memory registry backend",
+    "Watchdog": "18 pure helper assertions passed; subsequent native process test cannot run because it expects Windows powershell.exe. Full test suite not passed.",
+    "LiveWindowsOperationsExecuted": false
   },
-  "PendingReconciliation": [
-    "Native Windows PowerShell5.1 parsing on final bytes",
-    "Attended single-reboot manual repair and SYSTEM verification on Windows, including persistent flags and closeout failure",
-    "Scheduled06 automatic reboot and15 handoff pilot",
-    "External freeze scheduling remains independent of readiness",
-    "Ordinary07 servicing-only mode is not persisted across startup"
+  "PendingValidation": [
+    "Windows PowerShell 5.1 parser and SYSTEM endpoint pilot",
+    "Live DFC/share ACLs/reboot/refreeze/display restoration validation",
+    "Private production configuration and reviewed production watchdog hash pins",
+    "Missing Configure-RecoveryShare.py is not part of supplied archive"
   ],
-  "PreviousReleaseValidation": {
-    "PackageVersion": "3.0.20",
-    "BaseCommit": "a0d39170d887512c6cf976f47b1b0207c566d513",
-    "PowerShellParserExecuted": true,
-    "PowerShellParserVersion": "7.5.3 (Linux)",
-    "RequiresWindowsPowerShellValidation": true,
-    "StructuralChecks": [
-      "All active root PowerShell files parsed without execution",
-      "Manifest SHA256 values recomputed against all 23 repository managed files",
-      "Updater helper approval and both closeout verification actions preserved",
-      "Fixed periodic action, six Mon-Sat triggers and explicit policy entry present",
-      "Both uploaded Script 02 files identical; hr-ib2130 exclusion preserved; runtime version aligned",
-      "Secure Boot remediation lists remain empty; no automatic decryption enabled"
-    ],
-    "FunctionalTests": {
-      "SecureBootOfflineTestsPassed": 23,
-      "WindowsAuditUserEvidence": "SSC-216-007 SYSTEM audit: AlreadyUpdated; firmware verified; BitLocker On; event observed in Elastic"
-    },
-    "PendingReconciliation": [
-      "Windows PowerShell 5.1 parsing on final repository bytes",
-      "Attended certificate remediation/reboot/resume/frozen-boot pilot",
-      "External freeze schedule is not controlled by readiness",
-      "Script 07 startup continuation thaw/cutoff and servicing-mode persistence",
-      "Direct coordinator children versus ordinary maintenance global locking",
-      "Pending telemetry events require explicit forwarding if shared append remains locked"
-    ]
-  }
+  "KnownLimitations": [
+    "Script05 still uses recommendation disappearance as install verification",
+    "Script14 built-in task filtering and historical recovered-service classification remain follow-up work",
+    "Script15 direct-child locking and ordinary Script07 servicing-only persistence remain follow-up work"
+  ]
 }

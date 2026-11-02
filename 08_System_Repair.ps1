@@ -1,8 +1,9 @@
 # =====================================================================
 # ScriptName: 08_System_Repair.ps1
-# ScriptVersion: 4.13.0
-# LastUpdated: 2026-10-12
-# Changes: v4.13.0 adds read-only shell handler/server validation, thumbnail
+# ScriptVersion: 4.14.0
+# LastUpdated: 2026-10-28
+# Changes: v4.14.0 adds >75% utilization findings and single-pass pre-cleanup disk diagnostics.
+# Previous: v4.13.0 adds read-only shell handler/server validation, thumbnail
 #          and preview inventories, and Explorer fault-module correlation.
 #          Machine registry scope and unavailable/truncated checks are explicit.
 #          No handler deletion, permission edits or Explorer restarts.
@@ -78,6 +79,8 @@
 
 [CmdletBinding()]
 param(
+    [ValidateRange(1,99)][int]$DiskWarningPercent = 75,
+    [ValidateRange(10,3600)][int]$DiskDiagnosticTimeoutSeconds = 300,
     [ValidateRange(2,30)][int]$PerformanceSampleSeconds = 10,
     [ValidateRange(1,30)][int]$DiagnosticDaysBack = 7,
     [switch]$AutoRepairOnDetection = $false,
@@ -98,13 +101,13 @@ param(
     [string]$HpImageAssistantLocalPath = 'C:\ProgramData\SystemRepair\HPImageAssistant',
     [switch]$AllowComponentStoreEscalation = $false,
     [string]$ApprovalStatusUrl = 'http://n8n.compton.edu:5678/webhook/script08/approval-status',
-    [string]$ApprovalApiKeyPath = '\\filesvr\labscripts\Installers\approval-key.txt',
+    [string]$ApprovalApiKeyPath = '\\SERVER\DeploymentShare\Installers\approval-key.txt',
     [ValidateRange(1,120)][int]$ApprovalLookupTimeoutSeconds = 15,
-    [string]$ComponentStoreRepairScriptPath = '\\filesvr\labscripts\Repair-Windows-ComponentStore.ps1',
+    [string]$ComponentStoreRepairScriptPath = '\\SERVER\DeploymentShare\Repair-Windows-ComponentStore.ps1',
     [string]$ComponentStoreRepairLocalPath = 'C:\ProgramData\Compton\SystemRepair\Repair-Windows-ComponentStore.ps1',
-    [string]$ComponentStoreImagePath = '\\filesvr\labscripts\Installers\25H2\sources\install.wim',
-    [string]$ComponentStoreSetupMediaPath = '\\filesvr\labscripts\Installers\25H2',
-    [string]$ComponentStoreAdkPath = '\\filesvr\labscripts\Installers\ADK\Deployment Tools',
+    [string]$ComponentStoreImagePath = '\\SERVER\DeploymentShare\Installers\25H2\sources\install.wim',
+    [string]$ComponentStoreSetupMediaPath = '\\SERVER\DeploymentShare\Installers\25H2',
+    [string]$ComponentStoreAdkPath = '\\SERVER\DeploymentShare\Installers\ADK\Deployment Tools',
     [switch]$AllowCopilotRemoval = $false,
     [switch]$AggressiveCleanup = $false,
     [switch]$ClearEventLogs = $false,
@@ -120,7 +123,7 @@ param(
 $ErrorActionPreference = 'Stop'
 
 $script:ScriptName = '08_System_Repair.ps1'
-$script:ScriptVersion = '4.13.0'
+$script:ScriptVersion = '4.14.0'
 $script:RunId = [guid]::NewGuid().Guid
 $script:TelemetryNdjsonPath = Join-Path $LogDirectory 'Maintenance-Telemetry.ndjson'
 $script:LatestTelemetryPath = Join-Path $LogDirectory '08_System_Repair.latest.json'
@@ -2478,89 +2481,156 @@ function Get-LargestChildDirectories {
     )
 }
 
-function Invoke-DiskUsageInventory {
+function Get-DiskUsageDiagnostic {
     [CmdletBinding()]
-    param([ValidateRange(1,100)][int]$TopDirectories = 20)
-
-    Write-Log -Message "Collecting pre-cleanup disk-usage inventory. Top $TopDirectories child directories per root will be recorded."
-
-    $inventoryRoots = @(
-        'C:\',
-        'C:\Windows',
-        'C:\ProgramData',
-        'C:\Users'
+    param(
+        [Parameter(Mandatory)][string]$DeviceId,
+        [ValidateRange(10,3600)][int]$TimeoutSeconds = 300,
+        [ValidateRange(1,100)][int]$Top = 10,
+        [long]$VolumeSizeBytes = 0,
+        [long]$VolumeFreeBytes = 0,
+        [int]$WarningThresholdPercent = 75
     )
-
-    foreach ($root in $inventoryRoots) {
-        Write-Log -Message "Scanning disk usage under: $root"
-
-        try {
-            $largest = @(Get-LargestChildDirectories -RootPath $root -Top $TopDirectories)
-
-            foreach ($item in $largest) {
-                Write-Log -Message ("Disk usage: {0} | {1}" -f $item.SizeReadable, $item.Directory)
+    # Single traversal, no junction following, no permission changes or cleanup.
+    $started = [datetime]::UtcNow
+    $timer = [Diagnostics.Stopwatch]::StartNew()
+    $root = $DeviceId.TrimEnd('\') + '\'
+    $sizes = @{}
+    $pending = New-Object 'System.Collections.Generic.Stack[string]'
+    $pending.Push($root)
+    $files = New-Object 'System.Collections.Generic.List[object]'
+    $errors = New-Object 'System.Collections.Generic.List[string]'
+    $skips = New-Object 'System.Collections.Generic.List[string]'
+    [long]$fileCount = 0
+    [long]$errorCount = 0
+    [long]$skipCount = 0
+    $truncated = $false
+    while ($pending.Count -gt 0) {
+        if ($timer.Elapsed.TotalSeconds -ge $TimeoutSeconds -or $sizes.Count -ge 200000) { $truncated = $true; break }
+        $path = $pending.Pop()
+        $sizes[$path] = [long]0
+        # Stream one directory instead of materializing the whole volume in memory.
+        Get-ChildItem -LiteralPath $path -Force -ErrorAction Continue 2>&1 | ForEach-Object {
+            if ($_ -is [System.Management.Automation.ErrorRecord]) {
+                $errorCount++
+                if ($errors.Count -lt 30) { $errors.Add($_.ToString()) }
             }
-
-            Add-DetailedResult `
-                -Step ('DiskUsageInventory:' + $root) `
-                -Status 'Info' `
-                -Message "Collected top directory usage for $root" `
-                -Data @{
-                    RootPath = $root
-                    TopCount = $TopDirectories
-                    Results  = @($largest | ForEach-Object { $_ })
+            elseif ($timer.Elapsed.TotalSeconds -ge $TimeoutSeconds) { $truncated = $true }
+            elseif (($_.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+                $skipCount++
+                if ($skips.Count -lt 30) { $skips.Add($_.FullName) }
+            }
+            elseif ($_.PSIsContainer) { $pending.Push($_.FullName) }
+            else {
+                $fileCount++
+                $sizes[$path] += [long]$_.Length
+                $files.Add([pscustomobject]@{Path=$_.FullName;Bytes=[long]$_.Length;GB=[math]::Round($_.Length/1GB,3)})
+                if ($files.Count -ge 1000) {
+                    $keep = @($files | Sort-Object Bytes -Descending | Select-Object -First 30)
+                    $files.Clear(); $files.AddRange([object[]]$keep)
                 }
-        }
-        catch {
-            Write-Log -Level WARNING -Message "Disk-usage inventory failed for $root : $($_.Exception.Message)"
-            Add-DetailedResult `
-                -Step ('DiskUsageInventory:' + $root) `
-                -Status 'Warning' `
-                -Message "Disk-usage inventory failed for $root" `
-                -Data @{
-                    RootPath = $root
-                    Error    = $_.Exception.Message
-                }
+            }
         }
     }
-
+    # Each parent total includes its descendants. Nested rows must not be added.
+    foreach ($path in @($sizes.Keys | Sort-Object Length -Descending)) {
+        if ($path -eq $root) { continue }
+        $parent = [IO.Directory]::GetParent($path).FullName
+        if ($parent.TrimEnd('\') -eq $root.TrimEnd('\')) { $parent = $root }
+        if ($sizes.ContainsKey($parent)) { $sizes[$parent] += $sizes[$path] }
+    }
+    $rows = @(
+        foreach ($path in $sizes.Keys) {
+            if ($path -eq $root) { continue }
+            [pscustomobject]@{Path=$path;Bytes=$sizes[$path];GB=[math]::Round($sizes[$path]/1GB,3)}
+        }
+    ) | Sort-Object Bytes -Descending
+    $topLevel = @($rows | Where-Object { [IO.Directory]::GetParent($_.Path).FullName.TrimEnd('\') -eq $root.TrimEnd('\') } | Select-Object -First $Top)
+    $breakdown = @(
+        foreach ($name in @('Windows','ProgramData','Users','Program Files','Program Files (x86)')) {
+            $branch = Join-Path $root $name
+            $rows | Where-Object { [IO.Directory]::GetParent($_.Path).FullName.TrimEnd('\') -eq $branch.TrimEnd('\') } | Select-Object -First $Top
+        }
+    )
+    $rootFiles = @()
     try {
-        $systemDrive = Get-CimInstance Win32_LogicalDisk -Filter "DeviceID='C:'" -ErrorAction Stop
-
-        if ($systemDrive) {
-            $size = [int64]$systemDrive.Size
-            $free = [int64]$systemDrive.FreeSpace
-            $used = [int64]($size - $free)
-            $freePercent = if ($size -gt 0) { [math]::Round(($free / $size) * 100, 2) } else { 0 }
-
-            Write-Log -Message ("C: drive before cleanup: Used={0}; Free={1}; FreePercent={2}%" -f `
-                (Convert-BytesToReadableSize -Bytes $used),
-                (Convert-BytesToReadableSize -Bytes $free),
-                $freePercent)
-
-            Add-DetailedResult `
-                -Step 'DiskUsageInventory:DriveSummary' `
-                -Status 'Info' `
-                -Message 'Captured pre-cleanup system drive usage.' `
-                -Data @{
-                    DeviceID      = 'C:'
-                    SizeBytes     = $size
-                    UsedBytes     = $used
-                    FreeBytes     = $free
-                    SizeReadable  = Convert-BytesToReadableSize -Bytes $size
-                    UsedReadable  = Convert-BytesToReadableSize -Bytes $used
-                    FreeReadable  = Convert-BytesToReadableSize -Bytes $free
-                    FreePercent   = $freePercent
-                }
-        }
+        $rootFiles = @(Get-ChildItem -LiteralPath $root -Force -File -ErrorAction Stop |
+            Where-Object { ($_.Attributes -band [IO.FileAttributes]::ReparsePoint) -eq 0 } |
+            Sort-Object Length -Descending | Select-Object -First 20 |
+            ForEach-Object { [pscustomobject]@{Path=$_.FullName;Bytes=[long]$_.Length;GB=[math]::Round($_.Length/1GB,3)} })
+    } catch { $errorCount++; if ($errors.Count -lt 30) { $errors.Add($_.ToString()) } }
+    $shadow = @()
+    $shadowStatus = 'Collected'
+    $shadowError = $null
+    try {
+        $volume = Get-CimInstance Win32_Volume -Filter "DriveLetter='$DeviceId'" -OperationTimeoutSec 15 -ErrorAction Stop
+        if ($null -eq $volume) { throw 'Volume identity unavailable for shadow-storage correlation.' }
+        $shadow = @(Get-CimInstance Win32_ShadowStorage -OperationTimeoutSec 15 -ErrorAction Stop |
+            Where-Object { $_.Volume.DeviceID -eq $volume.DeviceID -or $_.DiffVolume.DeviceID -eq $volume.DeviceID } |
+            ForEach-Object { [pscustomobject]@{SourceVolume=[string]$_.Volume.DeviceID;StorageVolume=[string]$_.DiffVolume.DeviceID;UsedBytes=$_.UsedSpace;AllocatedBytes=$_.AllocatedSpace;MaximumBytes=$_.MaxSpace} })
+    } catch { $shadowStatus = 'Unavailable'; $shadowError = $_.Exception.Message }
+    $timer.Stop()
+    $status = if ($truncated) { 'Truncated' } elseif ($errorCount -gt 0 -or $skipCount -gt 0 -or $shadowStatus -eq 'Unavailable') { 'Partial' } else { 'Completed' }
+    return [pscustomobject]@{
+        SchemaVersion=1; ComputerName=$env:COMPUTERNAME; RunId=$script:RunId; SourceScript=$script:ScriptName
+        Drive=$DeviceId; SizeBytes=$VolumeSizeBytes; FreeBytes=$VolumeFreeBytes
+        UsedPercent=$(if ($VolumeSizeBytes -gt 0) { 100.0 * ($VolumeSizeBytes - $VolumeFreeBytes) / $VolumeSizeBytes } else { $null })
+        WarningThresholdPercent=$WarningThresholdPercent
+        ThresholdExceeded=[bool]($VolumeSizeBytes -gt 0 -and (100.0 * ($VolumeSizeBytes - $VolumeFreeBytes) / $VolumeSizeBytes) -gt $WarningThresholdPercent)
+        CollectedUtc=$started.ToString('o'); CompletedUtc=[datetime]::UtcNow.ToString('o')
+        Status=$status; TimeoutSeconds=$TimeoutSeconds; DurationSeconds=[math]::Round($timer.Elapsed.TotalSeconds,2)
+        Truncated=$truncated; FilesScanned=$fileCount; DirectoriesScanned=$sizes.Count; DirectoriesPending=$pending.Count
+        ScannedLogicalBytes=$(if ($sizes.ContainsKey($root)) { $sizes[$root] } else { 0 })
+        EnumerationErrorCount=$errorCount; EnumerationErrorSamples=[string[]]$errors.ToArray()
+        SkippedReparsePointCount=$skipCount; SkippedReparsePointSamples=[string[]]$skips.ToArray()
+        TopLevelDirectories=[object[]]$topLevel; LargestDirectories=[object[]]@($rows | Select-Object -First $Top)
+        DirectoryBreakdown=[object[]]$breakdown
+        LargestFiles=[object[]]@($files | Sort-Object Bytes -Descending | Select-Object -First 30)
+        RootFiles=[object[]]$rootFiles; ShadowStorageStatus=$shadowStatus; ShadowStorageError=$shadowError; ShadowStorage=[object[]]$shadow
+        MeasurementNotes='Logical file lengths, not allocated bytes. Hard links may be counted multiple times; compressed/sparse files differ. Protected files, skipped reparse points and NTFS metadata may leave usage unaccounted for. Nested directory rows overlap. Timeout is cooperative between entries; individual filesystem operations may take longer.'
     }
-    catch {
-        Write-Log -Level WARNING -Message "Unable to capture C: drive summary before cleanup: $($_.Exception.Message)"
-    }
-
-    Write-Log -Level SUCCESS -Message 'Pre-cleanup disk-usage inventory completed.'
 }
 
+function Save-DiskUsageDiagnostic {
+    param([Parameter(Mandatory)]$Diagnostic)
+    $safeDrive = $Diagnostic.Drive.Replace(':','')
+    $prefix = [IO.Path]::GetFileNameWithoutExtension($script:ScriptName)
+    $target = Join-Path $LogDirectory ("{0}.DiskUsage.{1}.latest.json" -f $prefix,$safeDrive)
+    $temporary = $target + '.' + $script:RunId + '.tmp'
+    try {
+        $json = $Diagnostic | ConvertTo-Json -Depth 8
+        [IO.File]::WriteAllText($temporary,$json,(New-Object Text.UTF8Encoding($false)))
+        Move-Item -LiteralPath $temporary -Destination $target -Force -ErrorAction Stop
+        return $target
+    } finally { if (Test-Path -LiteralPath $temporary) { Remove-Item -LiteralPath $temporary -Force -ErrorAction SilentlyContinue } }
+}
+
+function Invoke-DiskUsageInventory {
+    [CmdletBinding()]
+    param([ValidateRange(1,100)][int]$TopDirectories = 10)
+    foreach ($drive in @(Get-CimInstance Win32_LogicalDisk -Filter 'DriveType=3' -ErrorAction Stop)) {
+        if ([double]$drive.Size -le 0) { continue }
+        $usedPercent = 100.0 * ([double]$drive.Size - [double]$drive.FreeSpace) / [double]$drive.Size
+        $exceeded = $usedPercent -gt $DiskWarningPercent
+        # Preserve routine system-drive inventory; diagnose other fixed drives when over threshold.
+        if ($drive.DeviceID -ne $env:SystemDrive -and -not $exceeded) { continue }
+        $data = [ordered]@{
+            Drive=[string]$drive.DeviceID; SizeBytes=[long]$drive.Size; FreeBytes=[long]$drive.FreeSpace
+            UsedPercent=[math]::Round($usedPercent,4); WarningThresholdPercent=$DiskWarningPercent
+            ThresholdExceeded=[bool]$exceeded; Phase='BeforeCleanup'; Diagnostic=$null; DiagnosticPath=$null; DiagnosticError=$null
+        }
+        try {
+            $data.Diagnostic = Get-DiskUsageDiagnostic -DeviceId $drive.DeviceID -TimeoutSeconds $DiskDiagnosticTimeoutSeconds -Top $TopDirectories -VolumeSizeBytes $drive.Size -VolumeFreeBytes $drive.FreeSpace -WarningThresholdPercent $DiskWarningPercent
+            $data.DiagnosticPath = Save-DiskUsageDiagnostic -Diagnostic $data.Diagnostic
+            foreach ($row in $data.Diagnostic.TopLevelDirectories) {
+                Write-Log ("DISK_USAGE_DIRECTORY|Drive={0}|GB={1}|Path={2}" -f $drive.DeviceID,$row.GB,$row.Path) 'INFO'
+            }
+        } catch { $data.DiagnosticError = $_.Exception.Message }
+        $status = if ($exceeded -or $data.DiagnosticError) { 'Warning' } else { 'Info' }
+        Add-DetailedResult -Step ('DiskUsageInventory:' + $drive.DeviceID) -Status $status -Message 'Pre-cleanup disk usage evidence captured; inspect diagnostic status for limitations.' -Data $data
+        Write-Log ("DISK_USAGE_DIAGNOSTIC|Drive={0}|UsedPercent={1}|ThresholdPercent={2}|ThresholdExceeded={3}|Report={4}|Error={5}" -f $drive.DeviceID,$data.UsedPercent,$DiskWarningPercent,$exceeded,$data.DiagnosticPath,$data.DiagnosticError) $(if ($exceeded -or $data.DiagnosticError) { 'WARN' } else { 'INFO' })
+    }
+}
 
 function Remove-ExpiredDeepFreezeLogs {
     [CmdletBinding()]
@@ -5530,11 +5600,19 @@ function Invoke-DiskSpaceCheck {
         $sizeGB = [math]::Round($drive.Size / 1GB, 2)
         Write-Log "System drive free space: $freeGB GB of $sizeGB GB" 'INFO'
 
+        $usedPercent = if ([double]$drive.Size -gt 0) { 100.0 * ([double]$drive.Size - [double]$drive.FreeSpace) / [double]$drive.Size } else { $null }
+        $exceeded = $null -ne $usedPercent -and $usedPercent -gt $DiskWarningPercent
         Add-DetailedResult -Step 'DiskSpaceCheck' -Status 'Info' -Message 'Disk space checked.' -Data @{
             FreeGB  = $freeGB
             TotalGB = $sizeGB
+            UsedPercent = $usedPercent
+            WarningThresholdPercent = $DiskWarningPercent
+            ThresholdExceeded = [bool]$exceeded
         }
 
+        if ($exceeded) {
+            Warn-Step -Name 'DiskSpaceCheck' -Reason ("DISK_USAGE_THRESHOLD|Drive={0}|UsedPercent={1:N2}|ThresholdPercent={2}|ThresholdExceeded=True" -f $drive.DeviceID,$usedPercent,$DiskWarningPercent)
+        }
         if ($freeGB -lt 10) {
             Warn-Step -Name 'DiskSpaceCheck' -Reason "Low free space on system drive: $freeGB GB"
         }
@@ -6380,6 +6458,7 @@ function New-SystemRepairTelemetryEvent {
                 DismStepResults = @(Get-StepSummaryTelemetry -StepPattern 'DISM*')
                 SfcStepResults = @(Get-StepSummaryTelemetry -StepPattern 'SFC*')
                 RepairVolumeStepResults = @(Get-StepSummaryTelemetry -StepPattern 'RepairVolume*')
+                DiskUsageStepResults = @(Get-StepSummaryTelemetry -StepPattern 'DiskUsageInventory:*')
                 StorageStepResults = @(Get-StepSummaryTelemetry -StepPattern 'Storage*')
                 WmiStepResults = @(Get-StepSummaryTelemetry -StepPattern 'Wmi*')
                 WindowsUpdateResetStepResults = @(Get-StepSummaryTelemetry -StepPattern 'WindowsUpdate*')
@@ -6531,6 +6610,7 @@ try {
 
     Invoke-Safely -Name 'Action1AgentValidation' -ScriptBlock { Ensure-Action1Agent } -WarnOnly | Out-Null
     Invoke-Safely -Name 'DiskSpaceCheck' -ScriptBlock { Invoke-DiskSpaceCheck } -WarnOnly | Out-Null
+    Invoke-Safely -Name 'DiskUsageInventory' -ScriptBlock { Invoke-DiskUsageInventory -TopDirectories 10 } -WarnOnly | Out-Null
     Invoke-Safely -Name 'StorageHealthCheck' -ScriptBlock { Invoke-StorageHealthCheck } -WarnOnly | Out-Null
 
     Invoke-Safely -Name 'PendingRebootCheck' -ScriptBlock {
@@ -6550,7 +6630,6 @@ try {
     Invoke-Safely -Name 'SFCDetection' -ScriptBlock { Invoke-SfcDetection } -WarnOnly | Out-Null
     Invoke-Safely -Name 'WmiRepositoryCheck' -ScriptBlock { Invoke-WmiCheck } -WarnOnly | Out-Null
     Invoke-Safely -Name 'DnsFlush' -ScriptBlock { Invoke-DnsFlushOnly } -WarnOnly | Out-Null
-    Invoke-Safely -Name 'DiskUsageInventory' -ScriptBlock { Invoke-DiskUsageInventory -TopDirectories 20 } -WarnOnly | Out-Null
     Invoke-Safely -Name 'TempCleanup' -ScriptBlock { Invoke-TempCleanup } -WarnOnly | Out-Null
     Invoke-Safely -Name 'ScheduledTaskHealthCheck' -ScriptBlock { Invoke-ScheduledTaskHealthCheck } -WarnOnly | Out-Null
     Invoke-Safely -Name 'RpcDiagnostics' -ScriptBlock { Invoke-RpcDiagnostics } -WarnOnly | Out-Null

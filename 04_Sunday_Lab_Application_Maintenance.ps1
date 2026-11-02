@@ -1,8 +1,23 @@
 #requires -Version 5.1
 #requires -RunAsAdministrator
 # ScriptName:    04_Sunday_Lab_Application_Maintenance.ps1
-# ScriptVersion: 1.18.0
-# LastUpdated:   2026-10-12
+# ScriptVersion: 1.19.15
+# Changes: v1.19.15 repairs Event Log registry limits even when EventLog RPC is unavailable.
+# Previous: v1.19.14 leaves MISAdmin startup profile untouched and removes MISAdmin logon suppression.
+# Previous: v1.19.13 excludes MISAdmin from OneDrive startup and contains unexpected section errors.
+# Previous: v1.19.12 improves OneDrive silent setup and contains startup hive-unload failures.
+# Previous: v1.19.11 disables OneDrive startup for CC-Student, including newly created profiles.
+# Previous: v1.19.10 keeps PaperCut Print Deploy UI startup enabled for all user profiles.
+# Previous: v1.19.9 adds LIB-128-CAT* / CC-Student Edge library kiosk logon launcher and startup approval.
+# LastUpdated:   2026-11-01
+# Changes:       v1.19.8 synchronizes Event Log MaxSize while thawed for Deep Freeze resizing.
+# Previous:      v1.19.7 enables OneDrive login startup and Windows-credential sign-in.
+# Previous:      v1.19.6 repairs PaperCut initialise.bat startup approvals for all profiles.
+# Previous:       v1.19.5 ignores verified stale Microsoft 365 uninstall entries.
+# Previous:      v1.19.3 also disables global IPv4 routing and interface forwarding,
+#                verifies active/persistent settings, and reports reboot requirements.
+# Previous:      v1.19.0 stops and disables RemoteAccess on lab workstations,
+#                verifies the result, and publishes remote-access policy telemetry.
 <#
 .SYNOPSIS
     Runs the Sunday lab application and configuration maintenance in one script.
@@ -59,6 +74,9 @@
                    are stopped and narrowly matching scheduled tasks are disabled;
                    HP drivers, audio services, HPIA, HPCMSL, BIOS tools, and other
                    hardware-support components are not modified.
+                   v1.19.5 gates Office changes on DFC-verified Thawed state;
+                   Frozen systems are skipped and unknown states block Office
+                   remediation. Office telemetry records the query and state.
                    v1.12.1 requires Deep Freeze to be installed before Microsoft
                    365 Apps can be replaced with Office LTSC 2024. Microsoft 365
                    is left unchanged on non-Deep-Freeze systems and the skip is
@@ -208,12 +226,21 @@ $ErrorActionPreference = 'Stop'
     'MS-203*'
 )
 
+# --- Library discovery kiosk at CC-Student sign-in --------------------------
+[string[]]$LibraryKioskComputerPatterns = @('LIB-128-CAT*')
+[string]$LibraryKioskAccountName = 'CC-Student'
+[string]$LibraryKioskEdgePath = 'C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe'
+[string]$LibraryKioskUrl = 'https://caccl-compton.primo.exlibrisgroup.com/discovery/search?vid=01CACCL_COMPTON:COMPTON&lang=en'
+
 # --- Windows startup-app allowlist ------------------------------------------
 # Only these items are left enabled in Task Manager > Startup apps. Matching
 # considers both the startup value/display name and the executable or script
 # filename found in its command. Everything else is disabled, not uninstalled.
 [string[]]$AllowedStartupApplications = @(
     'LaunchComptonChromeIncognito',
+    'LaunchComptonLibraryKiosk',
+    'PaperCut Print Deploy UI Controller',
+    'pc-print-deploy-client.exe',
     'DWRCST.EXE',
     'initialise.bat',
     'OneDrive.exe',
@@ -227,6 +254,7 @@ $ErrorActionPreference = 'Stop'
 # ============================================================================
 # Set a value to $false to retain the section in this combined file but skip it.
 [bool]$RunPrinterAndPaperCut = $true
+[bool]$RunRemoteAccessDisable = $true
 [bool]$RunSystemRestore     = $true
 [bool]$RunChromeIncognito     = $true
 [bool]$RunElasticAgent      = $false
@@ -237,6 +265,7 @@ $ErrorActionPreference = 'Stop'
 [bool]$RunStellariumLocation = $true
 [bool]$RunOffice2024Maintenance = $true
 [bool]$RunStartupAppAllowlist = $true
+[bool]$RunLibraryKioskStartup = $true
 [bool]$RunAdobeReaderPolicy = $true
 [bool]$RunPostMaintenanceCopilotCleanup = $true
 
@@ -245,10 +274,12 @@ $ErrorActionPreference = 'Stop'
 # ============================================================================
 [string]$HomepageUrl = 'https://www.compton.edu'
 [string]$Office2024SourcePath = '\\SERVER\DeploymentShare\Installers\Office2024'
+# Optional local DFC.exe path; installed Windows/Faronics locations are also checked.
+[string]$OfficeDeepFreezeCommandPath = 'C:\Scripts\DFC.exe'
 [string]$Office2024ConfigurationFile = 'office2024config.xml'
 [string]$LogDirectory = 'C:\Logs'
 [string]$RunnerScriptName = '04_Sunday_Lab_Application_Maintenance.ps1'
-[string]$RunnerVersion = '1.18.0'
+[string]$RunnerVersion = '1.19.15'
 [string]$CopilotModuleLocalPath = 'C:\Scripts\Maintenance.Copilot.psm1'
 [string]$CopilotModuleSharePath = '\\SERVER\DeploymentShare\Maintenance.Copilot.psm1'
 [string]$RunnerLogPath = Join-Path $LogDirectory '04_Sunday_Lab_Application_Maintenance.log'
@@ -1461,10 +1492,10 @@ $ErrorActionPreference = 'Stop'
 # =========================
 $ScriptName = '11_Install_SharpDriver_And_PaperCut.ps1'
 $ScriptVersion = '1.2.8'
-$DriverSourcePath = '\\PRINT-SERVER\Drivers\SHARP\SH_D31_PCL6_PS_2410a_EnglishUS_64bit'
+$DriverSourcePath = '\\papercut\Printer Drivers\MFP\win\SH_D31_PCL6_PS_2410a_EnglishUS_64bit'
 $PrinterDriverName = 'Sharp BP-70C31 PCL6'
-$PaperCutMsiPath = '\\PRINT-SERVER\PrintDeploy\pc-print-deploy-client.msi'
-$PrinterSharePath = '\\PRINT-SERVER\StudentSecurePrint'
+$PaperCutMsiPath = '\\papercut\Print Deploy Clients\win\pc-print-deploy-client[10.2.3.44].msi'
+$PrinterSharePath = '\\papercut\StudentSecurePrint'
 $LocalDriverStage = 'C:\ProgramData\Compton\Drivers\Sharp'
 $StateDirectory = 'C:\ProgramData\Compton\State'
 $StatePath = Join-Path $StateDirectory 'SharpDriver-PaperCut-State.json'
@@ -2452,7 +2483,7 @@ $ScriptVersion = '2.1.5'
 
 # Fleet enrollment settings copied from the current Install.ps1.
 # NOTE: The enrollment token is sensitive. Restrict read access to this script/share.
-[string]$FleetServerUrl = 'https://FLEET-SERVER:8220'
+[string]$FleetServerUrl = 'https://10.2.12.4:8220'
 [string]$EnrollmentToken = ''
 
 # Fleet Server is currently using the Quick Start self-signed TLS certificate.
@@ -2461,7 +2492,7 @@ $ScriptVersion = '2.1.5'
 
 # Preferred and fallback ZIP locations.
 [string]$PreferredInstallerPath = "\\SERVER\DeploymentShare\ElasticAgent\elastic-agent-$ElasticAgentVersion-windows-x86_64.zip"
-[string]$FallbackInstallerPath = "\\FALLBACK-SERVER\DeploymentShare\ElasticAgent\elastic-agent-$ElasticAgentVersion-windows-x86_64.zip"
+[string]$FallbackInstallerPath = "\\10.2.3.30\Labscripts\ElasticAgent\elastic-agent-$ElasticAgentVersion-windows-x86_64.zip"
 
 # Official Elastic download fallback. Used automatically when both internal shares are unavailable.
 [string]$DownloadUri = "https://artifacts.elastic.co/downloads/beats/elastic-agent/elastic-agent-$ElasticAgentVersion-windows-x86_64.zip"
@@ -4795,6 +4826,145 @@ function Get-DeepFreezeInstallationState {
     }
 }
 
+function Get-OfficeDeepFreezeRuntimeState {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][bool]$Installed)
+
+    $result = [ordered]@{
+        State = 'NotInstalled'; CheckedUtc = [datetime]::UtcNow.ToString('o')
+        CommandPath = $null; ExitCode = $null; Detail = $null
+    }
+    if (-not $Installed) { return [pscustomobject]$result }
+    $result.State = 'Unknown'
+    $paths = @(
+        $OfficeDeepFreezeCommandPath
+        (Join-Path $env:SystemRoot 'System32\DFC.exe')
+        (Join-Path $env:SystemRoot 'SysWOW64\DFC.exe')
+        'C:\Program Files (x86)\Faronics\Deep Freeze\Install C-0\DFC.exe'
+        'C:\Program Files\Faronics\Deep Freeze\Install C-0\DFC.exe'
+        'C:\Program Files (x86)\Faronics\Deep Freeze\DFC.exe'
+        'C:\Program Files\Faronics\Deep Freeze\DFC.exe'
+    )
+    $commandPath = $paths | Where-Object {
+        -not [string]::IsNullOrWhiteSpace($_) -and
+        (Test-Path -LiteralPath $_ -PathType Leaf)
+    } | Select-Object -First 1
+    if (-not $commandPath) {
+        $result.Detail = 'DFC.exe was not found in the configured or installed locations.'
+        return [pscustomobject]$result
+    }
+    $result.CommandPath = $commandPath
+    $process = New-Object System.Diagnostics.Process
+    try {
+        $process.StartInfo.FileName = $commandPath
+        $process.StartInfo.Arguments = 'get /ISFROZEN'
+        $process.StartInfo.UseShellExecute = $false
+        $process.StartInfo.CreateNoWindow = $true
+        $process.StartInfo.RedirectStandardOutput = $true
+        $process.StartInfo.RedirectStandardError = $true
+        if (-not $process.Start()) { throw 'DFC.exe did not start.' }
+        $stdout = $process.StandardOutput.ReadToEndAsync()
+        $stderr = $process.StandardError.ReadToEndAsync()
+        if (-not $process.WaitForExit(15000)) {
+            try { $process.Kill() } catch {}
+            throw 'DFC state query timed out after 15 seconds.'
+        }
+        $process.WaitForExit()
+        $result.ExitCode = [int]$process.ExitCode
+        $result.Detail = (([string]$stdout.Result + ' ' + [string]$stderr.Result).Trim())
+        # Faronics: DFC get /ISFROZEN returns 0=Thawed, 1=Frozen.
+        switch ($result.ExitCode) {
+            0 { $result.State = 'Thawed' }
+            1 { $result.State = 'Frozen' }
+            default { $result.Detail = "Unexpected DFC exit code $($result.ExitCode). $($result.Detail)" }
+        }
+    }
+    catch { $result.Detail = $_.Exception.Message }
+    finally { $process.Dispose() }
+    return [pscustomobject]$result
+}
+
+
+function Get-ComptonOfficeSuiteEvidence {
+    # Read-only, conservative reconciliation of Click-to-Run suite identity.
+    $ids = @()
+    $configs = @()
+    $readFailed = $false
+    foreach ($path in @(
+        'HKLM:\SOFTWARE\Microsoft\Office\ClickToRun\Configuration',
+        'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Office\ClickToRun\Configuration'
+    )) {
+        try {
+            $config = Get-ItemProperty -LiteralPath $path -ErrorAction Stop
+            $property = $config.PSObject.Properties['ProductReleaseIds']
+            if ($null -eq $property) { $readFailed = $true; continue }
+            $currentIds = @(([string]$property.Value -split '[,;\s]+') |
+                Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+            $ids += $currentIds
+            $configs += [pscustomobject]@{Path=$path;Config=$config;Ids=$currentIds}
+        }
+        catch {
+            if ($_.CategoryInfo.Category -ne [Management.Automation.ErrorCategory]::ObjectNotFound) {
+                $readFailed = $true
+            }
+        }
+    }
+    $ids = @($ids | Sort-Object -Unique)
+    $selected = $null
+    $applicationPath = $null
+    foreach ($record in $configs) {
+        if (@($record.Ids | Where-Object { $_ -match '^(?i)(?:ProPlus|Standard)2024(?:Volume|Retail)$' }).Count -eq 0) { continue }
+        $locationProperty = $record.Config.PSObject.Properties['InstallationPath']
+        if ($null -eq $locationProperty -or [string]::IsNullOrWhiteSpace([string]$locationProperty.Value)) { continue }
+        $root = [string]$locationProperty.Value
+        foreach ($relative in @('root\Office16\WINWORD.EXE','Office16\WINWORD.EXE',
+                                'root\Office16\EXCEL.EXE','Office16\EXCEL.EXE')) {
+            if (Test-Path -LiteralPath (Join-Path $root $relative) -PathType Leaf) {
+                $selected = $record; $applicationPath = Join-Path $root $relative; break
+            }
+        }
+        if ($selected) { break }
+    }
+    $has365 = @($ids | Where-Object { $_ -match '^(?i)(?:O365|M365)' }).Count -gt 0
+    $platform = ''
+    $version = ''
+    $installRoot = ''
+    if ($selected) {
+        foreach ($field in @('Platform','VersionToReport','InstallationPath')) {
+            $property = $selected.Config.PSObject.Properties[$field]
+            $value = if ($null -ne $property) { [string]$property.Value } else { '' }
+            switch ($field) {
+                Platform { $platform = $value.ToLowerInvariant() }
+                VersionToReport { $version = $value }
+                InstallationPath { $installRoot = $value }
+            }
+        }
+    }
+    return [pscustomobject]@{
+        ReliableRead = (-not $readFailed -and $configs.Count -gt 0)
+        Verified2024Without365 = (-not $readFailed -and $null -ne $selected -and -not $has365)
+        ProductReleaseIds = $ids
+        Microsoft365Configured = $has365
+        Platform = $platform
+        Version = $version
+        InstallationPath = $installRoot
+        ApplicationPath = $applicationPath
+        RegistryPath = if ($selected) { $selected.Path } else { $null }
+    }
+}
+
+function Test-ComptonStale365UninstallEntry {
+    param([object]$Entry,[object]$Evidence)
+    if (-not $Evidence.Verified2024Without365) { return $false }
+    $nameProperty = $Entry.PSObject.Properties['PSChildName']
+    $publisherProperty = $Entry.PSObject.Properties['Publisher']
+    if ($null -eq $nameProperty -or $null -eq $publisherProperty) { return $false }
+    # Only known suite ARP keys: never Visio, Project, Access, language packs,
+    # Microsoft 365 desktop hub, or arbitrary names containing "365".
+    return ([string]$publisherProperty.Value -eq 'Microsoft Corporation' -and
+        [string]$nameProperty.Value -match '^(?i)(?:O365ProPlusRetail|O365BusinessRetail)(?:\s+-\s+[a-z]{2,3}-[a-z]{2,3})?$')
+}
+
 function Get-OfficeInstallationInventory {
     [CmdletBinding()]
     param()
@@ -4821,6 +4991,16 @@ function Get-OfficeInstallationInventory {
     $uninstallEntries = @(
         Get-ItemProperty -Path $uninstallPaths -ErrorAction SilentlyContinue
     )
+    $officeEvidence = Get-ComptonOfficeSuiteEvidence
+    $stale365Entries = @($uninstallEntries | Where-Object {
+        Test-ComptonStale365UninstallEntry -Entry $_ -Evidence $officeEvidence
+    })
+    if ($stale365Entries.Count -gt 0) {
+        Write-RunnerLog -Message ("Ignoring {0} stale Microsoft 365 uninstall entry/entries: Office 2024 product IDs and application files are present and no Microsoft 365 product IDs remain. Registry was not changed." -f $stale365Entries.Count)
+    }
+    $uninstallEntries = @($uninstallEntries | Where-Object {
+        -not (Test-ComptonStale365UninstallEntry -Entry $_ -Evidence $officeEvidence)
+    })
     [string[]]$displayNames = @(
         $uninstallEntries |
             ForEach-Object {
@@ -4896,12 +5076,14 @@ function Get-OfficeInstallationInventory {
         $olderMsiDisplayNames.Count -eq 0
 
     return [pscustomobject][ordered]@{
+        OfficeReconciliation       = $officeEvidence
+        IgnoredStaleMicrosoft365Names = @($stale365Entries | ForEach-Object { $_.DisplayName })
         ProductReleaseIds          = @($productReleaseIds)
         OfficeDisplayNames         = @($displayNames)
         Microsoft365Detected       = ($microsoft365ProductIds.Count -gt 0 -or $microsoft365DisplayNames.Count -gt 0)
         Microsoft365ProductIds     = @($microsoft365ProductIds)
         Microsoft365DisplayNames   = @($microsoft365DisplayNames)
-        Office2024Detected         = ($office2024ProductIds.Count -gt 0 -or $office2024DisplayNames.Count -gt 0)
+        Office2024Detected         = ($officeEvidence.Verified2024Without365 -or $office2024ProductIds.Count -gt 0 -or $office2024DisplayNames.Count -gt 0)
         Office2024ProductIds       = @($office2024ProductIds)
         Office2024DisplayNames     = @($office2024DisplayNames)
         OlderOfficeDetected       = ($olderClickToRunProductIds.Count -gt 0 -or $olderDisplayNames.Count -gt 0)
@@ -5210,6 +5392,8 @@ function Invoke-Office2024MaintenanceSection {
     $microsoft365Products = @()
     $microsoft365MigrationAttempted = $false
     $microsoft365MigrationSucceeded = $false
+    $deepFreezeRuntimeState = Get-OfficeDeepFreezeRuntimeState -Installed $false
+    $skippedDeepFreezeFrozen = $false
     $deepFreezeInstalled = $false
     $deepFreezeEvidence = @()
     $deepFreezeGateApplied = $false
@@ -5240,17 +5424,15 @@ function Invoke-Office2024MaintenanceSection {
         $olderOfficeDetectedThisRun = [bool]$inventory.OlderOfficeDetected
         $olderOfficeDetected = [bool]$history.MigratedFromOlderOffice -or $olderOfficeDetectedThisRun
 
-        if ($microsoft365Detected) {
-            $deepFreezeCheckPerformed = $true
-            $deepFreezeState = Get-DeepFreezeInstallationState
-            $deepFreezeInstalled = [bool]$deepFreezeState.Installed
-            $deepFreezeEvidence = @($deepFreezeState.Evidence)
-            if ($deepFreezeInstalled) {
-                Write-RunnerLog -Message "Deep Freeze installation detected. Evidence: $($deepFreezeEvidence -join '; ')" -Level 'SUCCESS'
-            }
-            else {
-                Write-RunnerLog -Message 'Deep Freeze is not installed. Microsoft 365 replacement is not authorized on this system.' -Level 'WARNING'
-            }
+        $deepFreezeCheckPerformed = $true
+        $deepFreezeState = Get-DeepFreezeInstallationState
+        $deepFreezeInstalled = [bool]$deepFreezeState.Installed
+        $deepFreezeEvidence = @($deepFreezeState.Evidence)
+        if ($deepFreezeInstalled) {
+            Write-RunnerLog -Message "Deep Freeze installation detected. Evidence: $($deepFreezeEvidence -join '; ')" -Level 'SUCCESS'
+        }
+        else {
+            Write-RunnerLog -Message 'Deep Freeze is not installed. Microsoft 365 replacement remains unauthorized; existing non-365 Office behavior is retained.' -Level 'WARNING'
         }
 
         $combinedOlderOfficeProducts = @($inventory.OlderClickToRunProductIds) +
@@ -5262,7 +5444,20 @@ function Invoke-Office2024MaintenanceSection {
                 Sort-Object -Unique
         )
 
-        if ($microsoft365Detected -and -not $deepFreezeInstalled) {
+        $failureStage = 'CheckDeepFreezeState'
+        $deepFreezeRuntimeState = Get-OfficeDeepFreezeRuntimeState -Installed $deepFreezeInstalled
+        Write-RunnerLog -Message ("Office Deep Freeze check: State={0}; DFC={1}; ExitCode={2}; Detail={3}" -f $deepFreezeRuntimeState.State,$deepFreezeRuntimeState.CommandPath,$deepFreezeRuntimeState.ExitCode,$deepFreezeRuntimeState.Detail)
+        if ($deepFreezeInstalled -and $deepFreezeRuntimeState.State -eq 'Unknown') {
+            $deepFreezeGateApplied = $true
+            throw "Office changes blocked: Deep Freeze state could not be verified. $($deepFreezeRuntimeState.Detail)"
+        }
+        if ($deepFreezeInstalled -and $deepFreezeRuntimeState.State -eq 'Frozen') {
+            $skippedDeepFreezeFrozen = $true
+            $deepFreezeGateApplied = $true
+            $outcome = 'OfficeMaintenanceSkippedFrozen'
+            Write-RunnerLog -Message 'Computer is Frozen. Office removal, installation, and activation were skipped; no migration success is reported.' -Level 'WARNING'
+        }
+        elseif ($microsoft365Detected -and -not $deepFreezeInstalled) {
             $skippedMicrosoft365 = $true
             $deepFreezeGateApplied = $true
             $outcome = 'Microsoft365SkippedNoDeepFreeze'
@@ -5288,6 +5483,14 @@ function Invoke-Office2024MaintenanceSection {
                 -SourcePath $Office2024SourcePath `
                 -DestinationPath $localStagePath
 
+            if ($deepFreezeInstalled) {
+                $failureStage = 'CheckDeepFreezeState'
+                $deepFreezeRuntimeState = Get-OfficeDeepFreezeRuntimeState -Installed $true
+                if ($deepFreezeRuntimeState.State -ne 'Thawed') {
+                    $deepFreezeGateApplied = $true
+                    throw "Office changes blocked: Deep Freeze state is $($deepFreezeRuntimeState.State). $($deepFreezeRuntimeState.Detail)"
+                }
+            }
             $uninstallAttempted = $true
             if ([bool]$inventory.OlderMsiOrUnknownDetected) {
                 $failureStage = 'ValidateOffice2024Configuration'
@@ -5322,14 +5525,27 @@ function Invoke-Office2024MaintenanceSection {
                 if ($removeExitCode -eq 3010) { $rebootRequired = $true }
 
                 $afterRemoval = Get-OfficeInstallationInventory
-                if ($afterRemoval.Microsoft365Detected) {
+                if ($afterRemoval.Microsoft365Detected -and
+                    (@($afterRemoval.Microsoft365ProductIds).Count -gt 0 -or
+                     -not $afterRemoval.OfficeReconciliation.ReliableRead)) {
                     throw "Microsoft 365 remained detected after the removal command: $(@($afterRemoval.Microsoft365DisplayNames + $afterRemoval.Microsoft365ProductIds) -join ', ')"
+                }
+                if ($afterRemoval.Microsoft365Detected -and @($afterRemoval.Microsoft365ProductIds).Count -eq 0) {
+                    Write-RunnerLog -Message 'Targeted Office removal returned successfully and Microsoft 365 product IDs are absent; uninstall display-name remnants will be rechecked after Office 2024 installation.' -Level 'WARNING'
                 }
                 if (@($afterRemoval.OlderClickToRunProductIds).Count -gt 0) {
                     throw "Older Office Click-to-Run products remained after the removal command: $(@($afterRemoval.OlderClickToRunProductIds) -join ', ')"
                 }
             }
 
+            if ($deepFreezeInstalled) {
+                $failureStage = 'CheckDeepFreezeState'
+                $deepFreezeRuntimeState = Get-OfficeDeepFreezeRuntimeState -Installed $true
+                if ($deepFreezeRuntimeState.State -ne 'Thawed') {
+                    $deepFreezeGateApplied = $true
+                    throw "Office changes blocked: Deep Freeze state is $($deepFreezeRuntimeState.State). $($deepFreezeRuntimeState.Detail)"
+                }
+            }
             $failureStage = 'InstallOffice2024'
             $installationAttempted = $true
             Write-RunnerLog -Message "Installing Office 2024 with: setup.exe /configure $Office2024ConfigurationFile"
@@ -5352,6 +5568,14 @@ function Invoke-Office2024MaintenanceSection {
             $installationSucceeded = $true
             $office2024Installed = $true
 
+            if ($deepFreezeInstalled) {
+                $failureStage = 'CheckDeepFreezeState'
+                $deepFreezeRuntimeState = Get-OfficeDeepFreezeRuntimeState -Installed $true
+                if ($deepFreezeRuntimeState.State -ne 'Thawed') {
+                    $deepFreezeGateApplied = $true
+                    throw "Office activation blocked: Deep Freeze state is $($deepFreezeRuntimeState.State). $($deepFreezeRuntimeState.Detail)"
+                }
+            }
             $failureStage = 'ActivateOffice2024'
             $activation = Ensure-Office2024MachineActivation
             $activationAttempted = [bool]$activation.ActivationAttempted
@@ -5381,6 +5605,14 @@ function Invoke-Office2024MaintenanceSection {
             Write-RunnerLog -Message 'No Microsoft 365, Office 2024, or supported older Office LTSC/perpetual suite was detected. No change was made.'
         }
         else {
+            if ($deepFreezeInstalled) {
+                $failureStage = 'CheckDeepFreezeState'
+                $deepFreezeRuntimeState = Get-OfficeDeepFreezeRuntimeState -Installed $true
+                if ($deepFreezeRuntimeState.State -ne 'Thawed') {
+                    $deepFreezeGateApplied = $true
+                    throw "Office activation blocked: Deep Freeze state is $($deepFreezeRuntimeState.State). $($deepFreezeRuntimeState.Detail)"
+                }
+            }
             $failureStage = 'ActivateOffice2024'
             $activation = Ensure-Office2024MachineActivation
             $activationAttempted = [bool]$activation.ActivationAttempted
@@ -5395,6 +5627,7 @@ function Invoke-Office2024MaintenanceSection {
         $remediationFailure = $true
         $failureMessage = [string]$_.Exception.Message
         $outcome = switch ($failureStage) {
+            'CheckDeepFreezeState' { 'OfficeMaintenanceBlockedDeepFreezeState' }
             'ValidateOffice2024Configuration' { 'Office2024ConfigurationInvalid' }
             'UninstallExistingOffice' { 'ExistingOfficeUninstallFailed' }
             'InstallOffice2024'    { 'Office2024InstallationFailed' }
@@ -5431,17 +5664,19 @@ function Invoke-Office2024MaintenanceSection {
         }
     }
 
+    if ($successful) { $failureStage = $null }
+
     $duration = [math]::Round(((Get-Date) - $sectionStart).TotalSeconds, 2)
     $eventTime = Get-Date
     $officeEvent = [ordered]@{
         '@timestamp'    = $eventTime.ToUniversalTime().ToString('o')
         EventType       = 'maintenance.office2024_compliance'
-        SchemaVersion   = '1.2'
+        SchemaVersion   = '1.3'
         ComputerName    = [string]$env:COMPUTERNAME
         ScriptName      = $RunnerScriptName
         ScriptVersion   = $RunnerVersion
         RunId           = $RunnerRunId
-        Status          = if ($successful) { 'Success' } else { 'Failed' }
+        Status          = if ($skippedDeepFreezeFrozen) { 'Skipped' } elseif ($successful) { 'Success' } else { 'Failed' }
         Outcome         = $outcome
         ExitCode        = $exitCode
         StartTime       = $sectionStart.ToUniversalTime().ToString('o')
@@ -5455,6 +5690,12 @@ function Invoke-Office2024MaintenanceSection {
             Microsoft365Skipped        = $skippedMicrosoft365
             Microsoft365MigrationAttempted = $microsoft365MigrationAttempted
             Microsoft365MigrationSucceeded = $microsoft365MigrationSucceeded
+            DeepFreezeState             = $deepFreezeRuntimeState.State
+            DeepFreezeStateCheckedUtc    = $deepFreezeRuntimeState.CheckedUtc
+            DeepFreezeCommandPath       = $deepFreezeRuntimeState.CommandPath
+            DeepFreezeQueryExitCode     = $deepFreezeRuntimeState.ExitCode
+            DeepFreezeQueryDetail       = $deepFreezeRuntimeState.Detail
+            SkippedDeepFreezeFrozen     = $skippedDeepFreezeFrozen
             DeepFreezeInstalled         = $deepFreezeInstalled
             DeepFreezeCheckPerformed    = $deepFreezeCheckPerformed
             DeepFreezeEvidence          = @($deepFreezeEvidence)
@@ -5512,6 +5753,8 @@ function Invoke-Office2024MaintenanceSection {
         SkippedMicrosoft365 = $skippedMicrosoft365
         Microsoft365MigrationAttempted = $microsoft365MigrationAttempted
         Microsoft365MigrationSucceeded = $microsoft365MigrationSucceeded
+        DeepFreezeState = $deepFreezeRuntimeState.State
+        SkippedDeepFreezeFrozen = $skippedDeepFreezeFrozen
         DeepFreezeInstalled = $deepFreezeInstalled
         DeepFreezeCheckPerformed = $deepFreezeCheckPerformed
         DeepFreezeGateApplied = $deepFreezeGateApplied
@@ -5731,6 +5974,127 @@ function Invoke-MaintenanceSection {
     }
 }
 
+function Invoke-LibraryKioskStartupSection {
+    [CmdletBinding()]
+    param()
+
+    $started = Get-Date
+    $success = $true
+    $failure = ''
+    $notTargeted = -not (Test-ComputerMatchesAnyPattern -ComputerName $env:COMPUTERNAME -Patterns $LibraryKioskComputerPatterns)
+    $launcherPath = ''
+    try {
+        if ($notTargeted) {
+            Write-RunnerLog -Message 'Library kiosk startup: computer is not targeted; no changes made.'
+        }
+        else {
+            if (-not (Test-Path -LiteralPath $LibraryKioskEdgePath -PathType Leaf)) {
+                throw "Library kiosk requires Microsoft Edge at $LibraryKioskEdgePath"
+            }
+            $directory = Join-Path $env:ProgramData 'Compton\LibraryKiosk'
+            New-Item -Path $directory -ItemType Directory -Force -ErrorAction Stop | Out-Null
+            # The launcher runs as the signed-in user; only administrators/SYSTEM
+            # may change it. It is never executed as an elevated logon action.
+            $acl = New-Object System.Security.AccessControl.DirectorySecurity
+            $acl.SetAccessRuleProtection($true, $false)
+            $acl.SetOwner((New-Object System.Security.Principal.SecurityIdentifier('S-1-5-32-544')))
+            foreach ($sid in @('S-1-5-18','S-1-5-32-544','S-1-5-32-545')) {
+                $rights = if ($sid -eq 'S-1-5-32-545') { 'ReadAndExecute' } else { 'FullControl' }
+                $rule = New-Object System.Security.AccessControl.FileSystemAccessRule(
+                    (New-Object System.Security.Principal.SecurityIdentifier($sid)),
+                    $rights, 'ContainerInherit, ObjectInherit', 'None', 'Allow')
+                [void]$acl.AddAccessRule($rule)
+            }
+            Set-Acl -LiteralPath $directory -AclObject $acl -ErrorAction Stop
+            $launcherPath = Join-Path $directory 'Launch-ComptonLibraryKiosk.ps1'
+            $configuration = @{
+                Patterns=@($LibraryKioskComputerPatterns)
+                AccountName=$LibraryKioskAccountName
+                EdgePath=$LibraryKioskEdgePath
+                Url=$LibraryKioskUrl
+            } | ConvertTo-Json -Depth 3 -Compress
+            $encoded = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($configuration))
+            $launcher = @'
+#requires -Version 5.1
+# ScriptName: Launch-ComptonLibraryKiosk.ps1
+# ScriptVersion: 1.0.0
+$ErrorActionPreference = 'Stop'
+try {
+    $config = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('__CONFIG__')) | ConvertFrom-Json
+    $targeted = $false
+    foreach ($pattern in @($config.Patterns)) {
+        if ($env:COMPUTERNAME -like $pattern) { $targeted = $true; break }
+    }
+    if (-not $targeted) { exit 0 }
+    $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+    if ($identity.IsSystem) { exit 0 }
+    $accountName = ($identity.Name -split '\\')[-1]
+    if ($accountName -ine [string]$config.AccountName) { exit 0 }
+    if (-not (Test-Path -LiteralPath $config.EdgePath -PathType Leaf)) { exit 1 }
+    # Pass the complete URL as one argument, including its &lang=en query.
+    $arguments = '--kiosk "' + [string]$config.Url + '" --edge-kiosk-type=fullscreen'
+    Start-Process -FilePath $config.EdgePath -ArgumentList $arguments -ErrorAction Stop | Out-Null
+    exit 0
+}
+catch {
+    Write-Warning ("Library kiosk launch failed: " + $_.Exception.Message)
+    exit 1
+}
+'@
+            $launcher = $launcher.Replace('__CONFIG__', $encoded)
+            $tokens = $null; $parseErrors = $null
+            [void][System.Management.Automation.Language.Parser]::ParseInput($launcher, [ref]$tokens, [ref]$parseErrors)
+            if ($parseErrors.Count -gt 0) { throw 'Library kiosk launcher failed PowerShell parser validation.' }
+            [IO.File]::WriteAllText($launcherPath, $launcher, (New-Object Text.UTF8Encoding($true)))
+            # Remove any pre-existing explicit file permissions; inherit the protected folder ACL.
+            $fileAcl = New-Object System.Security.AccessControl.FileSecurity
+            $fileAcl.SetAccessRuleProtection($false, $false)
+            $fileAcl.SetOwner((New-Object System.Security.Principal.SecurityIdentifier('S-1-5-32-544')))
+            Set-Acl -LiteralPath $launcherPath -AclObject $fileAcl -ErrorAction Stop
+            $runKey = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Run'
+            $entryName = 'LaunchComptonLibraryKiosk'
+            $powershellPath = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+            $command = '"' + $powershellPath + '" -NoLogo -NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File "' + $launcherPath + '"'
+            New-Item -Path $runKey -Force -ErrorAction Stop | Out-Null
+            New-ItemProperty -LiteralPath $runKey -Name $entryName -PropertyType String -Value $command -Force -ErrorAction Stop | Out-Null
+            if ((Get-ItemPropertyValue -LiteralPath $runKey -Name $entryName -ErrorAction Stop) -cne $command) {
+                throw 'Library kiosk Run entry verification failed.'
+            }
+            $counts = @{ Enabled=0; Disabled=0; Unchanged=0 }
+            Set-StartupApprovedState -Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run' -Name $entryName -Enabled $true -Counters $counts -Scope 'Library kiosk'
+            Write-RunnerLog -Message "Library kiosk configured for $LibraryKioskAccountName at next sign-in. URL=$LibraryKioskUrl; launcher=$launcherPath. No browser was launched during maintenance." -Level 'SUCCESS'
+        }
+    }
+    catch {
+        $success = $false
+        $failure = $_.Exception.Message
+        Write-RunnerLog -Message "Library kiosk startup configuration failed: $failure" -Level 'ERROR'
+    }
+    $duration = [math]::Round(((Get-Date) - $started).TotalSeconds, 2)
+    $event = [pscustomobject][ordered]@{
+        EventType='maintenance.library_kiosk_startup'; ComputerName=$env:COMPUTERNAME
+        ScriptName=$RunnerScriptName; ScriptVersion=$RunnerVersion; RunId=$RunnerRunId
+        TimestampUtc=(Get-Date).ToUniversalTime().ToString('o')
+        Status=$(if ($notTargeted) {'NotTargeted'} elseif ($success) {'Success'} else {'Failed'})
+        TargetAccount=$LibraryKioskAccountName; ComputerPatterns=@($LibraryKioskComputerPatterns)
+        Url=$LibraryKioskUrl; EdgePath=$LibraryKioskEdgePath; LauncherPath=$launcherPath
+        FailureMessage=$failure; DurationSeconds=$duration
+    }
+    try {
+        Write-RunnerTelemetryLine -Path $RunnerTelemetryPath -JsonLine ($event | ConvertTo-Json -Depth 5 -Compress)
+        Write-RunnerJsonAtomically -Path (Join-Path $LogDirectory '04_Library_Kiosk_Startup.latest.json') -Json ($event | ConvertTo-Json -Depth 5)
+    }
+    catch {
+        $success = $false
+        Write-RunnerLog -Message "Library kiosk telemetry failed: $($_.Exception.Message)" -Level 'ERROR'
+    }
+    return [pscustomobject]@{
+        SectionId='LibraryKioskStartup'; DisplayName='CC-Student library Edge kiosk startup'
+        ExitCode=$(if ($success) {0} else {1}); Success=$success
+        RebootRequired=$false; DurationSeconds=$duration; FailureMessage=$failure
+    }
+}
+
 function Invoke-ChromeIncognitoStartupSection {
     [CmdletBinding()]
     param([string[]]$Patterns)
@@ -5872,6 +6236,17 @@ function Get-StartupCommandFileName {
     return ''
 }
 
+
+function Test-PaperCutInitialiseStartup {
+    param([string]$Name,[AllowEmptyString()][string]$Command)
+    # StartupFolder shortcuts may include .lnk; Run names may be full paths.
+    $leaf = [IO.Path]::GetFileName($Name.Trim())
+    if ($leaf -imatch '^initialise\.bat(?:\.lnk)?$') { return $true }
+    # Handles quoted/unquoted paths and cmd.exe /c wrappers. Do not accept
+    # uninitialise.bat or initialise.bat.bak.
+    return ($Command -imatch '(?:^|[\\/"\s])initialise\.bat(?=$|["\s])')
+}
+
 function Test-StartupItemAllowed {
     [CmdletBinding()]
     param(
@@ -5879,6 +6254,9 @@ function Test-StartupItemAllowed {
         [AllowEmptyString()][string]$Command,
         [Parameter(Mandatory)][string[]]$AllowList
     )
+
+    # PaperCut login initialization is mandatory even with a caller-supplied allowlist.
+    if (Test-PaperCutInitialiseStartup -Name $Name -Command $Command) { return $true }
 
     $candidates = New-Object System.Collections.Generic.List[string]
     $candidates.Add($Name.Trim()) | Out-Null
@@ -5931,6 +6309,11 @@ function Set-StartupApprovedState {
 
     $state = [byte[]]($desiredByte,0,0,0,0,0,0,0,0,0,0,0)
     New-ItemProperty -LiteralPath $Path -Name $Name -PropertyType Binary -Value $state -Force -ErrorAction Stop | Out-Null
+    $verified = Get-ItemPropertyValue -LiteralPath $Path -Name $Name -ErrorAction Stop
+    if ($verified -isnot [byte[]] -or $verified.Length -lt 12 -or $verified[0] -ne $desiredByte) {
+        throw "Startup approval verification failed for '$Name' in $Scope."
+    }
+
 
     if ($Enabled) {
         $Counters.Enabled++
@@ -5954,6 +6337,109 @@ function Get-StartupShortcutTarget {
     catch { return $Path }
 }
 
+function Disable-StudentOneDriveStartupForHive {
+    param([string]$HiveRoot, [System.Collections.IDictionary]$Counters, [string]$Scope)
+    $base = "$HiveRoot\Software\Microsoft\Windows\CurrentVersion"
+    $policy = "$HiveRoot\Software\Policies\Microsoft\OneDrive"
+    New-Item -Path $policy -Force -ErrorAction Stop | Out-Null
+    New-ItemProperty -LiteralPath $policy -Name EnableAutoStart -PropertyType DWord -Value 0 -Force -ErrorAction Stop | Out-Null
+    foreach ($run in @("$base\Run", "$HiveRoot\Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Run")) {
+        if (-not (Test-Path -LiteralPath $run)) { continue }
+        $key = Get-Item -LiteralPath $run -ErrorAction Stop
+        foreach ($name in @($key.GetValueNames())) {
+            $command = [string]$key.GetValue($name)
+            if ($name -like '*OneDrive*' -or $command -match '(?i)OneDrive\.exe') {
+                Remove-ItemProperty -LiteralPath $run -Name $name -ErrorAction Stop
+            }
+        }
+    }
+    foreach ($category in @('Run','Run32','StartupFolder','StartupTask')) {
+        $approval = "$base\Explorer\StartupApproved\$category"
+        $names = @('OneDrive')
+        if (Test-Path -LiteralPath $approval) { $names += @((Get-Item -LiteralPath $approval).GetValueNames() | Where-Object {$_ -like '*OneDrive*'}) }
+        foreach ($name in @($names | Select-Object -Unique)) {
+            Set-StartupApprovedState -Path $approval -Name $name -Enabled $false -Counters $Counters -Scope $Scope
+        }
+    }
+    Write-RunnerLog -Message "OneDrive startup disabled for excluded profile: $Scope."
+}
+
+function Install-StudentOneDriveLogonPolicy {
+    # Active Setup runs before Explorer processes Run entries, including first sign-in.
+    # It runs without elevation and applies only to CC-Student; MISAdmin is untouched.
+    $folder = Join-Path $env:ProgramData 'Compton\StudentStartup'
+    New-Item -Path $folder -ItemType Directory -Force -ErrorAction Stop | Out-Null
+    $acl = New-Object Security.AccessControl.DirectorySecurity
+    $acl.SetAccessRuleProtection($true,$false)
+    $acl.SetOwner((New-Object Security.Principal.SecurityIdentifier('S-1-5-32-544')))
+    foreach ($sid in @('S-1-5-18','S-1-5-32-544','S-1-5-32-545')) {
+        $rights = if ($sid -eq 'S-1-5-32-545') {'ReadAndExecute'} else {'FullControl'}
+        $rule = New-Object Security.AccessControl.FileSystemAccessRule((New-Object Security.Principal.SecurityIdentifier($sid)),$rights,'ContainerInherit, ObjectInherit','None','Allow')
+        [void]$acl.AddAccessRule($rule)
+    }
+    Set-Acl -LiteralPath $folder -AclObject $acl -ErrorAction Stop
+    $path = Join-Path $folder 'Set-StudentOneDriveStartup.ps1'
+    $code = @'
+#requires -Version 5.1
+# ScriptName: Set-StudentOneDriveStartup.ps1
+# ScriptVersion: 1.0.2
+$ErrorActionPreference = 'Stop'
+if (([Security.Principal.WindowsIdentity]::GetCurrent().Name -split '\\')[-1] -ine 'CC-Student') { exit 0 }
+$policy = 'HKCU:\Software\Policies\Microsoft\OneDrive'
+New-Item -Path $policy -Force | Out-Null
+New-ItemProperty -LiteralPath $policy -Name EnableAutoStart -PropertyType DWord -Value 0 -Force | Out-Null
+foreach ($run in @('HKCU:\Software\Microsoft\Windows\CurrentVersion\Run','HKCU:\Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Run')) {
+    if (-not (Test-Path -LiteralPath $run)) { continue }
+    $key = Get-Item -LiteralPath $run
+    foreach ($name in @($key.GetValueNames())) {
+        if ($name -like '*OneDrive*' -or [string]$key.GetValue($name) -match '(?i)OneDrive\.exe') {
+            Remove-ItemProperty -LiteralPath $run -Name $name
+        }
+    }
+}
+foreach ($category in @('Run','Run32','StartupFolder','StartupTask')) {
+    $approval = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\$category"
+    $names = @('OneDrive')
+    if (Test-Path -LiteralPath $approval) { $names += @((Get-Item -LiteralPath $approval).GetValueNames() | Where-Object {$_ -like '*OneDrive*'}) }
+    New-Item -Path $approval -Force | Out-Null
+    foreach ($name in @($names | Select-Object -Unique)) {
+        New-ItemProperty -LiteralPath $approval -Name $name -PropertyType Binary -Value ([byte[]](3,0,0,0,0,0,0,0,0,0,0,0)) -Force | Out-Null
+    }
+}
+'@
+    $tokens=$null; $errors=$null
+    [void][Management.Automation.Language.Parser]::ParseInput($code,[ref]$tokens,[ref]$errors)
+    if ($errors.Count -gt 0) {throw 'Student OneDrive logon helper has parser errors.'}
+    [IO.File]::WriteAllText($path,$code,(New-Object Text.UTF8Encoding($true)))
+    $component = 'HKLM:\SOFTWARE\Microsoft\Active Setup\Installed Components\{2D9F5842-281D-4BCF-9AEC-9A4624CA7341}'
+    New-Item -Path $component -Force -ErrorAction Stop | Out-Null
+    $ps = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+    $command = '"'+$ps+'" -NoLogo -NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File "'+$path+'"'
+    New-ItemProperty -LiteralPath $component -Name StubPath -PropertyType String -Value $command -Force -ErrorAction Stop | Out-Null
+    New-ItemProperty -LiteralPath $component -Name Version -PropertyType String -Value '1,0,2,0' -Force -ErrorAction Stop | Out-Null
+    New-ItemProperty -LiteralPath $component -Name IsInstalled -PropertyType DWord -Value 1 -Force -ErrorAction Stop | Out-Null
+    Write-RunnerLog -Message 'Registered CC-Student OneDrive startup suppression; MISAdmin is excluded from changes.'
+}
+
+function Invoke-StartupHiveUnload {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][string]$MountName)
+
+    # Native stderr must not escape a caller's finally block under PowerShell 5.1.
+    $ErrorActionPreference = 'Continue'
+    try {
+        $nativeOutput = @(& reg.exe unload "HKU\$MountName" 2>&1)
+        $nativeExitCode = $LASTEXITCODE
+        return [pscustomobject]@{
+            Success = ($nativeExitCode -eq 0)
+            Message = "ExitCode=$nativeExitCode; $($nativeOutput -join ' ')"
+        }
+    }
+    catch {
+        return [pscustomobject]@{ Success=$false; Message=[string]$_.Exception.Message }
+    }
+}
+
 function Set-StartupAllowlistForHive {
     [CmdletBinding()]
     param(
@@ -5962,12 +6448,75 @@ function Set-StartupAllowlistForHive {
         [AllowEmptyString()][string]$ProfilePath,
         [Parameter(Mandatory)][string[]]$AllowList,
         [Parameter(Mandatory)][System.Collections.IDictionary]$Counters,
-        [switch]$MachineScope
+        [switch]$MachineScope,
+        [switch]$PaperCutOnly
     )
 
     $base = "$HiveRoot\Software\Microsoft\Windows\CurrentVersion"
     $approvedBase = "$base\Explorer\StartupApproved"
     $processed = @{}
+    $studentProfile = $false
+    if (-not $MachineScope -and -not [string]::IsNullOrWhiteSpace($ProfilePath)) {
+        $studentProfile = (Split-Path -Leaf $ProfilePath) -match '^(?i:CC-Student|MISAdmin)(?:\..+)?$'
+        # Resolve the registered SID when possible; profile folders can be renamed.
+        foreach ($profile in @(Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList\*' -ErrorAction SilentlyContinue)) {
+            if ([Environment]::ExpandEnvironmentVariables([string]$profile.ProfileImagePath) -ine $ProfilePath) { continue }
+            try {
+                $sid = New-Object Security.Principal.SecurityIdentifier([string]$profile.PSChildName)
+                $account = $sid.Translate([Security.Principal.NTAccount]).Value
+                $studentProfile = (($account -split '\\')[-1] -in @('CC-Student','MISAdmin'))
+            } catch { }
+            break
+        }
+    }
+
+    # Runs under SYSTEM: edit the actual user hive, never SYSTEM's HKCU.
+    # Default User receives these values too, so newly created profiles inherit them.
+    if (-not $MachineScope -and -not $PaperCutOnly -and -not $studentProfile) {
+        $oneDrivePolicy = "$HiveRoot\Software\Policies\Microsoft\OneDrive"
+        New-Item -Path $oneDrivePolicy -Force -ErrorAction Stop | Out-Null
+        New-ItemProperty -LiteralPath $oneDrivePolicy -Name 'EnableAutoStart' -PropertyType DWord -Value 1 -Force -ErrorAction Stop | Out-Null
+        # Suppress the end-of-setup tutorial; this does not bypass authentication.
+        $oneDriveUserSettings = "$HiveRoot\Software\Microsoft\OneDrive"
+        New-Item -Path $oneDriveUserSettings -Force -ErrorAction Stop | Out-Null
+        New-ItemProperty -LiteralPath $oneDriveUserSettings -Name 'DisableTutorial' -PropertyType DWord -Value 1 -Force -ErrorAction Stop | Out-Null
+        # Retry a recorded OneAuth failure only for profiles without a business account.
+        # Preserve successful setup markers and all existing account configurations.
+        $businessAccounts = @(Get-ChildItem -LiteralPath "$oneDriveUserSettings\Accounts" -ErrorAction SilentlyContinue |
+            Where-Object { $_.PSChildName -like 'Business*' })
+        if ($businessAccounts.Count -eq 0) {
+            $settings = Get-ItemProperty -LiteralPath $oneDriveUserSettings -ErrorAction Stop
+            if ($null -ne $settings.PSObject.Properties['OneAuthUnrecoverableTimestamp']) {
+                Remove-ItemProperty -LiteralPath $oneDriveUserSettings -Name 'OneAuthUnrecoverableTimestamp' -ErrorAction Stop
+                Write-RunnerLog -Message "Cleared OneAuth failure timestamp for $Scope; silent setup will be retried at Windows sign-in."
+            }
+        }
+        $oneDriveExe = $null
+        foreach ($programRoot in @($env:ProgramW6432, $env:ProgramFiles, ${env:ProgramFiles(x86)})) {
+            if ([string]::IsNullOrWhiteSpace($programRoot)) { continue }
+            $candidate = Join-Path $programRoot 'Microsoft OneDrive\OneDrive.exe'
+            if (Test-Path -LiteralPath $candidate -PathType Leaf) { $oneDriveExe = $candidate; break }
+        }
+        if (-not $oneDriveExe) {
+            # Keep the variable unexpanded for future profiles; Windows expands it at login.
+            $oneDriveExe = '%LOCALAPPDATA%\Microsoft\OneDrive\OneDrive.exe'
+            $profileExe = Join-Path $ProfilePath 'AppData\Local\Microsoft\OneDrive\OneDrive.exe'
+            if (-not (Test-Path -LiteralPath $profileExe -PathType Leaf)) {
+                Write-RunnerLog -Message "OneDrive executable missing for $Scope. Startup configured, but install OneDrive (preferably per-machine) before login validation." -Level 'WARNING'
+            }
+        }
+        $runPath = "$base\Run"
+        New-Item -Path $runPath -Force -ErrorAction Stop | Out-Null
+        # Normal launch allows setup/sign-in UI when silent configuration cannot finish.
+        $oneDriveCommand = '"{0}"' -f $oneDriveExe
+        New-ItemProperty -LiteralPath $runPath -Name 'OneDrive' -PropertyType ExpandString -Value $oneDriveCommand -Force -ErrorAction Stop | Out-Null
+        $key = Get-Item -LiteralPath $runPath -ErrorAction Stop
+        try { $actual = $key.GetValue('OneDrive', $null, [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames) }
+        finally { $key.Close() }
+        if ($actual -cne $oneDriveCommand) { throw "OneDrive startup verification failed for $Scope." }
+        if ((Get-ItemPropertyValue -LiteralPath $oneDrivePolicy -Name 'EnableAutoStart' -ErrorAction Stop) -ne 1) { throw "OneDrive autostart policy verification failed for $Scope." }
+        Write-RunnerLog -Message "OneDrive login startup configured for $Scope; interactive sign-in remains available."
+    }
 
     $wowBase = "$HiveRoot\Software\WOW6432Node\Microsoft\Windows\CurrentVersion"
     $runMappings = @(
@@ -5980,7 +6529,9 @@ function Set-StartupAllowlistForHive {
         $properties = (Get-ItemProperty -LiteralPath $mapping.Source -ErrorAction Stop).PSObject.Properties |
             Where-Object { $_.Name -notmatch '^PS' }
         foreach ($property in @($properties)) {
+            if ($PaperCutOnly -and -not (Test-PaperCutInitialiseStartup -Name $property.Name -Command ([string]$property.Value))) { continue }
             $allowed = Test-StartupItemAllowed -Name $property.Name -Command ([string]$property.Value) -AllowList $AllowList
+            if ($studentProfile -and ($property.Name -like '*OneDrive*' -or [string]$property.Value -match '(?i)OneDrive\.exe')) { $allowed = $false }
             Set-StartupApprovedState -Path $mapping.Approved -Name $property.Name -Enabled $allowed -Counters $Counters -Scope $Scope
             $processed[("{0}|{1}" -f $mapping.Approved,$property.Name).ToLowerInvariant()] = $true
         }
@@ -5997,7 +6548,9 @@ function Set-StartupAllowlistForHive {
     if (-not [string]::IsNullOrWhiteSpace($startupFolder) -and (Test-Path -LiteralPath $startupFolder -PathType Container)) {
         foreach ($file in @(Get-ChildItem -LiteralPath $startupFolder -File -Force -ErrorAction SilentlyContinue)) {
             $target = Get-StartupShortcutTarget -Path $file.FullName
+            if ($PaperCutOnly -and -not (Test-PaperCutInitialiseStartup -Name $file.Name -Command $target)) { continue }
             $allowed = Test-StartupItemAllowed -Name $file.Name -Command $target -AllowList $AllowList
+            if ($studentProfile -and ($file.Name -like '*OneDrive*' -or $target -match '(?i)OneDrive\.exe')) { $allowed = $false }
             $approvedPath = "$approvedBase\StartupFolder"
             Set-StartupApprovedState -Path $approvedPath -Name $file.Name -Enabled $allowed -Counters $Counters -Scope $Scope
             $processed[("{0}|{1}" -f $approvedPath,$file.Name).ToLowerInvariant()] = $true
@@ -6014,11 +6567,41 @@ function Set-StartupAllowlistForHive {
         foreach ($property in @($properties)) {
             $identity = ("{0}|{1}" -f $approvedPath,$property.Name).ToLowerInvariant()
             if ($processed.ContainsKey($identity)) { continue }
+            if ($PaperCutOnly -and -not (Test-PaperCutInitialiseStartup -Name $property.Name -Command '')) { continue }
             $allowed = Test-StartupItemAllowed -Name $property.Name -Command '' -AllowList $AllowList
+            if ($studentProfile -and $property.Name -like '*OneDrive*') { $allowed = $false }
             Set-StartupApprovedState -Path $approvedPath -Name $property.Name -Enabled $allowed -Counters $Counters -Scope $Scope
         }
     }
 
+
+    if (-not $MachineScope) {
+        $machineBase = 'Registry::HKEY_LOCAL_MACHINE\Software'
+        foreach ($map in @(
+            @{Source="$machineBase\Microsoft\Windows\CurrentVersion\Run";Approval='Run'},
+            @{Source="$machineBase\WOW6432Node\Microsoft\Windows\CurrentVersion\Run";Approval='Run32'}
+        )) {
+            if (-not (Test-Path -LiteralPath $map.Source)) { continue }
+            $properties = (Get-ItemProperty -LiteralPath $map.Source -ErrorAction Stop).PSObject.Properties
+            foreach ($property in $properties) {
+                if ($property.Name -match '^PS') { continue }
+                if (Test-PaperCutInitialiseStartup -Name $property.Name -Command ([string]$property.Value)) {
+                    Set-StartupApprovedState -Path "$approvedBase\$($map.Approval)" -Name $property.Name -Enabled $true -Counters $Counters -Scope $Scope
+                }
+            }
+        }
+        $commonStartup = Join-Path $env:ProgramData 'Microsoft\Windows\Start Menu\Programs\Startup'
+        foreach ($file in @(Get-ChildItem -LiteralPath $commonStartup -File -Force -ErrorAction SilentlyContinue)) {
+            $target = Get-StartupShortcutTarget -Path $file.FullName
+            if (Test-PaperCutInitialiseStartup -Name $file.Name -Command $target) {
+                Set-StartupApprovedState -Path "$approvedBase\StartupFolder" -Name $file.Name -Enabled $true -Counters $Counters -Scope $Scope
+            }
+        }
+    }
+
+    if ($studentProfile -and -not $PaperCutOnly) {
+        Disable-StudentOneDriveStartupForHive -HiveRoot $HiveRoot -Counters $Counters -Scope $Scope
+    }
     $Counters.HivesProcessed++
 }
 
@@ -6119,6 +6702,39 @@ function Invoke-StartupAppAllowlistSection {
         }
     }
 
+    try { Install-StudentOneDriveLogonPolicy }
+    catch {
+        $counters.Failures++
+        $failureMessages.Add("CC-Student OneDrive logon policy: $($_.Exception.Message)") | Out-Null
+        Write-RunnerLog -Message "CC-Student OneDrive logon policy failed: $($_.Exception.Message)" -Level 'ERROR'
+    }
+
+    # OneDrive startup approval alone does not configure sign-in or create a Run entry.
+    try {
+        $oneDriveMachinePolicy = 'HKLM:\SOFTWARE\Policies\Microsoft\OneDrive'
+        $oneDriveWindowsPolicy = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\OneDrive'
+        foreach ($path in @($oneDriveMachinePolicy, $oneDriveWindowsPolicy)) {
+            New-Item -Path $path -Force -ErrorAction Stop | Out-Null
+        }
+        foreach ($setting in @(
+            @{ Path=$oneDriveMachinePolicy; Name='SilentAccountConfig'; Value=1 },
+            @{ Path=$oneDriveMachinePolicy; Name='DisableAutoConfig'; Value=0 },
+            @{ Path=$oneDriveMachinePolicy; Name='FilesOnDemandEnabled'; Value=1 },
+            @{ Path=$oneDriveWindowsPolicy; Name='DisableFileSyncNGSC'; Value=0 }
+        )) {
+            New-ItemProperty -LiteralPath $setting.Path -Name $setting.Name -PropertyType DWord -Value $setting.Value -Force -ErrorAction Stop | Out-Null
+            if ((Get-ItemPropertyValue -LiteralPath $setting.Path -Name $setting.Name -ErrorAction Stop) -ne $setting.Value) {
+                throw "OneDrive policy verification failed: $($setting.Name)"
+            }
+        }
+        Write-RunnerLog -Message 'OneDrive enabled; Windows-credential sign-in requested. Entra/hybrid join and authentication policy determine silent sign-in success. No user sign-in was tested under SYSTEM.'
+    }
+    catch {
+        $counters.Failures++
+        $failureMessages.Add("OneDrive machine policies: $($_.Exception.Message)") | Out-Null
+        Write-RunnerLog -Message "OneDrive machine policy configuration failed: $($_.Exception.Message)" -Level 'ERROR'
+    }
+
     # Prevent Edge Startup Boost and background mode from recreating a browser
     # startup entry after the allowlist has disabled msedge.exe.
     try {
@@ -6145,14 +6761,25 @@ function Invoke-StartupAppAllowlistSection {
     }
 
     $profileEntries = @(Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList\*' -ErrorAction SilentlyContinue |
-        Where-Object { $_.PSChildName -match '^S-1-5-21-(?:\d+-){3}\d+$' })
+        Where-Object { $_.PSChildName -match '^S-1-(?:5-21|12-1)-(?:\d+-){3}\d+$' })
     $loadedSids = @(Get-ChildItem Registry::HKEY_USERS -ErrorAction SilentlyContinue |
-        Where-Object { $_.PSChildName -match '^S-1-5-21-(?:\d+-){3}\d+$' } |
+        Where-Object { $_.PSChildName -match '^S-1-(?:5-21|12-1)-(?:\d+-){3}\d+$' } |
         Select-Object -ExpandProperty PSChildName)
 
     foreach ($profile in $profileEntries) {
         $sid = [string]$profile.PSChildName
         $profilePath = [Environment]::ExpandEnvironmentVariables([string]$profile.ProfileImagePath)
+        # Do not mount or modify the excluded local maintenance account's hive.
+        $skipMaintenanceProfile = (Split-Path -Leaf $profilePath) -match '^(?i:MISAdmin)(?:\..+)?$'
+        try {
+            $profileSid = New-Object Security.Principal.SecurityIdentifier($sid)
+            $profileAccount = $profileSid.Translate([Security.Principal.NTAccount]).Value
+            if (($profileAccount -split '\\')[-1] -ieq 'MISAdmin') { $skipMaintenanceProfile = $true }
+        } catch { }
+        if ($skipMaintenanceProfile) {
+            Write-RunnerLog -Message "Skipping MISAdmin startup profile without mounting or changing its hive: $profilePath."
+            continue
+        }
         if ($sid -in $loadedSids) {
             try {
                 Set-StartupAllowlistForHive -HiveRoot "Registry::HKEY_USERS\$sid" -Scope $profilePath -ProfilePath $profilePath -AllowList $AllowList -Counters $counters
@@ -6183,7 +6810,12 @@ function Invoke-StartupAppAllowlistSection {
         finally {
             if ($mounted) {
                 [gc]::Collect(); [gc]::WaitForPendingFinalizers()
-                & reg.exe unload "HKU\$mountName" 2>&1 | Out-Null
+                $unloadResult = Invoke-StartupHiveUnload -MountName $mountName
+                if (-not $unloadResult.Success) {
+                    $counters.Failures++
+                    $failureMessages.Add("Hive unload $mountName`: $($unloadResult.Message)") | Out-Null
+                    Write-RunnerLog -Message "Startup hive unload failed for $mountName`: $($unloadResult.Message)" -Level 'ERROR'
+                }
             }
         }
     }
@@ -6206,7 +6838,12 @@ function Invoke-StartupAppAllowlistSection {
         finally {
             if ($mounted) {
                 [gc]::Collect(); [gc]::WaitForPendingFinalizers()
-                & reg.exe unload "HKU\$mountName" 2>&1 | Out-Null
+                $unloadResult = Invoke-StartupHiveUnload -MountName $mountName
+                if (-not $unloadResult.Success) {
+                    $counters.Failures++
+                    $failureMessages.Add("Hive unload $mountName`: $($unloadResult.Message)") | Out-Null
+                    Write-RunnerLog -Message "Startup hive unload failed for $mountName`: $($unloadResult.Message)" -Level 'ERROR'
+                }
             }
         }
     }
@@ -6246,6 +6883,288 @@ function Invoke-StartupAppAllowlistSection {
         HpNotificationProcessesStopped=[int]$hpSuppression.ProcessesStopped
         HpNotificationTasksDisabled=[int]$hpSuppression.TasksDisabled
         FailureCount=$counters.Failures
+    }
+}
+
+function Get-ForwardingPolicyState {
+    param($Value,[string]$Store)
+    $text=[string]$Value
+    if ($text -in @('Disabled','0')) { return 'Disabled' }
+    if ($text -in @('Enabled','1')) { return 'Enabled' }
+    if ($Store -eq 'PersistentStore' -and ([string]::IsNullOrWhiteSpace($text) -or $text -in @('NotConfigured','2'))) { return 'Inherited' }
+    return 'Unknown'
+}
+
+function Invoke-RemoteAccessDisableSection {
+    [CmdletBinding()]
+    param()
+    $started = Get-Date
+    $status = 'Failed'
+    $success = $false
+    $beforeStatus = 'Unknown'
+    $beforeStartup = 'Unknown'
+    $afterStatus = 'Unknown'
+    $afterStartup = 'Unknown'
+    $changesMade = $false
+    $routingBefore = $null
+    $routingAfter = $null
+    $forwardingChanged = 0
+    $rebootRequired = $false
+    $failure = ''
+    Write-RunnerLog -Message 'Starting lab policy: stop and disable Routing and Remote Access (RemoteAccess).'
+    try {
+        # Script 04 is for lab workstations; do not apply this service policy to servers.
+        $os = Get-CimInstance -ClassName Win32_OperatingSystem -ErrorAction Stop
+        if ([int]$os.ProductType -ne 1) {
+            $status = 'SkippedNonWorkstation'
+            $success = $true
+            Write-RunnerLog -Message 'RemoteAccess policy skipped: this system is not a workstation.' -Level 'WARNING'
+        }
+        else {
+            $service = $null
+            try { $service = Get-Service -Name 'RemoteAccess' -ErrorAction Stop }
+            catch {
+                if ($_.FullyQualifiedErrorId -notlike 'NoServiceFoundForGivenName*') { throw }
+            }
+            if ($null -eq $service) {
+                $status = 'NotInstalled'
+                $success = $true
+                $afterStatus = 'NotInstalled'
+                $afterStartup = 'NotInstalled'
+            }
+            else {
+                $beforeStatus = [string]$service.Status
+                $beforeStartup = [string]$service.StartType
+                if ($beforeStartup -ne 'Disabled') {
+                    Set-Service -Name 'RemoteAccess' -StartupType Disabled -ErrorAction Stop
+                    $changesMade = $true
+                }
+                # ServiceController waits are bounded; no dependent services are force-stopped.
+                $service.Refresh()
+                if ([string]$service.Status -ne 'Stopped') {
+                    if ([string]$service.Status -ne 'StopPending') { $service.Stop() }
+                    $service.WaitForStatus([System.ServiceProcess.ServiceControllerStatus]::Stopped,[TimeSpan]::FromSeconds(15))
+                    $changesMade = $true
+                }
+                $verified = Get-Service -Name 'RemoteAccess' -ErrorAction Stop
+                $afterStatus = [string]$verified.Status
+                $afterStartup = [string]$verified.StartType
+                if ($afterStatus -ne 'Stopped' -or $afterStartup -ne 'Disabled') {
+                    throw "RemoteAccess verification failed: State=$afterStatus; Startup=$afterStartup"
+                }
+                $success = $true
+                $status = if ($changesMade) { 'Configured' } else { 'AlreadyCompliant' }
+            }
+            # Apply the routing policy even when the RemoteAccess service is absent.
+            $routingPath = 'HKLM:\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters'
+            $routingItem = Get-ItemProperty -LiteralPath $routingPath -ErrorAction Stop
+            $routingProperty = $routingItem.PSObject.Properties['IPEnableRouter']
+            if ($null -ne $routingProperty) { $routingBefore = [int]$routingProperty.Value }
+            if ($null -eq $routingBefore -or $routingBefore -ne 0) {
+                New-ItemProperty -LiteralPath $routingPath -Name 'IPEnableRouter' -PropertyType DWord -Value 0 -Force -ErrorAction Stop | Out-Null
+                $changesMade = $true
+                $rebootRequired = $true
+            }
+            foreach ($store in @('ActiveStore','PersistentStore')) {
+                foreach ($interface in @(Get-NetIPInterface -AddressFamily IPv4 -PolicyStore $store -ErrorAction Stop)) {
+                    if ((Get-ForwardingPolicyState -Value $interface.Forwarding -Store $store) -eq 'Enabled') {
+                        Set-NetIPInterface -InterfaceIndex $interface.InterfaceIndex -AddressFamily IPv4 -PolicyStore $store -Forwarding Disabled -ErrorAction Stop
+                        $forwardingChanged++
+                        $changesMade = $true
+                        $rebootRequired = $true
+                    }
+                }
+                $verifiedInterfaces = @(Get-NetIPInterface -AddressFamily IPv4 -PolicyStore $store -ErrorAction Stop)
+                $remaining = @($verifiedInterfaces | Where-Object { (Get-ForwardingPolicyState -Value $_.Forwarding -Store $store) -notin @('Disabled','Inherited') })
+                if ($remaining.Count -gt 0) {
+                    $details = ($remaining | ForEach-Object { "Index=$($_.InterfaceIndex),Alias=$($_.InterfaceAlias),Forwarding=$($_.Forwarding)" }) -join '; '
+                    throw "IPv4 forwarding verification failed in $store for $($remaining.Count) interface(s): $details"
+                }
+                Write-RunnerLog -Message ("IPv4 forwarding verified: Store=$store; Interfaces=$($verifiedInterfaces.Count); inherited persistent values are permitted only with disabled active forwarding.")
+            }
+            $activeRemaining = @(Get-NetIPInterface -AddressFamily IPv4 -PolicyStore ActiveStore -ErrorAction Stop | Where-Object { (Get-ForwardingPolicyState -Value $_.Forwarding -Store ActiveStore) -ne 'Disabled' })
+            if ($activeRemaining.Count) { throw 'IPv4 active forwarding is not verified disabled after persistent configuration.' }
+            $routingAfter = [int](Get-ItemPropertyValue -LiteralPath $routingPath -Name 'IPEnableRouter' -ErrorAction Stop)
+            if ($routingAfter -ne 0) { throw "IPEnableRouter verification failed: $routingAfter" }
+            $success = $true
+            $status = if ($changesMade) { 'Configured' } else { 'AlreadyCompliant' }
+            Write-RunnerLog -Message "IP_ROUTING_POLICY|IPEnableRouter=$routingAfter|IPv4Forwarding=Disabled|ChangedInterfaceSettings=$forwardingChanged|RebootRequired=$rebootRequired|VerifyAfterReboot=ipconfig/all" -Level 'SUCCESS'
+        }
+    }
+    catch {
+        $success = $false
+        $status = 'Failed'
+        $failure = $_.Exception.Message
+        Write-RunnerLog -Message "RemoteAccess lab policy failed: $failure" -Level 'ERROR'
+    }
+    $duration = [math]::Round(((Get-Date) - $started).TotalSeconds,2)
+    $event = [pscustomobject][ordered]@{
+        EventType='maintenance.remote_access_policy';ComputerName=[string]$env:COMPUTERNAME
+        ScriptName=$RunnerScriptName;ScriptVersion=$RunnerVersion;RunId=$RunnerRunId
+        TimestampUtc=(Get-Date).ToUniversalTime().ToString('o');Status=$status
+        ServiceName='RemoteAccess';PreviousState=$beforeStatus;PreviousStartupType=$beforeStartup
+        VerifiedState=$afterStatus;VerifiedStartupType=$afterStartup;ChangesMade=[bool]$changesMade
+        Success=[bool]$success;FailureMessage=$failure;DurationSeconds=$duration
+        IPEnableRouterBefore=$routingBefore;IPEnableRouterVerified=$routingAfter
+        IPv4ForwardingSettingsChanged=$forwardingChanged;RebootRequired=[bool]$rebootRequired
+    }
+    try {
+        Write-RunnerTelemetryLine -Path $RunnerTelemetryPath -JsonLine ($event | ConvertTo-Json -Depth 4 -Compress)
+        Write-RunnerJsonAtomically -Path (Join-Path $LogDirectory '04_Remote_Access_Policy.latest.json') -Json ($event | ConvertTo-Json -Depth 4)
+    }
+    catch {
+        $success = $false
+        $status = 'Failed'
+        $failure = "RemoteAccess telemetry publication failed: $($_.Exception.Message)"
+        Write-RunnerLog -Message $failure -Level 'ERROR'
+    }
+    Write-RunnerLog -Message "REMOTE_ACCESS_POLICY|Status=$status|Service=RemoteAccess|State=$afterStatus|Startup=$afterStartup|Success=$success" -Level $(if ($success) { 'SUCCESS' } else { 'ERROR' })
+    return [pscustomobject][ordered]@{
+        SectionId='RemoteAccessDisable';DisplayName='Disable lab RemoteAccess and IPv4 routing'
+        ExitCode=$(if ($success) {0} else {1});Success=$success;Status=$status
+        RebootRequired=$rebootRequired;DurationSeconds=$duration;ChangesMade=$changesMade
+        FailureMessage=$failure
+    }
+}
+
+function Invoke-EventLogCapacitySection {
+    # Faronics confirmed that the classic MaxSize registry values drive retained
+    # Event Log volume growth. SSC-108-18 expanded 100 -> 296 MB after a thawed boot.
+    $started=Get-Date
+    $status='Compliant'; $success=$true; $failure=$null
+    $changed=$false; $backup=$null; $freeze='Unknown'
+    $rows=New-Object 'System.Collections.Generic.List[object]'
+    $volumes=New-Object 'System.Collections.Generic.List[object]'
+    try {
+        $installation=Get-DeepFreezeInstallationState
+        $runtime=Get-OfficeDeepFreezeRuntimeState -Installed ([bool]$installation.Installed)
+        $freeze=$runtime.State
+        if ($freeze -eq 'NotInstalled') {$status='SkippedNoDeepFreeze'}
+        elseif ($freeze -eq 'Frozen') {$status='SkippedFrozen'}
+        elseif ($freeze -ne 'Thawed') {throw "Event Log capacity changes blocked: Deep Freeze state is unknown. $($runtime.Detail)"}
+        else {
+            $minimums=[ordered]@{System=32MB;Application=32MB;Security=192MB;HardwareEvents=20MB}
+            # Read the entire plan before changing anything. Preserve larger limits.
+            foreach ($name in $minimums.Keys) {
+                $effective=$null; $file=$null; $apiAvailable=$false; $apiFailure=$null
+                try {
+                    $config=New-Object System.Diagnostics.Eventing.Reader.EventLogConfiguration -ArgumentList $name -ErrorAction Stop
+                    try {
+                        $effective=[long]$config.MaximumSizeInBytes
+                        $file=[Environment]::ExpandEnvironmentVariables([string]$config.LogFilePath)
+                        $apiAvailable=$true
+                    }
+                    finally {$config.Dispose()}
+                }
+                catch {
+                    $apiFailure=$_.Exception.Message
+                    Write-RunnerLog -Message ("Event Log API unavailable for {0}; using direct registry capacity repair: {1}" -f $name,$apiFailure) -Level 'WARNING'
+                    # Preserve a larger configured channel limit without contacting EventLog.
+                    $channelPath="HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WINEVT\Channels\$name"
+                    if (Test-Path -LiteralPath $channelPath -ErrorAction Stop) {
+                        $channel=Get-ItemProperty -LiteralPath $channelPath -ErrorAction Stop
+                        $limitProperty=$channel.PSObject.Properties['MaxSize']
+                        if ($null -ne $limitProperty) {
+                            $effective=[long]$limitProperty.Value
+                            if ($effective -lt 0) {throw "Invalid channel MaxSize for $name."}
+                        }
+                    }
+                }
+                $path="HKLM:\SYSTEM\CurrentControlSet\Services\EventLog\$name"
+                $key=Get-Item -LiteralPath $path -ErrorAction Stop
+                try {
+                    $old=$key.GetValue('MaxSize',$null)
+                    if (-not $file) {$file=[Environment]::ExpandEnvironmentVariables([string]$key.GetValue('File',''))}
+                    $kind=if ($null -ne $old) {[string]$key.GetValueKind('MaxSize')} else {'Missing'}
+                }
+                finally {$key.Close()}
+                if ($null -ne $old -and ($kind -ne 'DWord' -or [long]$old -lt 0)) {
+                    throw "Unexpected MaxSize registry type/value for $name; review manually."
+                }
+                if ([string]::IsNullOrWhiteSpace($file)) {throw "Missing Event Log file path for $name; review manually."}
+                $target=[long][math]::Max([double]$minimums[$name],[double]$effective)
+                if ($null -ne $old) {$target=[long][math]::Max([double]$target,[double]$old)}
+                if ($target -gt [int]::MaxValue) {throw "MaxSize for $name exceeds the supported repair range; review manually."}
+                [void]$rows.Add([pscustomobject]@{
+                    Log=$name;RegistryPath=$path;LogFile=$file;RegistryBeforeBytes=$old
+                    EffectiveBeforeBytes=$effective;TargetBytes=$target;RegistryAfterBytes=$old
+                    EffectiveAfterBytes=$effective;Changed=$false
+                    ApiAvailable=$apiAvailable;ApiFailure=$apiFailure;EffectiveVerificationDeferred=(-not $apiAvailable)
+                })
+            }
+            $needsChange=@($rows | Where-Object {$_.RegistryBeforeBytes -ne $_.TargetBytes -or ($_.ApiAvailable -and $_.EffectiveBeforeBytes -ne $_.TargetBytes)}).Count -gt 0
+            if ($needsChange) {
+                # Recheck immediately before the first write; no thaw or reboot here.
+                $runtime=Get-OfficeDeepFreezeRuntimeState -Installed $true
+                if ($runtime.State -ne 'Thawed') {throw 'Deep Freeze is no longer verified thawed; Event Log changes blocked.'}
+                $backupFolder=Join-Path $LogDirectory 'EventLogResize'
+                New-Item -Path $backupFolder -ItemType Directory -Force -ErrorAction Stop | Out-Null
+                $backup=Join-Path $backupFolder ("EventLog-BeforeResize-$RunnerRunId.reg")
+                & "$env:SystemRoot\System32\reg.exe" export 'HKLM\SYSTEM\CurrentControlSet\Services\EventLog' $backup /y | Out-Null
+                $backupExit=$LASTEXITCODE
+                if ($backupExit -ne 0 -or -not (Test-Path -LiteralPath $backup -PathType Leaf)) {throw 'Event Log registry backup failed; no settings changed.'}
+                foreach ($row in $rows) {
+                    if ($row.ApiAvailable -and $row.EffectiveBeforeBytes -ne $row.TargetBytes) {
+                        $changed=$true; $row.Changed=$true
+                        $config=New-Object System.Diagnostics.Eventing.Reader.EventLogConfiguration -ArgumentList $row.Log
+                        try {$config.MaximumSizeInBytes=$row.TargetBytes;$config.SaveChanges()}
+                        finally {$config.Dispose()}
+                    }
+                    if ($row.RegistryBeforeBytes -ne $row.TargetBytes) {
+                        $changed=$true; $row.Changed=$true
+                        New-ItemProperty -LiteralPath $row.RegistryPath -Name MaxSize -PropertyType DWord -Value ([int]$row.TargetBytes) -Force -ErrorAction Stop | Out-Null
+                    }
+                    $row.RegistryAfterBytes=[long](Get-ItemProperty -LiteralPath $row.RegistryPath -Name MaxSize -ErrorAction Stop).MaxSize
+                    if ($row.RegistryAfterBytes -ne $row.TargetBytes) {throw "Event Log registry size verification failed for $($row.Log)."}
+                    if ($row.ApiAvailable) {
+                        $config=New-Object System.Diagnostics.Eventing.Reader.EventLogConfiguration -ArgumentList $row.Log
+                        try {$row.EffectiveAfterBytes=[long]$config.MaximumSizeInBytes}
+                        finally {$config.Dispose()}
+                        if ($row.EffectiveAfterBytes -ne $row.TargetBytes) {throw "Event Log effective size verification failed for $($row.Log). Policy may be overriding the limit."}
+                    }
+                }
+                $status='ConfiguredPendingThawedRestart'
+            }
+            elseif (@($rows | Where-Object {-not $_.ApiAvailable}).Count -gt 0) {
+                $status='RegistryCompliantPendingThawedRestart'
+            }
+        }
+    }
+    catch {$success=$false;$status='Failed';$failure=$_.Exception.Message}
+    # Capture actual backing-volume information; C: free space alone is insufficient
+    # when the retained log folder is a separate mount point. Diagnostic only.
+    foreach ($folder in @($rows | ForEach-Object {Split-Path -Parent $_.LogFile} | Sort-Object -Unique)) {
+        try {
+            $text=@(& "$env:SystemRoot\System32\fsutil.exe" volume diskfree $folder 2>&1)
+            $code=$LASTEXITCODE
+            [void]$volumes.Add([pscustomobject]@{Folder=$folder;QueryExitCode=$code;DiskFreeOutput=($text -join "`n")})
+        }
+        catch {[void]$volumes.Add([pscustomobject]@{Folder=$folder;QueryExitCode=$null;DiskFreeOutput=$_.Exception.Message})}
+    }
+    $restartRequired=$changed -or ($status -eq 'RegistryCompliantPendingThawedRestart')
+    $serviceState='Unknown'
+    try {$serviceState=[string](Get-Service -Name EventLog -ErrorAction Stop).Status} catch {}
+    $event=[pscustomobject][ordered]@{
+        EventType='maintenance.eventlog_capacity';ComputerName=[string]$env:COMPUTERNAME
+        ScriptName=$RunnerScriptName;ScriptVersion=$RunnerVersion;RunId=$RunnerRunId
+        TimestampUtc=[datetime]::UtcNow.ToString('o');Status=$status;Success=$success
+        DeepFreezeState=$freeze;ChangesMade=$changed;RebootRequired=$restartRequired
+        ResizeVerified=$false;ResizeVerification='Compare retained volume capacity after the next thawed restart; configuration alone does not prove growth.'
+        EventLogServiceState=$serviceState;RegistryBackup=$backup
+        Logs=@($rows.ToArray());Volumes=@($volumes.ToArray());FailureMessage=$failure
+    }
+    try {
+        Write-RunnerTelemetryLine -Path $RunnerTelemetryPath -JsonLine ($event | ConvertTo-Json -Depth 7 -Compress)
+        Write-RunnerJsonAtomically -Path (Join-Path $LogDirectory '04_EventLog_Capacity.latest.json') -Json ($event | ConvertTo-Json -Depth 7)
+    }
+    catch {$success=$false;$failure="Event Log capacity telemetry failed: $($_.Exception.Message)";$status='Failed'}
+    Write-RunnerLog -Message ("EVENTLOG_CAPACITY|Status=$status|DeepFreeze=$freeze|Changed=$changed|Service=$serviceState|Failure=$failure") -Level $(if (-not $success) {'ERROR'} elseif ($freeze -eq 'Frozen') {'WARNING'} else {'INFO'})
+    foreach ($row in $rows) {Write-RunnerLog -Message ("EVENTLOG_LIMIT|Log=$($row.Log)|RegistryBefore=$($row.RegistryBeforeBytes)|EffectiveBefore=$($row.EffectiveBeforeBytes)|Target=$($row.TargetBytes)|RegistryAfter=$($row.RegistryAfterBytes)|EffectiveAfter=$($row.EffectiveAfterBytes)")}
+    return [pscustomobject]@{
+        SectionId='EventLogCapacity';DisplayName='Deep Freeze retained Event Log capacity configuration'
+        ExitCode=$(if (-not $success) {1} elseif ($restartRequired) {3010} else {0})
+        Success=$success;Status=$status;RebootRequired=$restartRequired;ChangesMade=$changed
+        DurationSeconds=[math]::Round(((Get-Date)-$started).TotalSeconds,2);FailureMessage=$failure
     }
 }
 
@@ -6437,7 +7356,7 @@ function Invoke-PostMaintenanceCopilotCleanupSection {
     }
     catch {
         $failureMessages.Add([string]$_.Exception.Message) | Out-Null
-        Write-RunnerLog -Message "Post-maintenance Copilot cleanup failed: $($_.Exception.Message)" -Level 'ERROR'
+        Write-RunnerLog -Message "Post-maintenance Copilot cleanup failed (non-fatal; continuing): $($_.Exception.Message)" -Level 'WARNING'
     }
 
     $duration = [math]::Round(((Get-Date) - $started).TotalSeconds, 2)
@@ -6462,7 +7381,9 @@ function Invoke-PostMaintenanceCopilotCleanupSection {
         ScriptVersion                = $RunnerVersion
         RunId                        = $RunnerRunId
         TimestampUtc                 = (Get-Date).ToUniversalTime().ToString('o')
-        Status                       = if ($success) { 'Success' } else { 'Failed' }
+        Status                       = if ($success) { 'Success' } else { 'Warning' }
+        CleanupSucceeded             = $success
+        NonFatal                     = $true
         ModuleStatus                 = $moduleStatus
         ModulePath                   = $modulePath
         InstalledPackagesFound       = $installedFound
@@ -6491,17 +7412,20 @@ function Invoke-PostMaintenanceCopilotCleanupSection {
     catch {
         $success = $false
         $failureMessages.Add("Telemetry: $($_.Exception.Message)") | Out-Null
-        Write-RunnerLog -Message "Unable to publish Copilot cleanup telemetry: $($_.Exception.Message)" -Level 'ERROR'
+        Write-RunnerLog -Message "Unable to publish Copilot cleanup telemetry (non-fatal): $($_.Exception.Message)" -Level 'WARNING'
     }
 
     Write-RunnerLog `
-        -Message "Completed section: $displayName. DesktopRemoved=$desktopRemoved; InstalledRemoved=$installedRemoved; ProvisionedRemoved=$provisionedRemoved; ExitCode=$(if ($success) { 0 } else { 1 }); DurationSeconds=$duration" `
-        -Level $(if ($success) { 'SUCCESS' } else { 'ERROR' })
+        -Message "Completed section: $displayName. DesktopRemoved=$desktopRemoved; InstalledRemoved=$installedRemoved; ProvisionedRemoved=$provisionedRemoved; CleanupSucceeded=$success; ExitCode=0; NonFatal=True; DurationSeconds=$duration" `
+        -Level $(if ($success) { 'SUCCESS' } else { 'WARNING' })
 
     return [pscustomobject][ordered]@{
         SectionId                    = 'PostMaintenanceCopilotCleanup'
         DisplayName                  = $displayName
-        ExitCode                     = if ($success) { 0 } else { 1 }
+        ExitCode                     = 0
+        CleanupExitCode              = if ($success) { 0 } else { 1 }
+        NonFatal                     = $true
+        Status                       = if ($success) { 'Success' } else { 'Warning' }
         Success                      = $success
         RebootRequired               = $false
         DurationSeconds              = $duration
@@ -6562,6 +7486,8 @@ try {
     }
 
     $sectionPlan = @(
+        [pscustomobject]@{ Id='EventLogCapacity'; Name='Deep Freeze retained Event Log capacity configuration'; Enabled=$true; Settings=[ordered]@{} }
+        [pscustomobject]@{ Id='RemoteAccessDisable'; Name='Disable lab RemoteAccess and IPv4 routing'; Enabled=$RunRemoteAccessDisable; Settings=[ordered]@{} }
         [pscustomobject]@{ Id='SystemRestore'; Name='System Restore and verified restore point'; Enabled=$RunSystemRestore; Settings=[ordered]@{} }
         [pscustomobject]@{ Id='PrinterAndPaperCut'; Name='SHARP driver, PaperCut, and printer'; Enabled=$RunPrinterAndPaperCut; Settings=[ordered]@{} }
         [pscustomobject]@{ Id='Office2024Maintenance'; Name='Office LTSC detection, Office 2024 migration, and activation'; Enabled=$RunOffice2024Maintenance; Settings=[ordered]@{} }
@@ -6571,6 +7497,7 @@ try {
         [pscustomobject]@{ Id='AdobeReaderPolicy'; Name='Adobe Reader local-only lab policy'; Enabled=$RunAdobeReaderPolicy; Settings=[ordered]@{} }
         [pscustomobject]@{ Id='Honorlock'; Name='Honorlock Chrome extension'; Enabled=$RunHonorlock; Settings=[ordered]@{ Patterns=@($HonorlockComputerPatterns) } }
         [pscustomobject]@{ Id='StellariumLocation'; Name='Stellarium Location Services'; Enabled=$RunStellariumLocation; Settings=[ordered]@{ Patterns=@($StellariumComputerPatterns) } }
+        [pscustomobject]@{ Id='LibraryKioskStartup'; Name='CC-Student library Edge kiosk startup'; Enabled=$RunLibraryKioskStartup; Settings=[ordered]@{} }
         [pscustomobject]@{ Id='StartupAppAllowlist'; Name='Windows startup-app allowlist and HP notification suppression'; Enabled=$RunStartupAppAllowlist; Settings=[ordered]@{ AllowedItems=@($AllowedStartupApplications) } }
         [pscustomobject]@{ Id='PostMaintenanceCopilotCleanup'; Name='Post-maintenance Microsoft Copilot cleanup'; Enabled=$RunPostMaintenanceCopilotCleanup; Settings=[ordered]@{} }
     )
@@ -6590,6 +7517,17 @@ try {
             continue
         }
 
+        try {
+        if ($section.Id -eq 'EventLogCapacity') {
+            [void]$results.Add((Invoke-EventLogCapacitySection))
+            continue
+        }
+
+        if ($section.Id -eq 'RemoteAccessDisable') {
+            [void]$results.Add((Invoke-RemoteAccessDisableSection))
+            continue
+        }
+
         if ($section.Id -eq 'Office2024Maintenance') {
             [void]$results.Add((Invoke-Office2024MaintenanceSection))
             continue
@@ -6597,6 +7535,11 @@ try {
 
         if ($section.Id -eq 'ChromeIncognito') {
             [void]$results.Add((Invoke-ChromeIncognitoStartupSection -Patterns @($section.Settings.Patterns)))
+            continue
+        }
+
+        if ($section.Id -eq 'LibraryKioskStartup') {
+            [void]$results.Add((Invoke-LibraryKioskStartupSection))
             continue
         }
 
@@ -6611,7 +7554,19 @@ try {
         }
 
         if ($section.Id -eq 'PostMaintenanceCopilotCleanup') {
-            [void]$results.Add((Invoke-PostMaintenanceCopilotCleanupSection))
+            try {
+                [void]$results.Add((Invoke-PostMaintenanceCopilotCleanupSection))
+            }
+            catch {
+                # Also isolate unexpected errors outside the cleanup function's inner try.
+                Write-RunnerLog -Message "Copilot section error (non-fatal; continuing): $($_.Exception.Message)" -Level 'WARNING'
+                [void]$results.Add([pscustomobject][ordered]@{
+                    SectionId='PostMaintenanceCopilotCleanup'; DisplayName=$section.Name
+                    ExitCode=0; CleanupExitCode=1; Success=$false; NonFatal=$true
+                    Status='Warning'; RebootRequired=$false; DurationSeconds=0
+                    FailureCount=1; FailureMessage=$_.Exception.Message
+                })
+            }
             continue
         }
 
@@ -6622,10 +7577,28 @@ try {
             -StagedScriptPath $sectionPath `
             -Settings $section.Settings
         [void]$results.Add($sectionResult)
+        }
+        catch {
+            $sectionError = $_
+            $details = "Section=$($section.Id); Message=$($sectionError.Exception.Message); Line=$($sectionError.InvocationInfo.ScriptLineNumber); Position=$($sectionError.InvocationInfo.PositionMessage); Stack=$($sectionError.ScriptStackTrace)"
+            Write-RunnerLog -Message "Section failed; continuing to next section. $details" -Level 'ERROR'
+            [void]$results.Add([pscustomobject][ordered]@{
+                SectionId=[string]$section.Id; DisplayName=[string]$section.Name
+                ExitCode=1; Success=$false; Status='Failed'; RebootRequired=$false
+                DurationSeconds=0; FailureMessage=$details
+            })
+        }
     }
 
     [object[]]$resultArray = $results.ToArray()
-    [object[]]$failedSections = @($resultArray | Where-Object { -not $_.Success })
+    [object[]]$copilotWarnings = @($resultArray | Where-Object {
+        $_.SectionId -eq 'PostMaintenanceCopilotCleanup' -and -not $_.Success -and
+        [bool](Get-RunnerPropertyValueSafe -InputObject $_ -Name 'NonFatal')
+    })
+    [object[]]$failedSections = @($resultArray | Where-Object {
+        -not $_.Success -and -not ($_.SectionId -eq 'PostMaintenanceCopilotCleanup' -and
+            [bool](Get-RunnerPropertyValueSafe -InputObject $_ -Name 'NonFatal'))
+    })
     $rebootRequired = @($resultArray | Where-Object { $_.RebootRequired }).Count -gt 0
 
     if ($failedSections.Count -gt 0) {
@@ -6635,6 +7608,10 @@ try {
     elseif ($rebootRequired) {
         $finalExitCode = 3010
         $finalStatus = 'SuccessRebootRequired'
+    }
+    elseif ($copilotWarnings.Count -gt 0) {
+        $finalExitCode = 0
+        $finalStatus = 'SuccessWithWarnings'
     }
     else {
         $finalExitCode = 0
@@ -6647,6 +7624,11 @@ catch {
     Write-RunnerLog -Message "Combined runner failed: $($_.Exception.Message)" -Level 'ERROR'
 }
 finally {
+    if ($finalStatus -eq 'NotStarted') {
+        $finalStatus = 'InterruptedBeforeCompletion'
+        $finalExitCode = 1
+        Write-RunnerLog -Message 'Runner ended before all sections completed. This can occur when execution is interrupted. Completed section records do not establish success for uncompleted sections.' -Level 'ERROR'
+    }
     $runnerEndTime = Get-Date
     $summary = [pscustomobject][ordered]@{
         EventType       = 'maintenance.combined_execution'

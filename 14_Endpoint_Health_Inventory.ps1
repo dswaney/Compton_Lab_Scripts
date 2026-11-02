@@ -10,6 +10,14 @@
     from a serial-bound full-run cache with its original collection timestamps.
     New selected Windows errors are emitted as endpoint.system_error events.
 
+    Full inventory (the Sunday scheduled run, or a manual run without -InventoryOnly)
+    also emits endpoint.storage.evidence rows for every fixed drive letter, large
+    directories/files and Windows Installer package metadata/duplicate groups.
+    This is observation only. Large-object thresholds, row caps, partial scans,
+    hash coverage and collection timestamps are included for backend comparisons.
+    Periodic -InventoryOnly retains on-demand >75% disk diagnostics, but skips
+    the weekly package metadata/hash audit and per-path evidence event stream.
+
     Collects hardware, operating system, performance, storage, security,
     networking, update, event-log, service, management-agent, and normalized
     managed-software inventory.
@@ -37,6 +45,7 @@
 .OUTPUTS
     C:\Logs\Maintenance-Telemetry.ndjson
     C:\Logs\14_Endpoint_Health_Inventory.latest.json
+    C:\Logs\14_Endpoint_Health_Inventory.StorageEvidence.latest.json
     C:\Logs\14_Endpoint_Health_Inventory.log
     C:\ProgramData\Compton\Autopilot\<COMPUTERNAME>-Autopilot.csv
     C:\ProgramData\Compton\Inventory\SoftwareInventory.latest.json
@@ -46,12 +55,18 @@
 
 .NOTES
     ScriptName:    14_Endpoint_Health_Inventory.ps1
-    ScriptVersion: 1.10.2
+    ScriptVersion: 1.12.4
     Audit scope:   Registry Success / service SetValue auditing applies only to SSC* hosts.
                    Requires Administrator/SYSTEM and a thawed system for persistence.
                    Elastic System/Security event collection must be configured separately.
-    LastUpdated:   2026-10-15
-    Changes:       v1.10.2 uses registry-provider-compatible Path for fixed-key audit ACL operations.
+    LastUpdated:   2026-11-02
+    Changes:       v1.12.4 includes pending rename paths, operation types and reboot evidence in finding details; existing warning severity is preserved.
+    Previous:      v1.12.1 suppresses historical Sunday-only task findings outside the current run day.
+    Previous:      v1.12.0 adds full-inventory per-path storage evidence and Installer package/duplicate telemetry.
+    Previous:      v1.11.1 accepts active virtual adapters; inconclusive/no-link inventory is Warning with evidence, not Critical.
+    Previous:      v1.11.0 adds >75% disk warnings with fresh bounded usage diagnostics in finding DetailsJson.
+    Previous:      v1.10.3 reconciles Office suite inventory with verified Click-to-Run products.
+    Previous:      v1.10.2 uses registry-provider-compatible Path for fixed-key audit ACL operations.
                    v1.10.1 queries numeric Registry audit policy with the Windows API.
                    v1.10.0 adds read-only periodic reporting, full-inventory cache,
                    bounded incremental Windows error telemetry and per-script overlap prevention.
@@ -178,7 +193,18 @@ param(
     [int]$MemoryWarningPercent = 85,
 
     [ValidateRange(1, 100)]
-    [int]$DiskWarningPercent = 85,
+    [int]$DiskWarningPercent = 75,
+
+    [ValidateRange(10, 3600)]
+    [int]$DiskDiagnosticTimeoutSeconds = 300,
+
+    # Full Sunday inventory only; periodic high-usage diagnostics retain their existing budget.
+    [ValidateRange(30, 7200)][int]$WeeklyDiskScanTimeoutSeconds = 900,
+    [ValidateRange(30, 7200)][int]$InstallerEvidenceTimeoutSeconds = 900,
+    [ValidateRange(0.01, 10000)][double]$LargeDirectoryGB = 1,
+    [ValidateRange(1, 1048576)][int]$LargeFileMB = 256,
+    [ValidateRange(10, 2000)][int]$StorageEvidenceMaxItemsPerKind = 250,
+    [ValidateRange(10, 10000)][int]$InstallerEvidenceMaxPackages = 2000,
 
     [ValidateRange(1, 100)]
     [int]$DiskCriticalPercent = 95,
@@ -282,7 +308,7 @@ Set-StrictMode -Version 2.0
 $ErrorActionPreference = 'Stop'
 
 $script:ScriptName       = '14_Endpoint_Health_Inventory.ps1'
-$script:ScriptVersion    = '1.10.2'
+$script:ScriptVersion    = '1.12.4'
 $script:RunId            = [guid]::NewGuid().Guid
 $script:StartTime        = Get-Date
 # One per-script mutex also protects direct/manual runs from overlapping the scheduled run.
@@ -294,6 +320,7 @@ if ($InventoryOnly -and -not $PSBoundParameters.ContainsKey('EventLookbackHours'
 if ($InventoryOnly) { $ShowCollectorProgress = $false }
 $script:InventoryRefreshCache = $null
 $script:InventoryRefreshSections = [ordered]@{}
+$script:StorageEvidenceRecords = New-Object 'System.Collections.Generic.List[object]'
 $script:PendingSystemErrors = [object[]]@()
 $script:PendingErrorReportingState = $null
 $script:WeeklyOnlyCollectors = @('UpdateServiceRegistryAuditing','RestrictedWinRM','LocalAutopilotHardwareHash',
@@ -709,6 +736,8 @@ function Get-ObjectPropertyValueSafe {
 
 function Test-PendingReboot {
     $reasons = New-Object System.Collections.Generic.List[string]
+    $indicators = [ordered]@{}
+    $operations = New-Object System.Collections.Generic.List[object]
 
     $paths = @{
         'ComponentBasedServicing' = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending'
@@ -717,28 +746,56 @@ function Test-PendingReboot {
     }
 
     foreach ($entry in $paths.GetEnumerator()) {
-        if (Test-Path -LiteralPath $entry.Value) {
+        $indicators[$entry.Key] = [bool](Test-Path -LiteralPath $entry.Value)
+        if ($indicators[$entry.Key]) {
             $reasons.Add($entry.Key)
         }
     }
 
     $sessionPath = 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager'
-    $pendingRename = Get-RegistryValueSafe -Path $sessionPath -Name 'PendingFileRenameOperations'
-    if ($pendingRename) { $reasons.Add('PendingFileRenameOperations') }
-
-    $pendingRename2 = Get-RegistryValueSafe -Path $sessionPath -Name 'PendingFileRenameOperations2'
-    if ($pendingRename2) { $reasons.Add('PendingFileRenameOperations2') }
+    foreach ($valueName in @('PendingFileRenameOperations','PendingFileRenameOperations2')) {
+        $raw = Get-RegistryValueSafe -Path $sessionPath -Name $valueName
+        $items = @($raw)
+        $present = @($items | Where-Object { -not [string]::IsNullOrEmpty($_) }).Count -gt 0
+        $indicators[$valueName] = $present
+        if ($present) { $reasons.Add($valueName) }
+        if (-not $present) { continue }
+        for ($i=0; $i -lt $items.Count; $i+=2) {
+            $source = [string]$items[$i]
+            $paired = ($i+1 -lt $items.Count)
+            $destination = if ($paired) { [string]$items[$i+1] } else { $null }
+            $normalized = $source
+            if ($normalized.StartsWith('*1')) { $normalized = $normalized.Substring(2) }
+            if ($normalized.StartsWith('\??\')) { $normalized = $normalized.Substring(4) }
+            $traceRoot = Join-Path $env:ProgramData 'Microsoft\Windows Defender Advanced Threat Protection\Trace\'
+            $segments = @($normalized -split '\\')
+            $traceDelete = ($paired -and $source.Length -gt 0 -and $destination -eq '' -and
+                $normalized.StartsWith($traceRoot,[StringComparison]::OrdinalIgnoreCase) -and
+                $segments -notcontains '..' -and $segments -notcontains '.')
+            $operations.Add([pscustomobject]@{
+                RegistryValue = $valueName
+                Source = $source
+                Destination = $destination
+                NormalizedSource = $normalized
+                Operation = if (-not $paired -or $source.Length -eq 0) { 'UnknownMalformedPair' } elseif ($destination -eq '') { 'Delete' } else { 'RenameOrReplace' }
+                Classification = if ($traceDelete) { 'DefenderForEndpointTraceCleanup' } else { 'UnclassifiedPendingFileOperation' }
+            })
+        }
+    }
 
     $updateExe = Get-RegistryValueSafe -Path 'HKLM:\SOFTWARE\Microsoft\Updates' -Name 'UpdateExeVolatile'
     if ($null -ne $updateExe -and [int]$updateExe -ne 0) {
         $reasons.Add('UpdateExeVolatile')
     }
 
+    $indicators['UpdateExeVolatile'] = ($null -ne $updateExe -and [int]$updateExe -ne 0)
+    $indicators['ConfigurationManager'] = $null
     try {
         $sccm = Invoke-CimMethod -Namespace 'root\ccm\ClientSDK' `
             -ClassName 'CCM_ClientUtilities' -MethodName 'DetermineIfRebootPending' `
             -ErrorAction Stop
 
+        $indicators['ConfigurationManager'] = [bool]($sccm.RebootPending -or $sccm.IsHardRebootPending)
         if ($sccm.RebootPending -or $sccm.IsHardRebootPending) {
             $reasons.Add('ConfigurationManager')
         }
@@ -746,7 +803,15 @@ function Test-PendingReboot {
         # SCCM client is optional.
     }
 
+    $otherReasons = @($reasons | Where-Object { $_ -notin @('PendingFileRenameOperations','PendingFileRenameOperations2') })
+    $traceOnly = ($operations.Count -gt 0 -and $otherReasons.Count -eq 0 -and
+        @($operations | Where-Object { $_.Classification -ne 'DefenderForEndpointTraceCleanup' }).Count -eq 0)
     [pscustomobject]@{
+        CheckedUtc = [datetime]::UtcNow.ToString('o')
+        Indicators = [pscustomobject]$indicators
+        FileOperations = [object[]]$operations.ToArray()
+        DefenderTraceCleanupOnly = $traceOnly
+        Interpretation = if ($traceOnly) { 'Only Defender for Endpoint trace deletions were identified. These entries do not identify Windows update installation or system-file replacement. Other reboot indicators are reported separately; classification does not prove no restart is needed.' } else { 'Review reboot indicators and file operations. Pending rename entries alone do not establish that Windows Update requires a restart.' }
         Pending = ($reasons.Count -gt 0)
         ReasonNames = New-StringArrayForJson -InputObject @($reasons | Select-Object -Unique)
     }
@@ -975,6 +1040,87 @@ function Get-SoftwareProductClassification {
     return [pscustomobject]@{ CanonicalName = $DisplayName.Trim(); Category = $defaultCategory }
 }
 
+
+function Get-ComptonOfficeSuiteEvidence {
+    # Read-only, conservative reconciliation of Click-to-Run suite identity.
+    $ids = @()
+    $configs = @()
+    $readFailed = $false
+    foreach ($path in @(
+        'HKLM:\SOFTWARE\Microsoft\Office\ClickToRun\Configuration',
+        'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Office\ClickToRun\Configuration'
+    )) {
+        try {
+            $config = Get-ItemProperty -LiteralPath $path -ErrorAction Stop
+            $property = $config.PSObject.Properties['ProductReleaseIds']
+            if ($null -eq $property) { $readFailed = $true; continue }
+            $currentIds = @(([string]$property.Value -split '[,;\s]+') |
+                Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+            $ids += $currentIds
+            $configs += [pscustomobject]@{Path=$path;Config=$config;Ids=$currentIds}
+        }
+        catch {
+            if ($_.CategoryInfo.Category -ne [Management.Automation.ErrorCategory]::ObjectNotFound) {
+                $readFailed = $true
+            }
+        }
+    }
+    $ids = @($ids | Sort-Object -Unique)
+    $selected = $null
+    $applicationPath = $null
+    foreach ($record in $configs) {
+        if (@($record.Ids | Where-Object { $_ -match '^(?i)(?:ProPlus|Standard)2024(?:Volume|Retail)$' }).Count -eq 0) { continue }
+        $locationProperty = $record.Config.PSObject.Properties['InstallationPath']
+        if ($null -eq $locationProperty -or [string]::IsNullOrWhiteSpace([string]$locationProperty.Value)) { continue }
+        $root = [string]$locationProperty.Value
+        foreach ($relative in @('root\Office16\WINWORD.EXE','Office16\WINWORD.EXE',
+                                'root\Office16\EXCEL.EXE','Office16\EXCEL.EXE')) {
+            if (Test-Path -LiteralPath (Join-Path $root $relative) -PathType Leaf) {
+                $selected = $record; $applicationPath = Join-Path $root $relative; break
+            }
+        }
+        if ($selected) { break }
+    }
+    $has365 = @($ids | Where-Object { $_ -match '^(?i)(?:O365|M365)' }).Count -gt 0
+    $platform = ''
+    $version = ''
+    $installRoot = ''
+    if ($selected) {
+        foreach ($field in @('Platform','VersionToReport','InstallationPath')) {
+            $property = $selected.Config.PSObject.Properties[$field]
+            $value = if ($null -ne $property) { [string]$property.Value } else { '' }
+            switch ($field) {
+                Platform { $platform = $value.ToLowerInvariant() }
+                VersionToReport { $version = $value }
+                InstallationPath { $installRoot = $value }
+            }
+        }
+    }
+    return [pscustomobject]@{
+        ReliableRead = (-not $readFailed -and $configs.Count -gt 0)
+        Verified2024Without365 = (-not $readFailed -and $null -ne $selected -and -not $has365)
+        ProductReleaseIds = $ids
+        Microsoft365Configured = $has365
+        Platform = $platform
+        Version = $version
+        InstallationPath = $installRoot
+        ApplicationPath = $applicationPath
+        RegistryPath = if ($selected) { $selected.Path } else { $null }
+    }
+}
+
+function Test-ComptonStale365UninstallEntry {
+    param([object]$Entry,[object]$Evidence)
+    if (-not $Evidence.Verified2024Without365) { return $false }
+    $nameProperty = $Entry.PSObject.Properties['PSChildName']
+    $publisherProperty = $Entry.PSObject.Properties['Publisher']
+    if ($null -eq $nameProperty -or $null -eq $publisherProperty) { return $false }
+    # Only known suite ARP keys: never Visio, Project, Access, language packs,
+    # Microsoft 365 desktop hub, or arbitrary names containing "365".
+    return ([string]$publisherProperty.Value -eq 'Microsoft Corporation' -and
+        [string]$nameProperty.Value -match '^(?i)(?:O365ProPlusRetail|O365BusinessRetail)(?:\s+-\s+[a-z]{2,3}-[a-z]{2,3})?$')
+}
+
 function Get-InstalledSoftwareInventory {
     [CmdletBinding()]
     param(
@@ -1006,13 +1152,35 @@ function Get-InstalledSoftwareInventory {
         }
     }
 
+    $officeEvidence = Get-ComptonOfficeSuiteEvidence
+    $suppressedOfficeEntries = New-Object System.Collections.Generic.List[string]
     $packageById = @{}
     $sourceReadCount = 0
     foreach ($source in $registrySources) {
         $entries = @(Get-ItemProperty -Path $source.Path -ErrorAction SilentlyContinue)
         if ($entries.Count -gt 0) { $sourceReadCount++ }
+        if ($source.Scope -eq 'Machine' -and $officeEvidence.Verified2024Without365 -and
+            $source.Architecture -eq $officeEvidence.Platform) {
+            # Keep existing inventory identity/delta rules; synthesize the suite
+            # only from configured product IDs plus a present Office application.
+            $suite = [pscustomobject]@{
+                DisplayName='Microsoft Office LTSC 2024'
+                DisplayVersion=$officeEvidence.Version
+                Publisher='Microsoft Corporation'
+                InstallLocation=$officeEvidence.InstallationPath
+                PSChildName='Compton-Verified-Office2024'
+                PSPath=$officeEvidence.RegistryPath
+            }
+            $entries = @($suite) + $entries
+        }
+
 
         foreach ($entry in $entries) {
+            if ($source.Scope -eq 'Machine' -and (Test-ComptonStale365UninstallEntry -Entry $entry -Evidence $officeEvidence)) {
+                $suppressedOfficeEntries.Add([string]$entry.PSPath) | Out-Null
+                continue
+            }
+
             $displayName = ([string](Get-ObjectPropertyValueSafe -InputObject $entry -Name 'DisplayName')).Trim()
             if ([string]::IsNullOrWhiteSpace($displayName)) { continue }
 
@@ -1200,6 +1368,11 @@ function Get-InstalledSoftwareInventory {
         PreviousPolicyVersion = $previousPolicyVersion
         ComparisonStatus = $comparisonStatus
         ComparisonResetReason = $comparisonResetReason
+        OfficeReconciliation = [pscustomobject]@{
+            Evidence = $officeEvidence
+            SuppressedStaleMicrosoft365RegistryPaths = @($suppressedOfficeEntries.ToArray())
+            RegistryModified = $false
+        }
         CurrentPackageCount = $currentPackages.Count
         InstalledCount = $installedCount
         UpdatedCount = $updatedCount
@@ -1539,7 +1712,7 @@ function Get-OperatingSystemHealth {
     if ($pending.Pending) {
         Add-Finding -Severity 'Warning' -Category 'OperatingSystem' `
             -Check 'PendingReboot' -Message ('Pending reboot: {0}' -f ($pending.ReasonNames -join ', ')) `
-            -Value $pending.ReasonNames
+            -Value $pending.ReasonNames -Details $pending
     } else {
         Add-Finding -Severity 'Healthy' -Category 'OperatingSystem' `
             -Check 'PendingReboot' -Message 'No pending reboot indicators were found.'
@@ -1560,6 +1733,7 @@ function Get-OperatingSystemHealth {
         UptimeDays           = if ($lastBoot) { [math]::Round(($now - $lastBoot).TotalDays, 2) } else { $null }
         PendingReboot        = $pending.Pending
         PendingRebootReasonNames = $pending.ReasonNames
+        PendingRebootDetails  = $pending
     }
 }
 
@@ -1688,28 +1862,417 @@ function Get-DiskDriveMetadata {
     return ,([object[]]$rows)
 }
 
+function New-StorageEvidenceRecord {
+    param([string]$Kind,[string]$Drive,[string]$Path,[long]$Bytes=0,$Details=$null)
+    [pscustomobject]@{
+        Kind=$Kind;Drive=$Drive;Path=$Path;CollectedUtc=[datetime]::UtcNow.ToString('o');Bytes=$Bytes;GB=[math]::Round($Bytes/1GB,4)
+        FileCount=$null;UsedPercent=$null;PercentOfVolume=$null;ObservationStatus='Collected'
+        LastWriteTimeUtc=$null;SHA256=$null;PackageCode=$null;PackageFamilyHint=$null
+        RegisteredProductCount=$null;RegistrationFound=$null;Products=[string[]]@();DuplicateCount=$null
+        DuplicateLogicalBytes=$null;DetailsJson=$(if ($null -ne $Details) { $Details | ConvertTo-Json -Depth 6 -Compress } else { $null })
+    }
+}
+
+function Get-InstallerStorageEvidence {
+    # Observation only: no MSI product enumeration that triggers repairs, no deletes.
+    $root=Join-Path $env:SystemRoot 'Installer'
+    $timer=[Diagnostics.Stopwatch]::StartNew()
+    $observed=[datetime]::UtcNow.ToString('o')
+    $issues=New-Object 'System.Collections.Generic.List[string]'
+    $refs=@{}; $registryComplete=$true; $rootsRead=0
+    $views=@([Microsoft.Win32.RegistryView]::Registry32)
+    if ([Environment]::Is64BitOperatingSystem) { $views += [Microsoft.Win32.RegistryView]::Registry64 }
+    foreach ($view in $views) {
+        $hive=$null;$ud=$null
+        try {
+            $hive=[Microsoft.Win32.RegistryKey]::OpenBaseKey([Microsoft.Win32.RegistryHive]::LocalMachine,$view)
+            $base='SOFTWARE\Microsoft\Windows\CurrentVersion\Installer\UserData'
+            $ud=$hive.OpenSubKey($base)
+            if (-not $ud) { continue }
+            $rootsRead++
+            foreach ($sid in $ud.GetSubKeyNames()) {
+                $owners=@{}
+                $products=$hive.OpenSubKey("$base\$sid\Products")
+                if ($products) {
+                    try {
+                        foreach ($id in $products.GetSubKeyNames()) {
+                            $ip=$null;$pp=$null
+                            try {
+                                $ip=$hive.OpenSubKey("$base\$sid\Products\$id\InstallProperties")
+                                $name='(Unresolved product)'
+                                if ($ip) {
+                                    $name=[string]$ip.GetValue('DisplayName',$name)
+                                    $local=[string]$ip.GetValue('LocalPackage','')
+                                    if ($local) {
+                                        $local=[IO.Path]::GetFullPath([Environment]::ExpandEnvironmentVariables($local))
+                                        if (-not $refs.ContainsKey($local)) { $refs[$local]=@() }
+                                        $refs[$local]+=$name
+                                    }
+                                }
+                                $pp=$hive.OpenSubKey("$base\$sid\Products\$id\Patches")
+                                if ($pp) { foreach ($patchId in $pp.GetSubKeyNames()) {
+                                    if (-not $owners.ContainsKey($patchId)) { $owners[$patchId]=@() };$owners[$patchId]+=$name
+                                } }
+                            } finally { if ($ip) { $ip.Dispose() };if ($pp) { $pp.Dispose() } }
+                        }
+                    } finally { $products.Dispose() }
+                }
+                $patches=$hive.OpenSubKey("$base\$sid\Patches")
+                if ($patches) {
+                    try {
+                        foreach ($id in $patches.GetSubKeyNames()) {
+                            $pk=$hive.OpenSubKey("$base\$sid\Patches\$id")
+                            if (-not $pk) { continue }
+                            try {
+                                $local=[string]$pk.GetValue('LocalPackage','')
+                                if ($local) {
+                                    $local=[IO.Path]::GetFullPath([Environment]::ExpandEnvironmentVariables($local))
+                                    if (-not $refs.ContainsKey($local)) { $refs[$local]=@() }
+                                    $refs[$local]+=$(if ($owners.ContainsKey($id)) { $owners[$id] } else { '(Patch registration; product unresolved)' })
+                                }
+                            } finally { $pk.Dispose() }
+                        }
+                    } finally { $patches.Dispose() }
+                }
+            }
+        } catch { $registryComplete=$false;$issues.Add($_.Exception.Message) }
+        finally { if ($ud) { $ud.Dispose() };if ($hive) { $hive.Dispose() } }
+    }
+    if ($rootsRead -eq 0) { $registryComplete=$false;$issues.Add('No Installer UserData registry root was available.') }
+    $installer=$null;$apiStatus='Collected';$apiCount=0
+    try {
+        $installer=New-Object -ComObject WindowsInstaller.Installer
+        foreach ($patch in $installer.PatchesEx('','S-1-1-0',7,15)) {
+            $apiCount++
+            $local=[string]$patch.PatchProperty('LocalPackage')
+            if ($local) {
+                $local=[IO.Path]::GetFullPath($local)
+                if (-not $refs.ContainsKey($local)) { $refs[$local]=@() }
+                $refs[$local]+=[string]$patch.PatchProperty('DisplayName')
+            }
+        }
+    } catch { $apiStatus='Unavailable';$issues.Add($_.Exception.Message) }
+    $enumerationErrors=@();$packages=@();$truncated=$false
+    $records=New-Object 'System.Collections.Generic.List[object]'
+    try {
+        if (-not (Test-Path -LiteralPath $root)) { throw 'Installer directory not found.' }
+        $item=Get-Item -LiteralPath $root -Force
+        while ($null -ne $item) {
+            if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { throw 'Installer path contains a reparse point; inspection skipped.' }
+            $item=$item.Parent
+        }
+        $packages=@(Get-ChildItem -LiteralPath $root -Force -File -ErrorAction SilentlyContinue -ErrorVariable enumerationErrors |
+            Where-Object { $_.Extension -in @('.msi','.msp') -and ($_.Attributes -band [IO.FileAttributes]::ReparsePoint) -eq 0 } | Sort-Object Length -Descending)
+        foreach ($err in $enumerationErrors) { $issues.Add($err.ToString()) }
+        $duplicateSizes=@{}
+        foreach ($group in @($packages | Group-Object Length | Where-Object Count -gt 1)) { $duplicateSizes[[string]$group.Name]=$true }
+        foreach ($file in $packages) {
+            if ($timer.Elapsed.TotalSeconds -ge $InstallerEvidenceTimeoutSeconds -or $records.Count -ge $InstallerEvidenceMaxPackages) { $truncated=$true;break }
+            $row=New-StorageEvidenceRecord -Kind 'InstallerPackage' -Drive $env:SystemDrive -Path $file.FullName -Bytes $file.Length
+            $row.CollectedUtc=$observed;$row.LastWriteTimeUtc=$file.LastWriteTimeUtc.ToString('o')
+            $names=@();if ($refs.ContainsKey($file.FullName)) { $names=@($refs[$file.FullName] | Select-Object -Unique) }
+            $row.Products=[string[]]$names;$row.RegisteredProductCount=$names.Count;$row.RegistrationFound=$refs.ContainsKey($file.FullName)
+            $summary=$null;$metadataError=$null;$hashError=$null;$hashState='NotNeededUniqueSize'
+            try {
+                if (-not $installer) { throw 'Windows Installer COM unavailable.' }
+                $summary=$installer.GetType().InvokeMember('SummaryInformation',[Reflection.BindingFlags]::GetProperty,$null,$installer,@($file.FullName,0))
+                $revision=[string]$summary.GetType().InvokeMember('Property',[Reflection.BindingFlags]::GetProperty,$null,$summary,@(9))
+                $code=[regex]::Match($revision,'\{[0-9A-Fa-f-]{36}\}')
+                if ($code.Success) { $row.PackageCode=$code.Value }
+                if ($file.Extension -eq '.msp' -and $code.Value -match '^\{AC76BA86-') { $row.PackageFamilyHint='AcrobatStylePatchCode_Unverified' }
+            } catch { $metadataError=$_.Exception.Message }
+            finally { if ($summary) { [void][Runtime.InteropServices.Marshal]::ReleaseComObject($summary) } }
+            if ($duplicateSizes.ContainsKey([string]$file.Length)) {
+                if ($timer.Elapsed.TotalSeconds -ge $InstallerEvidenceTimeoutSeconds) { $hashState='SkippedTimeBudget';$truncated=$true }
+                else {
+                    try {
+                        $row.SHA256=(Get-FileHash -LiteralPath $file.FullName -Algorithm SHA256 -ErrorAction Stop).Hash
+                        $after=Get-Item -LiteralPath $file.FullName -Force -ErrorAction Stop
+                        if ($after.Length -ne $file.Length -or $after.LastWriteTimeUtc -ne $file.LastWriteTimeUtc) { throw 'File changed during hashing.' }
+                        $hashState='Hashed'
+                    } catch { $row.SHA256=$null;$hashState='Failed';$hashError=$_.Exception.Message }
+                }
+            }
+            if ($metadataError -or $hashError) { $row.ObservationStatus='Partial' }
+            $row.DetailsJson=([ordered]@{ObservedUtc=$observed;Extension=$file.Extension;HashStatus=$hashState;HashError=$hashError;MetadataError=$metadataError;ReferenceStatus=$(if ($names.Count) { 'Registered' } else { 'NoReferenceFound_NotProvenOrphan' });RegistryInspectionComplete=$registryComplete;PatchApiStatus=$apiStatus;Scope='Root MSI/MSP packages only; ancillary files/subfolders are covered by directory scan. Identical content and missing references are not authorization to delete.'} | ConvertTo-Json -Compress)
+            $records.Add($row)
+        }
+    } catch { $issues.Add($_.Exception.Message) }
+    finally { if ($installer) { [void][Runtime.InteropServices.Marshal]::ReleaseComObject($installer) } }
+    $duplicateGroups=0;[long]$duplicateBytes=0
+    foreach ($group in @($records | Where-Object { $_.SHA256 } | Group-Object SHA256 | Where-Object Count -gt 1)) {
+        $duplicateGroups++;[long]$extra=$group.Group[0].Bytes * ($group.Count-1);$duplicateBytes+=$extra
+        foreach ($row in $group.Group) { $row.DuplicateCount=$group.Count;$row.DuplicateLogicalBytes=$extra }
+        $row=New-StorageEvidenceRecord -Kind 'InstallerDuplicateGroup' -Drive $env:SystemDrive -Path ('sha256:'+ $group.Name) -Bytes ($group.Group[0].Bytes*$group.Count) -Details @{Paths=[string[]]@($group.Group.Path);NotADeletionRecommendation=$true}
+        $row.SHA256=$group.Name;$row.DuplicateCount=$group.Count;$row.DuplicateLogicalBytes=$extra
+        $script:StorageEvidenceRecords.Add($row)
+    }
+    foreach ($row in $records) { $script:StorageEvidenceRecords.Add($row) }
+    $hashed=@($records | Where-Object { $_.SHA256 }).Count
+    $partial=@($records | Where-Object ObservationStatus -eq 'Partial').Count
+    $status=if ($truncated) { 'Truncated' } elseif ($issues.Count -or -not $registryComplete -or $apiStatus -ne 'Collected' -or $partial) { 'Partial' } else { 'Completed' }
+    $summary=[pscustomobject]@{
+        Path=$root;CollectedUtc=$observed;Status=$status;Truncated=$truncated;TimeoutSeconds=$InstallerEvidenceTimeoutSeconds
+        DurationSeconds=[math]::Round($timer.Elapsed.TotalSeconds,2);PackagesDiscovered=$packages.Count;PackagesReported=$records.Count
+        PackageLogicalBytes=[long](($packages | Measure-Object Length -Sum).Sum);PackagesHashed=$hashed
+        RegisteredPackagePaths=$refs.Count;RegistryInspectionComplete=$registryComplete;PatchApiStatus=$apiStatus;RegisteredPatchRecords=$apiCount
+        DuplicateGroups=$duplicateGroups;DuplicateLogicalBytes=$duplicateBytes;Issues=[string[]]@($issues | Select-Object -First 30)
+        HashCoverage='SHA256 computed only for packages sharing a file length, within the time/package limits; unique lengths cannot be exact duplicates in this scan. Hashes recomputed every full run.'
+        Notes='Logical sizes may count hard links more than once. Duplicate bytes are evidence, not guaranteed recoverable allocated space or safe-to-delete files. No files changed.'
+    }
+    $row=New-StorageEvidenceRecord -Kind 'InstallerSummary' -Drive $env:SystemDrive -Path $root -Bytes $summary.PackageLogicalBytes -Details $summary
+    $row.CollectedUtc=$observed;$row.ObservationStatus=$status;$row.FileCount=$records.Count;$row.DuplicateCount=$duplicateGroups;$row.DuplicateLogicalBytes=$duplicateBytes
+    $script:StorageEvidenceRecords.Add($row)
+    return $summary
+}
+
+function Get-WeeklyStorageEvidence {
+    param($Storage)
+    $started=[datetime]::UtcNow.ToString('o')
+    if ($Storage) {
+        foreach ($scan in @($Storage.DiskUsageDiagnostics)) {
+            $drive=New-StorageEvidenceRecord -Kind 'Drive' -Drive $scan.Drive -Path ($scan.Drive+'\') -Bytes ($scan.SizeBytes-$scan.FreeBytes) -Details @{SizeBytes=$scan.SizeBytes;FreeBytes=$scan.FreeBytes;CollectedUtc=$scan.CollectedUtc;FilesScanned=$scan.FilesScanned;DirectoriesScanned=$scan.DirectoriesScanned;ScanStatus=$scan.Status;Truncated=$scan.Truncated;EnumerationErrorCount=$scan.EnumerationErrorCount;SkippedReparsePointCount=$scan.SkippedReparsePointCount;LargeDirectoryCount=$scan.LargeDirectoryCount;LargeFileCount=$scan.LargeFileCount;LargeDirectoriesCapped=$scan.LargeDirectoriesCapped;LargeFilesCapped=$scan.LargeFilesCapped;LargeDirectoryThresholdBytes=$scan.LargeDirectoryThresholdBytes;LargeFileThresholdBytes=$scan.LargeFileThresholdBytes;MeasurementNotes=$scan.MeasurementNotes}
+            $drive.CollectedUtc=$scan.CollectedUtc;$drive.UsedPercent=$scan.UsedPercent;$drive.ObservationStatus=$scan.Status;$script:StorageEvidenceRecords.Add($drive)
+            $seen=@{}
+            foreach ($section in @('TopLevelDirectories','LargestDirectories','DirectoryBreakdown','LargeDirectories')) {
+                foreach ($item in @($scan.$section)) {
+                    if ($seen.ContainsKey($item.Path)) { continue };$seen[$item.Path]=$true
+                    $row=New-StorageEvidenceRecord -Kind 'Directory' -Drive $scan.Drive -Path $item.Path -Bytes $item.Bytes -Details @{Selection=$section;ScanCollectedUtc=$scan.CollectedUtc;IncludesDescendants=$true;ScanStatus=$scan.Status}
+                    $row.LastWriteTimeUtc=Get-ObjectPropertyValueSafe -InputObject $item -Name 'LastWriteTimeUtc'
+                    $row.CollectedUtc=$scan.CollectedUtc;$row.ObservationStatus=$scan.Status
+                    if ($scan.SizeBytes -gt 0) { $row.PercentOfVolume=[math]::Round(100.0*$item.Bytes/$scan.SizeBytes,4) }
+                    $script:StorageEvidenceRecords.Add($row)
+                }
+            }
+            $seen=@{}
+            foreach ($section in @('LargestFiles','RootFiles','LargeFiles')) {
+                foreach ($item in @($scan.$section)) {
+                    if ($seen.ContainsKey($item.Path)) { continue };$seen[$item.Path]=$true
+                    $row=New-StorageEvidenceRecord -Kind 'File' -Drive $scan.Drive -Path $item.Path -Bytes $item.Bytes -Details @{Selection=$section;ScanCollectedUtc=$scan.CollectedUtc;ScanStatus=$scan.Status}
+                    $row.LastWriteTimeUtc=Get-ObjectPropertyValueSafe -InputObject $item -Name 'LastWriteTimeUtc'
+                    $row.CollectedUtc=$scan.CollectedUtc;$row.ObservationStatus=$scan.Status
+                    $script:StorageEvidenceRecords.Add($row)
+                }
+            }
+        }
+    }
+    $installer=Get-InstallerStorageEvidence
+    $scanIncomplete= -not $Storage
+    if ($Storage) { $scanIncomplete=@($Storage.DiskUsageDiagnostics | Where-Object { $_.Status -ne 'Completed' -or $_.LargeDirectoriesCapped -or $_.LargeFilesCapped }).Count -gt 0 }
+    $result=[pscustomobject]@{CollectedUtc=$started;CollectionMode='FullInventory';DriveCount=$(if ($Storage) { @($Storage.DiskUsageDiagnostics).Count } else { 0 });EventCount=$script:StorageEvidenceRecords.Count;Installer=$installer;LocalPath=(Join-Path $LogDirectory '14_Endpoint_Health_Inventory.StorageEvidence.latest.json');Status=$(if ($scanIncomplete -and $installer.Status -eq 'Completed') { 'Partial' } else { $installer.Status })}
+    $snapshot=[ordered]@{Summary=$result;Records=[object[]]$script:StorageEvidenceRecords.ToArray()}
+    Write-JsonAtomically -Path $result.LocalPath -Json ($snapshot | ConvertTo-Json -Depth 10)
+    Write-Log -Message ("STORAGE_EVIDENCE|DriveCount={0}|Records={1}|InstallerPackages={2}|InstallerLogicalGB={3:N2}|DuplicateGroups={4}|DuplicateLogicalGB={5:N2}|Status={6}|LocalPath={7}" -f $result.DriveCount,$result.EventCount,$installer.PackagesReported,($installer.PackageLogicalBytes/1GB),$installer.DuplicateGroups,($installer.DuplicateLogicalBytes/1GB),$result.Status,$result.LocalPath)
+    return $result
+}
+
+function Write-StorageEvidenceTelemetry {
+    param([datetime]$EventTime,$Identity)
+    $number=0
+    foreach ($row in $script:StorageEvidenceRecords) {
+        $number++
+        $event=[ordered]@{
+            '@timestamp'=$EventTime.ToUniversalTime().ToString('o');EventType='endpoint.storage.evidence';SchemaVersion='1.0'
+            RunId=$script:RunId;ComputerName=$env:COMPUTERNAME;ScriptName=$script:ScriptName;ScriptVersion=$script:ScriptVersion
+            Domain=$(if ($Identity) { $Identity.Domain } else { $env:USERDOMAIN });Building=$(if ($Identity) { $Identity.Building } else { $null })
+            Lab=$(if ($Identity) { $Identity.Lab } else { $null });DeviceIdentifier=$(if ($Identity) { $Identity.DeviceIdentifier } else { $null })
+            CollectionMode='FullInventory';EvidenceNumber=$number;EvidenceCount=$script:StorageEvidenceRecords.Count
+            Fingerprint=(New-StableFingerprint -Namespace 'endpoint.storage.evidence' -Components @($env:COMPUTERNAME,$row.Kind,$row.Path.ToLowerInvariant()))
+            Policy=[ordered]@{LargeDirectoryThresholdBytes=[long]($LargeDirectoryGB*1GB);LargeFileThresholdBytes=[long]($LargeFileMB*1MB);MaxLargeItemsPerKind=$StorageEvidenceMaxItemsPerKind;WeeklyDiskScanTimeoutSeconds=$WeeklyDiskScanTimeoutSeconds;InstallerTimeoutSeconds=$InstallerEvidenceTimeoutSeconds;InstallerMaxPackages=$InstallerEvidenceMaxPackages}
+            StorageEvidence=$row
+        }
+        Write-MaintenanceTelemetryLine -Path $script:NdjsonPath -JsonLine ($event | ConvertTo-Json -Depth 8 -Compress)
+    }
+    Write-Log -Message ("Published {0} endpoint.storage.evidence events to maintenance telemetry." -f $number)
+}
+
+function Get-DiskUsageDiagnostic {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$DeviceId,
+        [ValidateRange(10,3600)][int]$TimeoutSeconds = 300,
+        [ValidateRange(1,100)][int]$Top = 10,
+        [long]$VolumeSizeBytes = 0,
+        [long]$VolumeFreeBytes = 0,
+        [int]$WarningThresholdPercent = 75
+    )
+    # Single traversal, no junction following, no permission changes or cleanup.
+    $started = [datetime]::UtcNow
+    $timer = [Diagnostics.Stopwatch]::StartNew()
+    $root = $DeviceId.TrimEnd('\') + '\'
+    $sizes = @{}
+    $directoryTimes = @{}
+    $pending = New-Object 'System.Collections.Generic.Stack[string]'
+    $pending.Push($root)
+    $largeFiles = New-Object 'System.Collections.Generic.List[object]'
+    [long]$largeFileCount = 0
+    $files = New-Object 'System.Collections.Generic.List[object]'
+    $errors = New-Object 'System.Collections.Generic.List[string]'
+    $skips = New-Object 'System.Collections.Generic.List[string]'
+    [long]$fileCount = 0
+    [long]$errorCount = 0
+    [long]$skipCount = 0
+    $truncated = $false
+    while ($pending.Count -gt 0) {
+        if ($timer.Elapsed.TotalSeconds -ge $TimeoutSeconds -or $sizes.Count -ge 200000) { $truncated = $true; break }
+        $path = $pending.Pop()
+        $sizes[$path] = [long]0
+        # Stream one directory instead of materializing the whole volume in memory.
+        Get-ChildItem -LiteralPath $path -Force -ErrorAction Continue 2>&1 | ForEach-Object {
+            if ($_ -is [System.Management.Automation.ErrorRecord]) {
+                $errorCount++
+                if ($errors.Count -lt 30) { $errors.Add($_.ToString()) }
+            }
+            elseif ($timer.Elapsed.TotalSeconds -ge $TimeoutSeconds) { $truncated = $true }
+            elseif (($_.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+                $skipCount++
+                if ($skips.Count -lt 30) { $skips.Add($_.FullName) }
+            }
+            elseif ($_.PSIsContainer) { $directoryTimes[$_.FullName]=$_.LastWriteTimeUtc.ToString('o');$pending.Push($_.FullName) }
+            else {
+                $fileCount++
+                $sizes[$path] += [long]$_.Length
+                $fileRow=[pscustomobject]@{Path=$_.FullName;Bytes=[long]$_.Length;GB=[math]::Round($_.Length/1GB,3);LastWriteTimeUtc=$_.LastWriteTimeUtc.ToString('o')}
+                $files.Add($fileRow)
+                if ($_.Length -ge ($LargeFileMB*1MB)) {
+                    $largeFileCount++;$largeFiles.Add($fileRow)
+                    if ($largeFiles.Count -ge ($StorageEvidenceMaxItemsPerKind+500)) {
+                        $keepLarge=@($largeFiles | Sort-Object Bytes -Descending | Select-Object -First $StorageEvidenceMaxItemsPerKind)
+                        $largeFiles.Clear();$largeFiles.AddRange([object[]]$keepLarge)
+                    }
+                }
+                if ($files.Count -ge 1000) {
+                    $keep = @($files | Sort-Object Bytes -Descending | Select-Object -First 50)
+                    $files.Clear(); $files.AddRange([object[]]$keep)
+                }
+            }
+        }
+    }
+    # Each parent total includes its descendants. Nested rows must not be added.
+    foreach ($path in @($sizes.Keys | Sort-Object Length -Descending)) {
+        if ($path -eq $root) { continue }
+        $parent = [IO.Directory]::GetParent($path).FullName
+        if ($parent.TrimEnd('\') -eq $root.TrimEnd('\')) { $parent = $root }
+        if ($sizes.ContainsKey($parent)) { $sizes[$parent] += $sizes[$path] }
+    }
+    $rows = @(
+        foreach ($path in $sizes.Keys) {
+            if ($path -eq $root) { continue }
+            [pscustomobject]@{Path=$path;Bytes=$sizes[$path];GB=[math]::Round($sizes[$path]/1GB,3);LastWriteTimeUtc=$directoryTimes[$path]}
+        }
+    ) | Sort-Object Bytes -Descending
+    $largeDirectories=@($rows | Where-Object { $_.Bytes -ge ($LargeDirectoryGB*1GB) })
+    $topLevel = @($rows | Where-Object { [IO.Directory]::GetParent($_.Path).FullName.TrimEnd('\') -eq $root.TrimEnd('\') } | Select-Object -First $Top)
+    $breakdown = @(
+        foreach ($name in @('Windows','ProgramData','Users','Program Files','Program Files (x86)')) {
+            $branch = Join-Path $root $name
+            $rows | Where-Object { [IO.Directory]::GetParent($_.Path).FullName.TrimEnd('\') -eq $branch.TrimEnd('\') } | Select-Object -First $Top
+        }
+    )
+    $rootFiles = @()
+    try {
+        $rootFiles = @(Get-ChildItem -LiteralPath $root -Force -File -ErrorAction Stop |
+            Where-Object { ($_.Attributes -band [IO.FileAttributes]::ReparsePoint) -eq 0 } |
+            Sort-Object Length -Descending | Select-Object -First 20 |
+            ForEach-Object { [pscustomobject]@{Path=$_.FullName;Bytes=[long]$_.Length;GB=[math]::Round($_.Length/1GB,3);LastWriteTimeUtc=$_.LastWriteTimeUtc.ToString('o')} })
+    } catch { $errorCount++; if ($errors.Count -lt 30) { $errors.Add($_.ToString()) } }
+    $shadow = @()
+    $shadowStatus = 'Collected'
+    $shadowError = $null
+    try {
+        $volume = Get-CimInstance Win32_Volume -Filter "DriveLetter='$DeviceId'" -OperationTimeoutSec 15 -ErrorAction Stop
+        if ($null -eq $volume) { throw 'Volume identity unavailable for shadow-storage correlation.' }
+        $shadow = @(Get-CimInstance Win32_ShadowStorage -OperationTimeoutSec 15 -ErrorAction Stop |
+            Where-Object { $_.Volume.DeviceID -eq $volume.DeviceID -or $_.DiffVolume.DeviceID -eq $volume.DeviceID } |
+            ForEach-Object { [pscustomobject]@{SourceVolume=[string]$_.Volume.DeviceID;StorageVolume=[string]$_.DiffVolume.DeviceID;UsedBytes=$_.UsedSpace;AllocatedBytes=$_.AllocatedSpace;MaximumBytes=$_.MaxSpace} })
+    } catch { $shadowStatus = 'Unavailable'; $shadowError = $_.Exception.Message }
+    $timer.Stop()
+    $status = if ($truncated) { 'Truncated' } elseif ($errorCount -gt 0 -or $skipCount -gt 0 -or $shadowStatus -eq 'Unavailable') { 'Partial' } else { 'Completed' }
+    return [pscustomobject]@{
+        SchemaVersion=2; ComputerName=$env:COMPUTERNAME; RunId=$script:RunId; SourceScript=$script:ScriptName
+        Drive=$DeviceId; SizeBytes=$VolumeSizeBytes; FreeBytes=$VolumeFreeBytes
+        UsedPercent=$(if ($VolumeSizeBytes -gt 0) { 100.0 * ($VolumeSizeBytes - $VolumeFreeBytes) / $VolumeSizeBytes } else { $null })
+        WarningThresholdPercent=$WarningThresholdPercent
+        ThresholdExceeded=[bool]($VolumeSizeBytes -gt 0 -and (100.0 * ($VolumeSizeBytes - $VolumeFreeBytes) / $VolumeSizeBytes) -gt $WarningThresholdPercent)
+        CollectedUtc=$started.ToString('o'); CompletedUtc=[datetime]::UtcNow.ToString('o')
+        Status=$status; TimeoutSeconds=$TimeoutSeconds; DurationSeconds=[math]::Round($timer.Elapsed.TotalSeconds,2)
+        Truncated=$truncated; FilesScanned=$fileCount; DirectoriesScanned=$sizes.Count; DirectoriesPending=$pending.Count
+        ScannedLogicalBytes=$(if ($sizes.ContainsKey($root)) { $sizes[$root] } else { 0 })
+        EnumerationErrorCount=$errorCount; EnumerationErrorSamples=[string[]]$errors.ToArray()
+        SkippedReparsePointCount=$skipCount; SkippedReparsePointSamples=[string[]]$skips.ToArray()
+        TopLevelDirectories=[object[]]$topLevel; LargestDirectories=[object[]]@($rows | Select-Object -First $Top)
+        DirectoryBreakdown=[object[]]$breakdown
+        LargestFiles=[object[]]@($files | Sort-Object Bytes -Descending | Select-Object -First 50)
+        LargeDirectories=[object[]]@($largeDirectories | Select-Object -First $StorageEvidenceMaxItemsPerKind)
+        LargeFiles=[object[]]@($largeFiles | Sort-Object Bytes -Descending | Select-Object -First $StorageEvidenceMaxItemsPerKind)
+        LargeDirectoryThresholdBytes=[long]($LargeDirectoryGB*1GB);LargeFileThresholdBytes=[long]($LargeFileMB*1MB)
+        LargeDirectoryCount=$largeDirectories.Count;LargeFileCount=$largeFileCount
+        LargeDirectoriesCapped=[bool]($largeDirectories.Count -gt $StorageEvidenceMaxItemsPerKind)
+        LargeFilesCapped=[bool]($largeFileCount -gt $StorageEvidenceMaxItemsPerKind)
+        RootFiles=[object[]]$rootFiles; ShadowStorageStatus=$shadowStatus; ShadowStorageError=$shadowError; ShadowStorage=[object[]]$shadow
+        MeasurementNotes='Logical file lengths, not allocated bytes. Hard links may be counted multiple times; compressed/sparse files differ. Protected files, skipped reparse points and NTFS metadata may leave usage unaccounted for. Nested directory rows overlap. Timeout is cooperative between entries; individual filesystem operations may take longer.'
+    }
+}
+
+function Save-DiskUsageDiagnostic {
+    param([Parameter(Mandatory)]$Diagnostic)
+    $safeDrive = $Diagnostic.Drive.Replace(':','')
+    $prefix = [IO.Path]::GetFileNameWithoutExtension($script:ScriptName)
+    $target = Join-Path $LogDirectory ("{0}.DiskUsage.{1}.latest.json" -f $prefix,$safeDrive)
+    $temporary = $target + '.' + $script:RunId + '.tmp'
+    try {
+        $json = $Diagnostic | ConvertTo-Json -Depth 8
+        [IO.File]::WriteAllText($temporary,$json,(New-Object Text.UTF8Encoding($false)))
+        Move-Item -LiteralPath $temporary -Destination $target -Force -ErrorAction Stop
+        return $target
+    } finally { if (Test-Path -LiteralPath $temporary) { Remove-Item -LiteralPath $temporary -Force -ErrorAction SilentlyContinue } }
+}
+
 function Get-DiskHealth {
     $volumes = @()
+    $diskUsageDiagnostics = New-Object 'System.Collections.Generic.List[object]'
     $diskDriveMetadata = @(Get-DiskDriveMetadata)
     $logicalDisks = Get-CimInstance Win32_LogicalDisk -Filter 'DriveType=3'
 
     foreach ($disk in $logicalDisks) {
         $used = [double]$disk.Size - [double]$disk.FreeSpace
         $usedPercent = if ($disk.Size -gt 0) {
-            [math]::Round(($used / [double]$disk.Size) * 100, 2)
+            ($used / [double]$disk.Size) * 100
         } else { $null }
 
         $severity = 'Healthy'
         if ($usedPercent -ge $DiskCriticalPercent) {
             $severity = 'Critical'
-        } elseif ($usedPercent -ge $DiskWarningPercent) {
+        } elseif ($null -ne $usedPercent -and $usedPercent -gt $DiskWarningPercent) {
             $severity = 'Warning'
+        }
+
+        $diskDetails = [ordered]@{
+            Drive=[string]$disk.DeviceID; SizeBytes=[long]$disk.Size; FreeBytes=[long]$disk.FreeSpace
+            UsedPercent=$usedPercent; WarningThresholdPercent=$DiskWarningPercent; CriticalThresholdPercent=$DiskCriticalPercent
+            ThresholdExceeded=[bool]($null -ne $usedPercent -and $usedPercent -gt $DiskWarningPercent)
+            Diagnostic=$null; DiagnosticPath=$null; DiagnosticError=$null
+        }
+        if (-not $InventoryOnly -or $diskDetails.ThresholdExceeded -or $severity -eq 'Critical') {
+            try {
+                $diskDetails.Diagnostic = Get-DiskUsageDiagnostic -DeviceId $disk.DeviceID -TimeoutSeconds $(if ($InventoryOnly) { $DiskDiagnosticTimeoutSeconds } else { $WeeklyDiskScanTimeoutSeconds }) -Top 20 -VolumeSizeBytes $disk.Size -VolumeFreeBytes $disk.FreeSpace -WarningThresholdPercent $DiskWarningPercent
+                $diskUsageDiagnostics.Add($diskDetails.Diagnostic)
+                $diskDetails.DiagnosticPath = Save-DiskUsageDiagnostic -Diagnostic $diskDetails.Diagnostic
+            } catch {
+                $diskDetails.DiagnosticError = $_.Exception.Message
+                if ($null -eq $diskDetails.Diagnostic) {
+                    # Retain an explicit failed-volume record instead of silently omitting it.
+                    $failedScan=[pscustomobject]@{Drive=[string]$disk.DeviceID;SizeBytes=[long]$disk.Size;FreeBytes=[long]$disk.FreeSpace;UsedPercent=$usedPercent;CollectedUtc=[datetime]::UtcNow.ToString('o');Status='Failed';Truncated=$false;FilesScanned=0;DirectoriesScanned=0;EnumerationErrorCount=1;SkippedReparsePointCount=0;LargeDirectoryCount=0;LargeFileCount=0;LargeDirectoriesCapped=$false;LargeFilesCapped=$false;LargeDirectoryThresholdBytes=[long]($LargeDirectoryGB*1GB);LargeFileThresholdBytes=[long]($LargeFileMB*1MB);MeasurementNotes=$diskDetails.DiagnosticError;TopLevelDirectories=@();LargestDirectories=@();DirectoryBreakdown=@();LargeDirectories=@();LargestFiles=@();RootFiles=@();LargeFiles=@()}
+                    $diskUsageDiagnostics.Add($failedScan)
+                }
+            }
+            Write-Log -Level $(if ($diskDetails.ThresholdExceeded) { 'WARN' } else { 'INFO' }) -Message ("DISK_USAGE_OBSERVATION|Drive={0}|UsedPercent={1:N2}|ThresholdPercent={2}|ThresholdExceeded={3}|Report={4}|Error={5}" -f $disk.DeviceID,$usedPercent,$DiskWarningPercent,$diskDetails.ThresholdExceeded,$diskDetails.DiagnosticPath,$diskDetails.DiagnosticError)
         }
 
         Add-Finding -Severity $severity -Category 'Storage' `
             -Check ('DiskUtilization:{0}' -f $disk.DeviceID) `
             -Message ("Drive {0} is {1}% used." -f $disk.DeviceID, $usedPercent) `
-            -Value $usedPercent
+            -Value $usedPercent -Details ([pscustomobject]$diskDetails)
 
         $volumes += [pscustomobject]@{
             DriveLetter      = $disk.DeviceID
@@ -1862,6 +2425,7 @@ function Get-DiskHealth {
     $camWal = Get-CapabilityAccessManagerHealth
 
     [pscustomobject]@{
+        DiskUsageDiagnostics    = New-ObjectArrayForJson -InputObject @($diskUsageDiagnostics.ToArray())
         Volumes                 = New-ObjectArrayForJson -InputObject $volumes
         PhysicalDisks           = New-ObjectArrayForJson -InputObject $physical
         PhysicalDiskCount       = $physical.Count
@@ -2201,6 +2765,32 @@ function Get-DeviceManagerHealth {
     }
 }
 
+function Get-UacHealth {
+    $path = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System'
+    $config = Get-ItemProperty -LiteralPath $path -Name EnableLUA -ErrorAction Stop
+    $raw = $config.EnableLUA
+    if ($null -eq $raw -or [string]$raw -notmatch '^[01]$') {
+        throw 'UAC EnableLUA is missing or invalid; enabled state could not be verified.'
+    }
+    $enabled = ([int]$raw -eq 1)
+    $details = [pscustomobject]@{
+        EnableLUA = [int]$raw
+        Enabled = $enabled
+        RegistryPath = $path
+        CheckedUtc = [datetime]::UtcNow.ToString('o')
+        Remediation = 'Enable UAC through the approved policy and restart while thawed. No settings changed by this check.'
+    }
+    if ($enabled) {
+        Add-Finding -Severity 'Healthy' -Category 'Security' -Check 'UAC' -Value $true -Details $details -Message 'User Account Control is enabled (EnableLUA=1).'
+    }
+    else {
+        $message = 'User Account Control is disabled (EnableLUA=0). UAC is required; investigate policy or script changes and restore it, then restart while thawed.'
+        Write-Log -Level 'ERROR' -Message $message
+        Add-Finding -Severity 'Warning' -Category 'Security' -Check 'UAC' -Value $false -Details $details -Message $message
+    }
+    return $details
+}
+
 function Get-DefenderHealth {
     if (-not (Get-Command Get-MpComputerStatus -ErrorAction SilentlyContinue)) {
         Add-Finding -Severity 'Info' -Category 'Security' -Check 'Defender' `
@@ -2443,9 +3033,19 @@ function Get-TpmAndSecureBootHealth {
 function Get-NetworkHealth {
     $adapters = @()
     $ipConfigs = @()
+    $adapterQueryStatus = 'Unavailable'
+    $adapterQueryError = $null
+    $rawAdapters = @()
+    if (Get-Command Get-NetAdapter -ErrorAction SilentlyContinue) {
+        try {
+            $rawAdapters = @(Get-NetAdapter -IncludeHidden -ErrorAction Stop)
+            $adapterQueryStatus = 'Collected'
+        } catch { $adapterQueryStatus = 'Failed'; $adapterQueryError = $_.Exception.Message }
+    } else { $adapterQueryError = 'Get-NetAdapter is unavailable.' }
+
 
     if (Get-Command Get-NetAdapter -ErrorAction SilentlyContinue) {
-        foreach ($adapter in Get-NetAdapter -ErrorAction SilentlyContinue) {
+        foreach ($adapter in $rawAdapters) {
             $adapters += [pscustomobject]@{
                 Name              = $adapter.Name
                 InterfaceAlias    = $adapter.InterfaceAlias
@@ -2491,19 +3091,51 @@ function Get-NetworkHealth {
         }
     }
 
-    $upPhysical = @($adapters | Where-Object { $_.HardwareInterface -and $_.Status -eq 'Up' })
-    if ($upPhysical.Count -gt 0) {
-        Add-Finding -Severity 'Healthy' -Category 'Network' -Check 'ActiveAdapter' `
-            -Message ("{0} active physical network adapter(s)." -f $upPhysical.Count)
+    $upAdapters = @($adapters | Where-Object { $_.Status -eq 'Up' })
+    $upPhysical = @($upAdapters | Where-Object { $_.HardwareInterface })
+    $fallbackAdapters = @()
+    $fallbackStatus = 'NotNeeded'
+    $fallbackError = $null
+    if ($upAdapters.Count -eq 0) {
+        try {
+            $fallbackAdapters = @(Get-CimInstance Win32_NetworkAdapter -Filter 'NetConnectionStatus=2' -OperationTimeoutSec 15 -ErrorAction Stop |
+                ForEach-Object { [pscustomobject]@{Name=$_.Name;InterfaceIndex=$_.InterfaceIndex;PhysicalAdapter=$_.PhysicalAdapter;NetConnectionStatus=$_.NetConnectionStatus} })
+            $fallbackStatus = 'Collected'
+        } catch { $fallbackStatus = 'Failed'; $fallbackError = $_.Exception.Message }
+    }
+    $details = [pscustomobject]@{
+        AdapterQueryStatus=$adapterQueryStatus; AdapterQueryError=$adapterQueryError
+        ActiveAdapterCount=$upAdapters.Count; ActivePhysicalAdapterCount=$upPhysical.Count
+        Adapters=[object[]]$adapters; IPConfigurations=[object[]]$ipConfigs
+        FallbackQueryStatus=$fallbackStatus; FallbackQueryError=$fallbackError; FallbackConnectedAdapters=[object[]]$fallbackAdapters
+        AssessmentScope='Adapter link inventory only; does not prove gateway, DNS, internet or Elastic connectivity.'
+    }
+    if ($upAdapters.Count -gt 0) {
+        Add-Finding -Severity 'Healthy' -Category 'Network' -Check 'ActiveAdapter' -Details $details `
+            -Message ("{0} active network adapter(s); {1} reported as physical." -f $upAdapters.Count,$upPhysical.Count)
+    } elseif ($fallbackAdapters.Count -gt 0) {
+        Add-Finding -Severity 'Healthy' -Category 'Network' -Check 'ActiveAdapter' -Details $details `
+            -Message 'Connected adapter detected by CIM fallback; primary adapter inventory was unavailable or reported no Up adapters.'
+        Add-Finding -Severity 'Info' -Category 'Network' -Check 'AdapterInventoryFallback' -Details $details `
+            -Message 'Primary and fallback adapter inventory differed; CIM reported a connected adapter.'
     } else {
-        Add-Finding -Severity 'Critical' -Category 'Network' -Check 'ActiveAdapter' `
-            -Message 'No active physical network adapter was detected.'
+        $message = if ($adapterQueryStatus -ne 'Collected' -or $fallbackStatus -eq 'Failed') {
+            'Active adapter status could not be confirmed because adapter inventory was unavailable or failed. This does not establish a network outage.'
+        } else {
+            'No active network adapter was reported at collection time. Verify link state and connectivity; this snapshot alone does not establish an outage.'
+        }
+        Add-Finding -Severity 'Warning' -Category 'Network' -Check 'ActiveAdapter' -Details $details -Message $message
     }
 
     [pscustomobject]@{
         Adapters           = New-ObjectArrayForJson -InputObject $adapters
         IPConfigurations   = New-ObjectArrayForJson -InputObject $ipConfigs
+        # Preserve the existing physical-count field for dashboard compatibility.
         ActiveAdapterCount = $upPhysical.Count
+        ActiveLogicalAdapterCount = $upAdapters.Count
+        FallbackConnectedAdapterCount = $fallbackAdapters.Count
+        AdapterQueryStatus = $adapterQueryStatus
+        AdapterQueryError = $adapterQueryError
     }
 }
 
@@ -3517,6 +4149,8 @@ function Get-MaintenanceScheduledTaskHealth {
         return [pscustomobject]@{ Available=$false; TaskCount=0; UnhealthyCount=0; Tasks=[object[]]@() }
     }
     $rows = @()
+    $assessmentTime = Get-Date
+    $assessmentDay = $assessmentTime.Date
     $getActionDescription = {
         param($Action)
 
@@ -3552,12 +4186,57 @@ function Get-MaintenanceScheduledTaskHealth {
         $ageDays = if ($lastRun) {[math]::Round(((Get-Date)-$lastRun).TotalDays,2)} else {$null}
         $resultCode = if ($info) {[uint32]$info.LastTaskResult} else {$null}; $enabled = [bool]$task.Settings.Enabled
         $unhealthy = $enabled -and (($null -ne $resultCode -and $resultCode -ne 0 -and $resultCode -ne 267009) -or ($null -eq $lastRun) -or ($ageDays -gt $ScheduledTaskStaleDays))
+        # Classify only owned tasks with exclusively Sunday weekly triggers.
+        # Mixed/daily/unknown schedules retain the existing health assessment.
+        $actionText = (@($task.Actions | ForEach-Object { & $getActionDescription $_ }) -join ' ')
+        $ownedTask = $task.TaskPath -match '(?i)Compton' -or $task.TaskName -match '(?i)Compton' -or $actionText -match '(?i)C:\\Scripts\\'
+        $triggers = @($task.Triggers)
+        $sundayOnly = $ownedTask -and $triggers.Count -gt 0
+        foreach ($trigger in $triggers) {
+            $triggerClass = Get-ObjectPropertyValueSafe -InputObject $trigger -Name 'CimClass'
+            $className = if ($triggerClass) {Get-ObjectPropertyValueSafe -InputObject $triggerClass -Name 'CimClassName'} else {$null}
+            $days = Get-ObjectPropertyValueSafe -InputObject $trigger -Name 'DaysOfWeek'
+            if ($className -ne 'MSFT_TaskWeeklyTrigger' -or $null -eq $days -or [int]$days -ne 1) {
+                $sundayOnly = $false
+            }
+        }
+        $suppressed = $false
+        $assessmentReason = 'NormalScheduleAssessment'
+        if ($sundayOnly) {
+            # Fresh weekday runs are assessed regardless of launch source.
+            # LastRunTime does not distinguish a manual run from a missed trigger.
+            if ($lastRun -and $lastRun.Date -eq $assessmentDay) {
+                $assessmentReason = 'SundayTaskRanToday'
+            }
+            elseif ($assessmentTime.DayOfWeek -eq [DayOfWeek]::Sunday) {
+                # Assess missing/stale Sunday work only once a scheduled start is due.
+                $dueToday = $false
+                foreach ($trigger in $triggers) {
+                    $boundary = Get-ObjectPropertyValueSafe -InputObject $trigger -Name 'StartBoundary'
+                    if ($boundary) {
+                        try {
+                            $startTime = [datetime]::Parse([string]$boundary)
+                            if ($assessmentTime -ge $assessmentDay.Add($startTime.TimeOfDay) -and $assessmentTime -ge $startTime) {$dueToday=$true}
+                        } catch {}
+                    }
+                }
+                if ($dueToday) {$assessmentReason='SundayScheduledStartDue'}
+                else {$suppressed=$true; $assessmentReason='SundayScheduledStartNotDue'}
+            }
+            else {
+                $suppressed=$true
+                $assessmentReason='HistoricalSundayResultOutsideRunDay'
+            }
+        }
+        $rawUnhealthy = $unhealthy
+        if ($suppressed) {$unhealthy=$false}
         $row = [pscustomobject]@{
             TaskName=$task.TaskName; TaskPath=$task.TaskPath; State=[string]$task.State; Enabled=$enabled
             LastRunTime=if ($lastRun) {$lastRun.ToUniversalTime().ToString('o')} else {$null}; DaysSinceLastRun=$ageDays
             LastTaskResult=$resultCode; LastTaskResultHex=if ($null -ne $resultCode) {'0x{0:X8}' -f $resultCode} else {$null}
             NextRunTime=if ($info -and $info.NextRunTime -and $info.NextRunTime.Year -gt 1999) {$info.NextRunTime.ToUniversalTime().ToString('o')} else {$null}
             MissedRuns=if ($info) {$info.NumberOfMissedRuns} else {$null}; Unhealthy=$unhealthy
+            SundayOnly=$sundayOnly; FindingSuppressed=$suppressed; AssessmentReason=$assessmentReason; RawUnhealthy=$rawUnhealthy
             Actions=New-StringArrayForJson -InputObject @($task.Actions | ForEach-Object { & $getActionDescription $_ })
         }
         $rows += $row
@@ -3569,7 +4248,7 @@ function Get-MaintenanceScheduledTaskHealth {
     }
     $unhealthyRows = @($rows | Where-Object Unhealthy)
     if ($tasks.Count -eq 0) { Add-Finding -Severity 'Warning' -Category 'ScheduledTasks' -Check 'MaintenanceTasks' -Message 'No Compton maintenance scheduled tasks were detected.' }
-    elseif ($unhealthyRows.Count -eq 0) { Add-Finding -Severity 'Healthy' -Category 'ScheduledTasks' -Check 'MaintenanceTasks' -Message ("All {0} detected maintenance tasks are healthy." -f $tasks.Count) }
+    elseif ($unhealthyRows.Count -eq 0) { Add-Finding -Severity 'Healthy' -Category 'ScheduledTasks' -Check 'MaintenanceTasks' -Message ("No currently assessed maintenance task failures; {0} tasks inventoried (historical Sunday results may be suppressed)." -f $tasks.Count) }
     [pscustomobject]@{ Available=$true; TaskCount=$rows.Count; UnhealthyCount=$unhealthyRows.Count; StaleThresholdDays=$ScheduledTaskStaleDays; Tasks=New-ObjectArrayForJson -InputObject $rows }
 }
 
@@ -3966,6 +4645,77 @@ function Write-Telemetry {
     Write-JsonAtomically -Path $script:LatestPath -Json $jsonPretty
 }
 
+function Get-SoftwareDeepFreezeInstallationState {
+    [CmdletBinding()]
+    param()
+
+    [string[]]$evidence = @()
+    $queryFailed = $false
+
+    try {
+        $services = @(Get-CimInstance -ClassName Win32_Service -ErrorAction Stop | Where-Object {
+            $serviceText = @(
+                [string](Get-ObjectPropertyValueSafe -InputObject $_ -Name 'Name')
+                [string](Get-ObjectPropertyValueSafe -InputObject $_ -Name 'DisplayName')
+                [string](Get-ObjectPropertyValueSafe -InputObject $_ -Name 'PathName')
+            ) -join ' '
+            $serviceText -match '(?i)\bDFServ\b|Deep\s*Freeze|Faronics.*Deep'
+        })
+        foreach ($service in $services) {
+            $evidence += 'Service:{0}' -f [string](Get-ObjectPropertyValueSafe -InputObject $service -Name 'Name')
+        }
+    }
+    catch {
+        $queryFailed = $true
+        Write-Log -Message "Unable to inspect services for Deep Freeze: $($_.Exception.Message)" -Level 'WARNING'
+    }
+
+    $deepFreezePaths = @(
+        'C:\Program Files (x86)\Faronics\Deep Freeze',
+        'C:\Program Files\Faronics\Deep Freeze',
+        'C:\Program Files (x86)\Faronics\Deep Freeze\Install C-0\DFServ.exe',
+        'C:\Program Files\Faronics\Deep Freeze\Install C-0\DFServ.exe'
+    )
+    foreach ($path in $deepFreezePaths) {
+        if (Test-Path -LiteralPath $path -ErrorAction SilentlyContinue) {
+            $evidence += "Path:$path"
+        }
+    }
+
+    $uninstallRoots = @(
+        'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*',
+        'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*'
+    )
+    try {
+        $deepFreezeProducts = @(Get-ItemProperty -Path $uninstallRoots -ErrorAction SilentlyContinue | Where-Object {
+            $displayName = [string](Get-ObjectPropertyValueSafe -InputObject $_ -Name 'DisplayName')
+            $publisher = [string](Get-ObjectPropertyValueSafe -InputObject $_ -Name 'Publisher')
+            $displayName -match '(?i)Deep\s*Freeze' -or
+            ($publisher -match '(?i)Faronics' -and $displayName -match '(?i)Freeze')
+        })
+        foreach ($product in $deepFreezeProducts) {
+            $evidence += 'Product:{0}' -f [string](Get-ObjectPropertyValueSafe -InputObject $product -Name 'DisplayName')
+        }
+    }
+    catch {
+        $queryFailed = $true
+        Write-Log -Message "Unable to inspect uninstall records for Deep Freeze: $($_.Exception.Message)" -Level 'WARNING'
+    }
+
+    $evidence = @(
+        $evidence |
+            Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) } |
+            Sort-Object -Unique
+    )
+
+    return [pscustomobject][ordered]@{
+        Installed = if ($evidence.Count -gt 0) {$true} elseif ($queryFailed) {$null} else {$false}
+        DetectionStatus = if ($evidence.Count -gt 0) {'Installed'} elseif ($queryFailed) {'Unknown'} else {'NotInstalled'}
+        CheckedUtc = [datetime]::UtcNow.ToString('o')
+        Evidence  = @($evidence)
+    }
+}
+
 function Write-SoftwareInventoryTelemetry {
     [CmdletBinding()]
     param(
@@ -3974,13 +4724,15 @@ function Write-SoftwareInventoryTelemetry {
         $Identity
     )
 
+    $deepFreeze = Get-SoftwareDeepFreezeInstallationState
     $eventNumber = 0
     foreach ($software in @($Inventory.Events)) {
         $eventNumber++
         $softwareEvent = [ordered]@{
             '@timestamp' = $EventTime.ToUniversalTime().ToString('o')
             EventType = 'endpoint.software'
-            SchemaVersion = '1.1'
+            SchemaVersion = '1.2'
+            DeepFreeze = $deepFreeze
             RunId = $script:RunId
             InventoryRunId = $script:RunId
             InventoryEventNumber = $eventNumber
@@ -5376,9 +6128,14 @@ $battery         = Invoke-Collector -Name 'BatteryHealth'          -ScriptBlock 
 $operatingSystem = Invoke-Collector -Name 'OperatingSystem'       -ScriptBlock { Get-OperatingSystemHealth }
 $performance     = Invoke-Collector -Name 'Performance'           -ScriptBlock { Get-PerformanceHealth }
 $storage         = Invoke-Collector -Name 'Storage'               -ScriptBlock { Get-DiskHealth }
+$storageEvidence = $null
+if (-not $InventoryOnly) {
+    $storageEvidence = Invoke-Collector -Name 'WeeklyStorageEvidence' -ScriptBlock { Get-WeeklyStorageEvidence -Storage $storage }
+}
 $deviceManager   = Invoke-Collector -Name 'DeviceManager'         -ScriptBlock { Get-DeviceManagerHealth }
 $drivers         = Invoke-Collector -Name 'DriverCurrency'        -ScriptBlock { Get-DriverCurrencyHealth -Baseline $healthBaseline }
 $biosCurrency    = Invoke-Collector -Name 'BiosCurrency'          -ScriptBlock { Get-BiosCurrencyHealth -Identity $identity -Baseline $healthBaseline }
+$uac             = Invoke-Collector -Name 'UAC'                   -ScriptBlock { Get-UacHealth }
 $defender        = Invoke-Collector -Name 'Defender'              -ScriptBlock { Get-DefenderHealth }
 $firewall        = Invoke-Collector -Name 'Firewall'              -ScriptBlock { Get-FirewallHealth }
 $bitLocker       = Invoke-Collector -Name 'BitLocker'             -ScriptBlock { Get-BitLockerHealth }
@@ -5563,9 +6320,11 @@ $event = [ordered]@{
     Drivers       = $drivers
     OperatingSystem = $operatingSystem
     Performance   = $performance
+    StorageEvidenceSummary = $storageEvidence
     Storage       = $storage
     DeviceManager = $deviceManager
     Security      = [ordered]@{
+        UAC           = $uac
         Defender      = $defender
         Firewall      = $firewall
         BitLocker     = $bitLocker
@@ -5609,6 +6368,7 @@ try {
         $remediationCandidates.Count)
 
     Write-Telemetry -Event $event
+    if (-not $InventoryOnly) { Write-StorageEvidenceTelemetry -EventTime $endTime -Identity $identity }
 
     if ($softwareInventory -and -not $InventoryOnly) {
         Write-SoftwareInventoryTelemetry -Inventory $softwareInventory -EventTime $endTime -Identity $identity

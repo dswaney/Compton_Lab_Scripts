@@ -1,6 +1,6 @@
 ﻿#requires -version 5.1
-# ModuleVersion: 1.2.3
-# LastUpdated: 2026-10-19
+# ModuleVersion: 1.2.5
+# LastUpdated: 2026-10-30
 <#
 .SYNOPSIS
     Shared Microsoft Copilot removal and disablement for Compton College endpoints.
@@ -10,6 +10,10 @@
     Copilot packages, stops Copilot processes, disables Copilot tasks, applies
     machine and user policies, cleans shortcuts, and verifies the result.
 .NOTES
+    v1.2.5 skips MISAdmin user-hive and profile-shortcut changes while retaining
+    machine-wide package removal and verification. Exclusions are logged.
+    v1.2.4 recognizes empty-user catalog remnants only after successful
+    provisioning and per-profile registration checks, without broadening removal.
     v1.2.3 reads only required uninstall values, avoiding registry-provider casts
     of unrelated values while retaining strict Microsoft Copilot matching.
     v1.2.2 reports exclusively staged Appx remnants separately from installed
@@ -32,7 +36,26 @@
 
 Set-StrictMode -Version 2.0
 
-$script:CopilotModuleVersion = '1.2.3'
+$script:CopilotModuleVersion = '1.2.5'
+
+function Test-CopilotExcludedUserProfile {
+    param([string]$Sid, [string]$ProfilePath)
+
+    if (-not [string]::IsNullOrWhiteSpace($Sid)) {
+        try {
+            $identity = New-Object Security.Principal.SecurityIdentifier($Sid)
+            $account = $identity.Translate([Security.Principal.NTAccount]).Value
+            if (($account -split '\\')[-1] -ieq 'MISAdmin') { return $true }
+        } catch { }
+        if ([string]::IsNullOrWhiteSpace($ProfilePath)) {
+            $entry = Get-ItemProperty -LiteralPath "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList\$Sid" -ErrorAction SilentlyContinue
+            $pathValue = Get-CopilotPropertyValue -InputObject $entry -Name 'ProfileImagePath'
+            if ($pathValue) { $ProfilePath = [Environment]::ExpandEnvironmentVariables([string]$pathValue) }
+        }
+    }
+    return (-not [string]::IsNullOrWhiteSpace($ProfilePath) -and
+        (Split-Path -Leaf $ProfilePath) -match '^(?i:MISAdmin)(?:\..+)?$')
+}
 
 function Get-CopilotPropertyValue {
     param(
@@ -127,6 +150,43 @@ function Test-CopilotPackageStagedOnly {
         if ($state -ne 'Staged') { return $false }
     }
     return $true
+}
+
+function Test-CopilotPackageCatalogRemnant {
+    param(
+        [Parameter(Mandatory)]$Package,
+        [scriptblock]$Logger
+    )
+
+    # Missing state is not proof of removal. Require an explicit empty collection
+    # plus independent, successful provisioning and per-user registration queries.
+    $userProperty = $Package.PSObject.Properties['PackageUserInformation']
+    if ($null -eq $userProperty -or $null -eq $userProperty.Value) { return $false }
+    if (@($userProperty.Value).Count -ne 0) { return $false }
+    $name = [string](Get-CopilotPropertyValue -InputObject $Package -Name 'Name')
+    $fullName = [string](Get-CopilotPropertyValue -InputObject $Package -Name 'PackageFullName')
+    if ([string]::IsNullOrWhiteSpace($name) -or [string]::IsNullOrWhiteSpace($fullName)) { return $false }
+
+    try {
+        $provisioned = @(Get-AppxProvisionedPackage -Online -ErrorAction Stop | Where-Object {
+            $_.DisplayName -eq $name -or $_.PackageName -eq $fullName
+        })
+        if ($provisioned.Count -gt 0) { return $false }
+        $profiles = @(Get-CimInstance Win32_UserProfile -ErrorAction Stop | Where-Object { -not $_.Special })
+        if ($profiles.Count -eq 0) { throw 'No regular user profiles were available for independent verification.' }
+        foreach ($profile in $profiles) {
+            $sid = [string]$profile.SID
+            if ([string]::IsNullOrWhiteSpace($sid)) { throw 'A regular profile did not have a readable SID.' }
+            $registered = @(Get-AppxPackage -User $sid -Name $name -ErrorAction Stop)
+            if ($registered.Count -gt 0) { return $false }
+        }
+        Write-CopilotMessage -Logger $Logger -Level INFO -Message ("Confirmed inactive catalog remnant: {0}; empty user metadata; no provisioned package; no registration in {1} checked user profile(s)." -f $fullName,$profiles.Count)
+        return $true
+    }
+    catch {
+        Write-CopilotMessage -Logger $Logger -Level WARN -Message ("Cannot classify empty-user package as an inactive remnant: {0}; {1}. It remains actionable/unresolved." -f $fullName,$_.Exception.Message)
+        return $false
+    }
 }
 
 function Get-CopilotDesktopRegistrations {
@@ -316,6 +376,8 @@ function Invoke-ComprehensiveCopilotRemoval {
         StartupEntriesDisabled        = 0
         RemainingStagedPackages      = 0
         StagedPackageNames            = @()
+        RemainingCatalogRemnants     = 0
+        CatalogRemnantNames          = @()
         RemainingInstalledPackages   = 0
         RemainingProvisionedPackages = 0
         RemainingDesktopApplications = 0
@@ -391,6 +453,10 @@ function Invoke-ComprehensiveCopilotRemoval {
         Where-Object { $_.PSChildName -match '^S-1-5-21-(?:\d+-){3}\d+$' } |
         Select-Object -ExpandProperty PSChildName)
     foreach ($sid in $loadedUserSids) {
+        if (Test-CopilotExcludedUserProfile -Sid $sid) {
+            Write-CopilotMessage -Logger $Logger -Level INFO -Message "Skipping excluded MISAdmin loaded user hive: $sid."
+            continue
+        }
         try {
             if ($PSCmdlet.ShouldProcess($sid,'Apply Copilot user policies')) {
                 Set-CopilotUserPolicies -HiveRoot "Registry::HKEY_USERS\$sid"
@@ -411,6 +477,10 @@ function Invoke-ComprehensiveCopilotRemoval {
             $sid = [string]$profile.PSChildName
             if ($sid -in $loadedUserSids) { continue }
             $profilePath = [Environment]::ExpandEnvironmentVariables([string]$profile.ProfileImagePath)
+            if (Test-CopilotExcludedUserProfile -Sid $sid -ProfilePath $profilePath) {
+                Write-CopilotMessage -Logger $Logger -Level INFO -Message "Skipping excluded MISAdmin offline user hive without mounting: $profilePath."
+                continue
+            }
             $hiveFile = Join-Path $profilePath 'NTUSER.DAT'
             if (-not (Test-Path -LiteralPath $hiveFile -PathType Leaf)) { continue }
             $mountName = 'ComptonCopilot_{0}' -f ([guid]::NewGuid().ToString('N'))
@@ -469,6 +539,10 @@ function Invoke-ComprehensiveCopilotRemoval {
             Write-CopilotMessage -Logger $Logger -Message ("Staged-only Copilot package has no installed user registration; skipping repeat removal: {0}" -f $package.PackageFullName)
             continue
         }
+        if (Test-CopilotPackageCatalogRemnant -Package $package -Logger $Logger) {
+            Write-CopilotMessage -Logger $Logger -Message ("Skipping repeat removal of independently verified inactive catalog remnant: {0}" -f $package.PackageFullName)
+            continue
+        }
         try {
             if ($PSCmdlet.ShouldProcess($package.PackageFullName,'Remove Copilot Appx package for all users')) {
                 Remove-AppxPackage -Package $package.PackageFullName -AllUsers -ErrorAction Stop
@@ -506,6 +580,10 @@ function Invoke-ComprehensiveCopilotRemoval {
         (Join-Path $env:PUBLIC 'Desktop')
     )
     foreach ($profile in @(Get-ChildItem (Join-Path $env:SystemDrive 'Users') -Directory -Force -ErrorAction SilentlyContinue)) {
+        if (Test-CopilotExcludedUserProfile -ProfilePath $profile.FullName) {
+            Write-CopilotMessage -Logger $Logger -Level INFO -Message "Skipping excluded MISAdmin profile shortcuts: $($profile.FullName)."
+            continue
+        }
         $shortcutRoots += Join-Path $profile.FullName 'Desktop'
         $shortcutRoots += Join-Path $profile.FullName 'AppData\Roaming\Microsoft\Windows\Start Menu\Programs'
     }
@@ -539,10 +617,22 @@ function Invoke-ComprehensiveCopilotRemoval {
     $stagedPackages = @($remainingPackages | Where-Object { Test-CopilotPackageStagedOnly -Package $_ })
     $result.RemainingStagedPackages = $stagedPackages.Count
     $result.StagedPackageNames = @($stagedPackages | ForEach-Object { [string]$_.PackageFullName })
-    $result.RemainingInstalledPackages = @($remainingPackages | Where-Object { -not (Test-CopilotPackageStagedOnly -Package $_) }).Count
+    $result.RemainingInstalledPackages = 0
     foreach ($package in $remainingPackages) {
         $stagedOnly = Test-CopilotPackageStagedOnly -Package $package
-        Write-CopilotMessage -Logger $Logger -Level $(if ($stagedOnly) { 'INFO' } else { 'ERROR' }) -Message ("Copilot package verification: {0}; StagedOnly={1}; UserStates={2}" -f $package.PackageFullName,$stagedOnly,([string]$package.PackageUserInformation))
+        $catalogRemnant = $false
+        if (-not $stagedOnly) {
+            $catalogRemnant = Test-CopilotPackageCatalogRemnant -Package $package -Logger $Logger
+        }
+        if ($catalogRemnant) {
+            $result.RemainingCatalogRemnants++
+            $result.CatalogRemnantNames += [string]$package.PackageFullName
+        }
+        elseif (-not $stagedOnly) {
+            $result.RemainingInstalledPackages++
+        }
+        $inactive = ($stagedOnly -or $catalogRemnant)
+        Write-CopilotMessage -Logger $Logger -Level $(if ($inactive) { 'INFO' } else { 'ERROR' }) -Message ("Copilot package verification: {0}; StagedOnly={1}; CatalogRemnant={2}; UserStates={3}" -f $package.PackageFullName,$stagedOnly,$catalogRemnant,([string]$package.PackageUserInformation))
     }
     $result.RemainingProvisionedPackages = @(Get-AppxProvisionedPackage -Online -ErrorAction SilentlyContinue | Where-Object {
         $name = [string]$_.DisplayName; $fullName = [string]$_.PackageName
@@ -560,6 +650,9 @@ function Invoke-ComprehensiveCopilotRemoval {
     elseif ($result.Failures -gt 0) {
         $result.Status = 'CompletedWithErrors'
     }
+    elseif ($result.RemainingCatalogRemnants -gt 0) {
+        $result.Status = 'InactivePackageRemnantsOnly'
+    }
     elseif ($result.RemainingStagedPackages -gt 0) {
         $result.Status = 'StagedRemnantsOnly'
     }
@@ -568,7 +661,7 @@ function Invoke-ComprehensiveCopilotRemoval {
     }
 
     $level = if ($result.Failures -gt 0) { 'ERROR' } else { 'OK' }
-    Write-CopilotMessage -Logger $Logger -Level $level -Message ("Copilot removal completed. Status={0}; DesktopRemoved={1}; InstalledRemoved={2}; ProvisionedRemoved={3}; StartupEntriesDisabled={4}; UserHives={5}; OfflineHives={6}; Failures={7}" -f $result.Status,$result.DesktopApplicationsRemoved,$result.InstalledPackagesRemoved,$result.ProvisionedPackagesRemoved,$result.StartupEntriesDisabled,$result.UserHivesUpdated,$result.OfflineUserHivesUpdated,$result.Failures)
+    Write-CopilotMessage -Logger $Logger -Level $level -Message ("Copilot removal completed. Status={0}; DesktopRemoved={1}; InstalledRemoved={2}; ProvisionedRemoved={3}; StartupEntriesDisabled={4}; UserHives={5}; OfflineHives={6}; Failures={7}; CatalogRemnants={8}" -f $result.Status,$result.DesktopApplicationsRemoved,$result.InstalledPackagesRemoved,$result.ProvisionedPackagesRemoved,$result.StartupEntriesDisabled,$result.UserHivesUpdated,$result.OfflineUserHivesUpdated,$result.Failures,$result.RemainingCatalogRemnants)
     return [pscustomobject]$result
 }
 

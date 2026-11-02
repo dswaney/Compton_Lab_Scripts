@@ -1,8 +1,11 @@
-﻿# =====================================================================
+﻿# Changes v2.3.1 (2026-10-27): retry manual background-update closeout;
+# recover service configuration; explicit -Force defers failed pre-reboot
+# closeout to startup without suppressing the single verified-thawed reboot.
+# =====================================================================
 # ScriptName: 07_Force_Reboot_Install_Updates.ps1
-# ScriptVersion: 2.3.0
+# ScriptVersion: 2.3.1
 # LastUpdated: 2026-10-19
-# ChangeLog: v2.3.0 makes -Force one reboot for existing pending work followed by
+# ChangeLog: v2.3.1 makes -Force one reboot for existing pending work followed by
 #            one verification-only startup check. No update scans/downloads,
 #            installation passes, retry window, or follow-up reboots.
 #            Script 09 closes background update activity before/after reboot.
@@ -47,7 +50,7 @@ $ErrorActionPreference = 'Stop'
 
 $script:RunStart         = Get-Date
 $script:ScriptName       = '07_Force_Reboot_Install_Updates.ps1'
-$script:ScriptVersion    = '2.3.0'
+$script:ScriptVersion    = '2.3.1'
 $script:RunId            = [guid]::NewGuid().ToString()
 $script:Domain           = if ($env:USERDNSDOMAIN) { $env:USERDNSDOMAIN } else { $env:USERDOMAIN }
 $script:TelemetryPath    = Join-Path $LogDirectory 'Maintenance-Telemetry.ndjson'
@@ -1384,9 +1387,11 @@ function Invoke-ManualUpdateRebootCycle {
         PendingReboot=$null; RebootReasons=@(); WindowsUpdateRebootRequired=$null
         RebootsRequested=0; UpdatePasses=0; DownloadsRequested=$false
         RebootVerified=$false; FailureMessage=$null
+        BackgroundCloseoutStatus='NotRun'; BackgroundCloseoutFailure=$null
+        BackgroundCloseoutDeferredUntilStartup=$false
     }
     $report | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $reportPath -Encoding UTF8
-    function Close-ManualBackgroundUpdates {
+    function Invoke-ManualBackgroundCloseoutPass {
         # Close background downloads/restarts, without scanning/installing new updates.
         $closeout = Join-Path $PSScriptRoot '09_Disable_Windows_Update_Services.ps1'
         if (-not (Test-Path -LiteralPath $closeout -PathType Leaf)) { throw "Missing closeout script: $closeout" }
@@ -1403,6 +1408,43 @@ function Invoke-ManualUpdateRebootCycle {
         $rebootTask = Get-ScheduledTask -TaskPath '\Microsoft\Windows\UpdateOrchestrator\' -TaskName 'Reboot' -ErrorAction SilentlyContinue
         if ($null -ne $rebootTask -and $rebootTask.State -ne 'Disabled') { throw 'Update Orchestrator Reboot task remains enabled; closeout could not be verified.' }
     }
+
+    function Close-ManualBackgroundUpdates {
+        $lastFailure = $null
+        for ($attempt = 1; $attempt -le 3; $attempt++) {
+            try {
+                Write-Status "Background update closeout attempt $attempt/3." 'INFO'
+                Invoke-ManualBackgroundCloseoutPass
+                $report.BackgroundCloseoutStatus = 'Verified'
+                $report.BackgroundCloseoutFailure = $null
+                Write-Status 'Background update closeout verified.' 'OK'
+                return
+            }
+            catch {
+                $lastFailure = $_.Exception.Message
+                $report.BackgroundCloseoutFailure = $lastFailure
+                Write-Status "Closeout attempt $attempt failed: $lastFailure" 'WARN'
+                if ($attempt -lt 3) {
+                    # Repair only the same three services checked by closeout.
+                    # Do not terminate shared service hosts or clear reboot flags.
+                    foreach ($name in @('wuauserv','BITS','UsoSvc')) {
+                        try {
+                            Set-Service -Name $name -StartupType Disabled -ErrorAction Stop
+                            Stop-Service -Name $name -Force -ErrorAction Stop
+                            $service = Get-Service -Name $name -ErrorAction Stop
+                            $service.WaitForStatus([ServiceProcess.ServiceControllerStatus]::Stopped,
+                                [timespan]::FromSeconds(20))
+                        }
+                        catch { Write-Status "Closeout recovery for $name : $($_.Exception.Message)" 'WARN' }
+                    }
+                    Start-Sleep -Seconds 10
+                }
+            }
+        }
+        $report.BackgroundCloseoutStatus = 'Failed'
+        throw "Background update closeout failed after three attempts: $lastFailure"
+    }
+
     try {
         if ($Force -and $ManualResume) { throw 'Use -Force to start repair; -ManualResume is internal verification only.' }
         $boot = (Get-CimInstance Win32_OperatingSystem -ErrorAction Stop).LastBootUpTime.ToString('o')
@@ -1441,7 +1483,16 @@ function Invoke-ManualUpdateRebootCycle {
         Remove-Item -LiteralPath $manualPath -Force -ErrorAction SilentlyContinue
         Reset-State
         if (Test-Path -LiteralPath $script:StateFilePath) { throw 'Old scheduled reboot-cycle state could not be removed.' }
-        Close-ManualBackgroundUpdates
+        try { Close-ManualBackgroundUpdates }
+        catch {
+            # -Force authorizes one reboot even if background service closeout
+            # cannot finish before restart. Startup verification remains strict.
+            if (-not $Force) { throw }
+            $report.BackgroundCloseoutStatus = 'DeferredUntilStartup'
+            $report.BackgroundCloseoutDeferredUntilStartup = $true
+            $report.BackgroundCloseoutFailure = $_.Exception.Message
+            Write-Status ("Pre-reboot closeout could not be verified. Explicit -Force will still request one thaw-verified reboot; startup will retry closeout. Computer is NOT ready to freeze. Details: {0}" -f $_.Exception.Message) 'WARN'
+        }
         $flags = @(Get-PendingRebootFlags)
         $wuPending = [bool](New-Object -ComObject Microsoft.Update.SystemInfo).RebootRequired
         $report.WindowsUpdateRebootRequired=$wuPending
@@ -1453,7 +1504,7 @@ function Invoke-ManualUpdateRebootCycle {
         $action = New-ScheduledTaskAction -Execute "$env:WINDIR\System32\WindowsPowerShell\v1.0\powershell.exe" -Argument $arguments
         $trigger = New-ScheduledTaskTrigger -AtStartup
         $principal = New-ScheduledTaskPrincipal -UserId 'SYSTEM' -LogonType ServiceAccount -RunLevel Highest
-        $settings = New-ScheduledTaskSettingsSet -ExecutionTimeLimit (New-TimeSpan -Minutes 10) -MultipleInstances IgnoreNew
+        $settings = New-ScheduledTaskSettingsSet -ExecutionTimeLimit (New-TimeSpan -Minutes 15) -MultipleInstances IgnoreNew
         Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $trigger -Principal $principal -Settings $settings -Force -ErrorAction Stop | Out-Null
         $report.Status='RebootRequested'
         $report.RebootsRequested=1

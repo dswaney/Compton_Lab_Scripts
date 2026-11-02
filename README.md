@@ -46,18 +46,21 @@ The active endpoint scripts are designed primarily for 64-bit Windows PowerShell
 | [`Post-Deployment.ps1`](./Post-Deployment.ps1) | Prepares newly deployed HP or Dell computers, services vendor drivers/firmware, installs PaperCut and Action1, removes Copilot through the shared module, refreshes `C:\Scripts`, registers tasks, activates Office LTSC 2024 when present, updates applications and Windows, and optionally reboots. |
 | [`00_Update-Scripts-FromShare.ps1`](./00_Update-Scripts-FromShare.ps1) | Manifest-driven, self-updating synchronization of approved files from the configured primary or fallback deployment share; validates syntax and hashes, creates rollback copies, retires superseded files, and reconciles scheduled tasks. |
 | [`01_Enable_Windows_Update_Services.ps1`](./01_Enable_Windows_Update_Services.ps1) | Bootstraps the current package, restores Windows Update services/tasks/policies, verifies service recovery, applies standard Windows UI configuration, and can reboot when critical update services cannot be recovered. |
-| [`02_Remove_User_Profiles.ps1`](./02_Remove_User_Profiles.ps1) | Removes eligible stale user profiles with protected-profile, loaded-profile, age, timeout, and disk-space safeguards; applies the standard Windows 11 user environment. Copilot and Edge ownership have moved to Script 04. |
+| [`02_Remove_User_Profiles.ps1`](./02_Remove_User_Profiles.ps1) | Removes eligible stale user profiles with protected-profile, loaded-profile, age, timeout, and disk-space safeguards; applies the standard Windows 11 user environment. Skips profile deletion on CP*, CCDP*, and PD* computers. Copilot and Edge ownership have moved to Script 04. |
 | [`03_Weekend_Apps_Update.ps1`](./03_Weekend_Apps_Update.ps1) | Inventories available application upgrades, updates supported packages through WinGet, handles pinned/unknown packages according to switches, services Office Click-to-Run, and publishes per-application results. |
-| [`04_Sunday_Lab_Application_Maintenance.ps1`](./04_Sunday_Lab_Application_Maintenance.ps1) | Consolidated Sunday application/configuration runner: restore point, printing, Office migration/activation, Chrome Incognito startup, Elastic Agent, browser defaults/homepages, Adobe lab policy, Stellarium location, startup allowlist, and final Copilot cleanup. Honorlock remains embedded but disabled because GPO owns it. |
+| [`04_Sunday_Lab_Application_Maintenance.ps1`](./04_Sunday_Lab_Application_Maintenance.ps1) | Consolidated Sunday application/configuration runner: restore point, printing, Office migration/activation, Chrome Incognito startup, Elastic Agent, browser defaults/homepages, Adobe lab policy, Stellarium location, startup allowlist, Event Log capacity configuration, RemoteAccess/IP-routing controls, OneDrive startup policy, and final Copilot cleanup. Honorlock remains embedded but disabled because GPO owns it. |
 | [`05_Weekend_HP_Drivers_Update.ps1`](./05_Weekend_HP_Drivers_Update.ps1) | Vendor-aware HP/Dell maintenance with safe driver filtering, HPIA/DCU workflows, HP BIOS Internet-update policy, AV scheduled power-on, Dell Wake-on-LAN validation, Dell cleanup of orphaned HP software, and hardware/driver telemetry. |
 | [`06_Weekend_Windows_Updates.ps1`](./06_Weekend_Windows_Updates.ps1) | Installs Microsoft/Windows updates with PSWindowsUpdate, optionally resets Windows Update components, compares pre/post compliance, records detailed results, automatically schedules required reboots during Sunday 01:00–20:45 local maintenance while thawed; supports manual overrides and coordinator opt-out. |
 | [`07_Force_Reboot_Install_Updates.ps1`](./07_Force_Reboot_Install_Updates.ps1) | Coordinates a persistent, verified multi-reboot cycle; supports scheduled, startup-resume, maintenance-closeout, and final-verification modes; records the source of persistent reboot flags. |
 | [`08_System_Repair.ps1`](./08_System_Repair.ps1) | Performs DISM/SFC, storage, WMI, RPC, Explorer, Windows Update, management-agent, disk-usage, and cleanup diagnostics/repairs. Persistent corruption requires explicit opt-in plus a matching, unexpired n8n approval before source-WIM/in-place repair escalation. |
 | [`09_Disable_Windows_Update_Services.ps1`](./09_Disable_Windows_Update_Services.ps1) | Applies and verifies the post-maintenance Windows Update service, scheduled-task, and registry-policy state. |
 | [`10_Sync_System_Time.ps1`](./10_Sync_System_Time.ps1) | Detects domain or standalone time mode, configures Windows Time, safely restarts/resynchronizes it, validates offset/source/stratum, and publishes recent time-service evidence. |
-| [`14_Endpoint_Health_Inventory.ps1`](./14_Endpoint_Health_Inventory.ps1) | Produces the authoritative endpoint snapshot: hardware, OS, BIOS settings/version, warranty, security, networking, drivers, health findings, remediation candidates, normalized software records, and uninstall tombstones. |
+| [`14_Endpoint_Health_Inventory.ps1`](./14_Endpoint_Health_Inventory.ps1) | Produces the authoritative endpoint snapshot: hardware, OS, BIOS settings/version, warranty, security, networking, drivers, health findings, remediation candidates, normalized software records, uninstall tombstones, live UAC checks, and detailed pending-reboot evidence. |
 | [`15_Sunday_Update_Closeout.ps1`](./15_Sunday_Update_Closeout.ps1) | Runs additional Sunday update passes and final readiness checks; requests servicing-only reboots through Script 07 and disables updates only after clean final verification. Does not control Deep Freeze scheduling. |
 | [`16_Check_Deep_Freeze_Status.ps1`](./16_Check_Deep_Freeze_Status.ps1) | Uses the Faronics CLI to report Frozen, Thawed, Unknown, or NotInstalled state and tracks how long the current state has persisted. |
+| [`Watch-RebootRecovery.ps1`](./Watch-RebootRecovery.ps1) | Detects repeated completed Script 07 reboots and, when privately configured, performs a bounded thaw/update/repair/verification/refreeze recovery transaction. |
+| [`Show-RecoveryNotice.ps1`](./Show-RecoveryNotice.ps1) | Startup-only recovery display helper; does not repair, change Deep Freeze state, or reboot. |
+| [`RepairScreen.psm1`](./RepairScreen.psm1) | Edition-aware temporary repair display and verified restoration helpers. |
 | [`Repair-MicrosoftEdgeUpdate.ps1`](./Repair-MicrosoftEdgeUpdate.ps1) | Detection-first Edge Update repair for the fixed `MicrosoftEdgeUpdateRepair` remediation class; verifies policy, services, tasks, updater state, and optional signed Enterprise MSI repair. |
 | [`Repair-Windows-ComponentStore.ps1`](./Repair-Windows-ComponentStore.ps1) | Script 08 escalation helper: identifies the matching `install.wim` index, stages a compatible ADK DISM when needed, tries WIM and Windows Update repair sources, verifies DISM/SFC, and can launch a guarded in-place repair while the computer is thawed. |
 
@@ -100,6 +103,8 @@ Normal operation prepares the endpoint for the maintenance window by synchronizi
 
 Enumerates local profiles without using destructive broad deletion. It excludes configured accounts, system/special profiles, and loaded hives; can enforce an age threshold; measures profile sizes; removes OneDrive tasks associated with deleted profiles; maintains resumable cleanup state; limits concurrent deletion jobs; and records deleted, skipped, deferred, timed-out, and failed profiles plus recovered disk space.
 
+Hostnames beginning with `CP`, `CCDP`, or `PD` skip profile deletion; environment preference work remains separate.
+
 It also applies the standard Windows 11 UI preferences to current, loaded, offline, and Default User hives. As of version 2.5.0, it no longer removes Copilot or configures Edge InPrivate; those recurring functions belong to Script 04.
 
 ### `03_Weekend_Apps_Update.ps1`
@@ -121,6 +126,8 @@ Runs each major section independently so a child script's functions, strict mode
 9. Enables Windows Location Services for Stellarium on configured labs.
 10. Enforces the startup-app allowlist for existing users and Default User, and suppresses HP notification consumer popups without removing HP hardware-support components.
 11. Runs final Copilot cleanup after application maintenance so Copilot restored by Edge or other servicing is removed before inventory.
+
+Version 1.19.15 also disables and verifies RemoteAccess/IPv4 routing, applies targeted OneDrive startup/sign-in behavior while excluding MISAdmin profile changes, and configures retained Event Log capacity while thawed. Event Log registry limits can be repaired when the service/RPC API is unavailable; configuration alone does not prove retained-volume growth, which needs verification after a thawed restart.
 
 The current startup allowlist contains `DWRCST.EXE`, `initialise.bat`, `OneDrive.exe`, `student.exe`, `teacher.exe`, and `RtkAudUService64.exe`. Non-allowlisted startup entries are disabled, not uninstalled.
 
@@ -331,15 +338,24 @@ Collects one fault-tolerant weekly `endpoint.health` snapshot and separate event
 
 An access-denied result for active `CapabilityAccessManager.db-wal` inspection is recorded as informational, not storage corruption.
 
+Version 1.12.4 adds:
+
+- Live `Security / UAC` checks in full inventory and `-InventoryOnly` refresh. `EnableLUA=0` writes an ERROR log and emits a Warning finding, matching the existing Computer Warning Details filter. It does not change UAC.
+- `OperatingSystem / PendingReboot` findings populate `Finding.DetailsJson` with raw source/destination pairs, Delete/RenameOrReplace/unknown operation classification, observation time, and separate CBS/Windows Update/other indicators. Deletions strictly under Defender for Endpoint's Trace directory are labeled as trace cleanup. This is explanatory evidence, not proof that every reboot requirement is absent; warning severity remains unchanged.
+- Sunday-only maintenance task history suppression outside its applicable assessment day; a weekday run recorded today is still assessed. Built-in task discovery and recovered-service classification remain follow-up work.
+- Deep Freeze Installed/DetectionStatus/evidence on software events (`endpoint.software` schema 1.2), allowing Office dashboards to select `DeepFreeze.Installed:true`. Existing historical documents are not rewritten.
+
 ### `15_Sunday_Update_Closeout.ps1`
 
-Version 1.1.2 retains the Sunday update passes and final service closeout, and adds a Secure Boot certificate coordinator invoked by Script 01. `-SecureBootAuditOnly` reports deployment status, a live firmware query, separately labeled registry evidence, BitLocker protection and Deep Freeze version without updating certificates or changing protection. A denied firmware query preserves the other evidence and reports `Updated_FirmwareQueryRestricted` when applicable; it cannot establish readiness or authorize remediation. Run audits as SYSTEM to match the maintenance execution context.
+Version 1.1.7 retains the Sunday update passes and final service closeout, and adds a Secure Boot certificate coordinator invoked by Script 01. `-SecureBootAuditOnly` reports deployment status, a live firmware query, separately labeled registry evidence, BitLocker protection and Deep Freeze version without updating certificates or changing protection. A denied firmware query preserves the other evidence and reports `Updated_FirmwareQueryRestricted` when applicable; it cannot establish readiness or authorize remediation. Run audits as SYSTEM to match the maintenance execution context.
 
 Remediation is controlled by `Maintenance.Policy.json` → `SecureBootMaintenance`. The exact-host pilot, recovery-key-confirmation and thaw-through-verification lists are empty by default. New remediation is restricted to Sunday, requires live thaw proof for Deep Freeze, and requires encrypted Deep Freeze pilots to have version 10.20.220.5844 or later. It uses Microsoft's certificate/boot-manager update process, a protected machine/volume-bound transaction, bounded BitLocker suspension (two reboots), at most three reboot requests, and a temporary SYSTEM startup/deadline task. New transactions start before 18:00; reboot requests stop before 20:15. Completed deployment must resume owned protection and pass a subsequent protected boot check before the transaction is ready. No automatic decryption, TPM clear, PCR change or Secure Boot disabling is performed.
 
 The coordinator emits `maintenance.secure_boot` to the existing NDJSON feed and writes `SecureBoot-Maintenance.latest.json`. Explicit shared-file append retries coexist with readers; an exclusive lock falls back to a uniquely named local pending event. A pending file is not guaranteed to be ingested by the existing Elastic input. See [Secure Boot pilot instructions](./docs/SecureBoot-Maintenance.md) for the gates, failure handling, and remaining Windows pilot requirements.
 
 Normal closeout mode calls Scripts 01/06, independently scans updates, and requests servicing-only reboots through Script 07. `-VerifyOnly` skips initial enable/install but can still request servicing reboots. Final service closeout runs independently of certificate readiness, then verifies service state and certificate readiness before reporting `ReadyToFreeze=true`. Ordinary closeout operations must start on Sunday before 20:45, with a successful DFC Thawed query when Deep Freeze is detected. A queued Secure Boot reboot defers subsequent installation work in that pass.
+
+Closeout assesses servicing using bounded samples rather than blocking merely because TrustedInstaller/TiWorker exists: idle-worker acceptance requires stable CPU/I/O, stable CBS evidence and successful session finalization. Unknown/busy states defer closeout. `-Force` bypasses only the ordinary closeout calendar restriction; thaw checks remain, and Secure Boot retains its separate Sunday/policy gates. Child `-Force` is forwarded only when the child declares it. Per-run text logs use unique filenames and shared append with bounded retries.
 
 Neither this script nor a failed readiness check can hold the computer thawed or override the external Deep Freeze schedule. Arrange a thawed pilot through completion and monitor failures. Script 07 now independently enforces thawed state and the ordinary Sunday cutoff. Direct-child/global-lock limitations and ordinary servicing-only state persistence remain follow-up work.
 
@@ -385,6 +401,7 @@ Keep the computer thawed through the single manual repair reboot and verificatio
 |---|---|---|
 | 01 | `-ManualUpdateRepair` | Off. Opens/restores update services using the existing logic but skips Script 00 bootstrap, task reconciliation, and Script 15 Secure Boot coordination. Service-recovery failure returns an error instead of independently rebooting. Retained for service-only manual workflows; Script 07's one-reboot mode no longer invokes Script 01. |
 | 06 | `-AllowReboot` | Off. Explicitly allows a required restart on any day/time, including outside Sunday maintenance; still requires thawed state when Deep Freeze is detected. Does not force a restart when no reboot requirement is detected. |
+| 15 | `-Force` | Manual ordinary closeout calendar override; requires thaw proof and preserves servicing/Secure Boot safeguards. For final verification use `-VerifyOnly -Force`. |
 | 06 | `-NoReboot` | Off. Suppresses Script 06's restart even during maintenance for an explicit operator-controlled install-only pass. Script 15 no longer supplies it; Script 07 no longer calls Script 06. Cannot be combined with `-AllowReboot`. |
 | 06 | `-ResetWUComponentsFirst` | Off. Resets Windows Update components before installation using the script's existing reset routine; use for a diagnosed update-client issue, not as a routine completion step. |
 | 07 | `-Force` | Off. On any day, closes background updates with Script 09 and requests exactly one reboot for existing pending work. Startup continuation verifies once without scans, downloads, installation passes, or additional reboots. Does not delete flags or automatically freeze. Cannot be combined with the ordinary mode switches below. |
@@ -508,6 +525,22 @@ The manifest lists each managed file's version and hash. The update utility vali
 - `BUILD-VALIDATION.json` records structural checks performed for a package build.
 - `SHA256SUMS.txt` permits independent checksum verification.
 - `README-Maintenance-Framework.txt` contains framework-specific operator notes.
+
+## Reboot recovery watchdog and administrative utilities
+
+The supplied "Watchguard" files are the **Reboot Recovery Watchdog**, not a WatchGuard firewall product. Runtime files belong at the root beside Script 00; the [`Reboot-Recovery-Watchdog`](./Reboot-Recovery-Watchdog) folder retains supporting tests and setup notes.
+
+- `Watch-RebootRecovery.ps1` 1.5.4 correlates three distinct completed Script 07 restarts within 30 minutes, excludes the normal Sunday 00:15–21:45 window, and uses durable per-computer SMB incident state with ownership checks, attempt limits, failed-incident latching, and a 24-hour completed-incident cooldown. Explicitly configured recovery can request one thaw restart, one Script 07 manual repair, and one final frozen restart. Missing state, telemetry, approved hashes, or freeze proof blocks automatic actions.
+- The supplied setting `AutomaticFreezeAfterVerifiedRepair=true` means verified recovery can automatically refreeze and restart. This differs from older bundled documentation claiming it always leaves the endpoint thawed. Ordinary Script 15 readiness still does not control the external freeze schedule.
+- Script 00 synchronizes runtime files and calls watchdog `-Deploy`; that mode enables recovery only after private configuration, thaw/state checks, and successful installation. Public copies have blank passwords, so deployment defers. Do not publish privately configured scripts.
+- Existing `ApprovedUpdaterHashes`, `ApprovedScript07Hashes`, and `ApprovedScript09Hashes` are retained, not silently expanded. Sanitization and future code changes alter hashes. Review the final production scripts and explicitly maintain these recovery trust pins before an attended pilot.
+- `Show-RecoveryNotice.ps1` displays recovery status without repairs/reboots; `RepairScreen.psm1` implements temporary repair display and restore behavior. Root `RepairScreen.psm1` has newer version metadata than the bundled supporting copy; they are documented as separate supplied files.
+- `New-RebootRecoveryShare.ps1` sets up a dedicated Windows SMB share. The Linux `Configure-RecoveryShare.py` mentioned in the uploaded instructions was **not included**; obtain and review it separately if using Samba. Do not assume that deployment step is available here.
+- `Test-RebootRecoveryWatchdog.ps1` and `Test-RepairScreen.ps1` are isolated offline test helpers; `Preview-RepairScreen.ps1` is a manual display pilot. Their presence is not evidence of a successful Windows deployment.
+- `Collect-DeepFreezeDiagnostics.ps1` collects local service, driver, event and vendor evidence into a report/ZIP without changing freeze state or rebooting.
+- `Compton_Tech_Utils.ps1` is an interactive technician console with embedded maintenance components; it is not an additional scheduled maintenance task. Embedded files retain their own reviewed versions and verified hashes; updating a root script does not update that embedded bundle.
+- `Add-DellAHCIPreflightToBootWim.ps1` prepares deployment media with guarded Dell RAID-to-AHCI preflight and offline image servicing; it is not an endpoint repair task.
+- `Set-Dell-BIOS-Settings.ps1` provides direct-CIM Dell BIOS power configuration/audit. `Check-ADPasswordExpiry.ps1` is an administrative AD password-expiry query helper.
 
 ## Scheduled task deployment
 
@@ -684,3 +717,13 @@ This supersedes the earlier package 3.0.21 manual repair behavior.
 - Script 06 v2.1.13 retains automatic required restarts after scheduled installation. Script 15 v1.1.4 removes its `-NoReboot` override and stops the closeout pass when Script 06 reports the reboot requirement/request, preventing a duplicate Script 07 request.
 - Task registration and Sunday trigger times are unchanged. An update that still needs a reboot after the single attended repair is reported as unresolved; readiness is not fabricated by deleting servicing state.
 - Validation: grammar parsing, local workflow invariants and caller/diff review, README switch coverage, manifest/checksum integrity. Live Windows servicing, DFC, and SYSTEM startup verification still require an endpoint test.
+
+## November 2, 2026 supplied-package synchronization (package 3.0.23)
+
+- Imports supplied updater 4.12.3; Scripts 01 2.8.10, 02 2.5.24, 03 2.3.1, 04 1.19.15, 06 2.1.14, 07 2.3.1, 08 4.14.0, 14 1.12.4, 15 1.1.7; Copilot module 1.2.5; Post-Deployment 2.4.0; manifest builder 2.4.3; watchdog runtime and supplied administrative tools.
+- Script 01 adds EventLog service recovery/evidence. Script 03 adds shared scheduled execution budgets and Firefox pending-update reporting. Script 06 adds MSI-busy handling and update diagnostics. Script 07 retries manual background closeout and defers failed pre-reboot closeout to startup without adding extra manual reboot passes. Script 08 adds high-utilization/pre-cleanup disk evidence. Post-Deployment adds SHARP printer staging and verification.
+- Retains existing repository Edge repair lock isolation, component-store helper approval/catalog entry, and both Sunday closeout task-action verification checks. Same-version site-path/whitespace-only differences are not treated as functional updates.
+- Removes configured Deep Freeze/Elastic credentials from public copies and retains public deployment/status placeholders. Embedded technician-console components are also sanitized and rehashed. Private production configuration must be restored separately; public hashes do not apply after local edits.
+- Manifest/checksums describe final repository bytes. Replaces stale uploaded build metadata with checks for this release. No scheduled firmware rollout is enabled; Script 05 default firmware/storage exclusions remain.
+- The supplied Script 05 has no functional driver-selection change after public-path normalization. Its recommendation-based failure verification remains unchanged: a remaining HPIA recommendation alone does not establish an installer failure, as observed with Dynamic Tuning 9.1.10007.1466. Investigate before broadening installation scope.
+- Validation and runtime limitations are recorded in `BUILD-VALIDATION.json`; native Windows PowerShell 5.1 and live SYSTEM/DFC/reboot/repair tests remain required. Existing historical dashboard events retain their original details.

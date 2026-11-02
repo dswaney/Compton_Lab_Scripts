@@ -1,8 +1,10 @@
 ﻿# =====================================================================
 # ScriptName: 06_Weekend_Windows_Updates.ps1
-# ScriptVersion: 2.1.13
-# LastUpdated: 2026-10-19
-# Changes: v2.1.13 clarifies direct automatic restart ownership after installation.
+# ScriptVersion: 2.1.14
+# LastUpdated: 2026-10-27
+# Changes: v2.1.14 waits for MSI availability, retries confirmed installer-busy
+#          failures, uses direct Microsoft Update snapshots, and retains diagnostics.
+# Previous: v2.1.13 clarifies direct automatic restart ownership after installation.
 #          Script 15 no longer suppresses this restart.
 #          v2.1.12 automatically reboots when required during Sunday 01:00-20:45
 #          local maintenance; -NoReboot lets coordinators retain reboot control.
@@ -31,6 +33,8 @@
 [CmdletBinding()]
 param(
     [switch]$ResetWUComponentsFirst = $false,
+    [ValidateRange(30,3600)][int]$InstallerWaitSeconds = 600,
+    [ValidateRange(0,3)][int]$InstallerBusyRetryCount = 2,
     [switch]$AllowReboot,
     [switch]$NoReboot,
     [ValidateRange(30,3600)][int]$RebootDelaySeconds = 60,
@@ -42,7 +46,7 @@ $ErrorActionPreference = 'Stop'
 if ($AllowReboot -and $NoReboot) { throw '-AllowReboot and -NoReboot cannot be combined.' }
 
 $script:ScriptName       = '06_Weekend_Windows_Updates.ps1'
-$script:ScriptVersion    = '2.1.13'
+$script:ScriptVersion    = '2.1.14'
 $script:RunId            = [guid]::NewGuid().Guid
 $script:RunStart         = Get-Date
 $script:ComputerName     = $env:COMPUTERNAME
@@ -570,7 +574,15 @@ function Get-AvailableUpdateSnapshot {
     $items = @()
 
     try {
-        $results = @(Get-WindowsUpdate -MicrosoftUpdate -ErrorAction Stop)
+        # Use the same Microsoft Update service as the install pass. Read the
+        # COM collection directly: do not depend on PSWindowsUpdate pipeline output.
+        $session = New-Object -ComObject Microsoft.Update.Session
+        $searcher = $session.CreateUpdateSearcher()
+        $searcher.ServerSelection = 3
+        $searcher.ServiceID = '7971f918-a847-4430-9279-4a52d1efe18d'
+        $search = $searcher.Search('IsInstalled=0 and IsHidden=0')
+        if ([int]$search.ResultCode -ne 2) { throw "Microsoft Update scan result: $($search.ResultCode)" }
+        $results = @(for ($i = 0; $i -lt $search.Updates.Count; $i++) { $search.Updates.Item($i) })
         foreach ($item in $results) {
             $converted = Convert-WUItem -Item $item -Phase $Phase
             if ($converted) { $items += $converted }
@@ -579,7 +591,8 @@ function Get-AvailableUpdateSnapshot {
         Write-Log "Available updates found during $Phase scan: $($items.Count)" 'INFO'
     }
     catch {
-        Write-Log "The $Phase update scan failed: $($_.Exception.Message)" 'WARN'
+        Write-Log "The $Phase update scan failed: $($_.Exception.Message)" 'ERROR'
+        throw
     }
 
     return (ConvertTo-NormalArray -InputObject $items)
@@ -657,13 +670,17 @@ function Reset-WUComponentsSafe {
     Write-Log 'Windows Update component reset completed.' 'OK'
 }
 
-function Install-AvailableWindowsUpdates {
+function Invoke-WindowsUpdateInstallPass {
+    param([string[]]$OnlyKB = @())
     Write-Log 'Starting Windows Update installation job...' 'INFO'
 
-    $job = Start-Job -ScriptBlock {
+    $job = Start-Job -ArgumentList (,$OnlyKB) -ScriptBlock {
+        param([string[]]$OnlyKB)
         $ErrorActionPreference = 'Stop'
         Import-Module PSWindowsUpdate -Force
-        Install-WindowsUpdate -MicrosoftUpdate -AcceptAll -IgnoreReboot -Verbose *>&1
+        $arguments = @{MicrosoftUpdate=$true;AcceptAll=$true;IgnoreReboot=$true;Verbose=$true}
+        if ($OnlyKB.Count -gt 0) { $arguments.KBArticleID = $OnlyKB }
+        Install-WindowsUpdate @arguments *>&1
     }
 
     $poll = 5
@@ -733,10 +750,91 @@ function Install-AvailableWindowsUpdates {
         Write-Log 'Install-WindowsUpdate returned no update objects.' 'WARN'
     }
     else {
-        Write-Log "Windows Update job returned $($results.Count) output objects." 'OK'
+        Write-Log "Windows Update job returned $($results.Count) output objects; installation status is reported separately." 'INFO'
     }
 }
 
+
+
+function Test-WindowsInstallerBusy {
+    $mutex = $null
+    $owned = $false
+    try {
+        try { $mutex = [Threading.Mutex]::OpenExisting('Global\_MSIExecute') }
+        catch [Threading.WaitHandleCannotBeOpenedException] { return $false }
+        try { $owned = $mutex.WaitOne(0) }
+        catch [Threading.AbandonedMutexException] { $owned = $true }
+        return (-not $owned)
+    }
+    finally {
+        if ($owned -and $mutex) { $mutex.ReleaseMutex() }
+        if ($mutex) { $mutex.Dispose() }
+    }
+}
+
+function Wait-WindowsInstallerAvailable {
+    $deadline = (Get-Date).AddSeconds($InstallerWaitSeconds)
+    while (Test-WindowsInstallerBusy) {
+        if ((Get-Date) -ge $deadline) {
+            throw "Windows Installer remained busy for $InstallerWaitSeconds seconds; no installer was stopped."
+        }
+        Write-Log 'Windows Installer is busy; waiting 10 seconds before checking again.' 'INFO'
+        Start-Sleep -Seconds 10
+    }
+}
+
+function Install-AvailableWindowsUpdates {
+    $onlyKB = @()
+    for ($attempt = 0; $attempt -le $InstallerBusyRetryCount; $attempt++) {
+        Wait-WindowsInstallerAvailable
+        $attemptStart = Get-Date
+        $firstEntry = $script:UpdateEntries.Count
+        Invoke-WindowsUpdateInstallPass -OnlyKB $onlyKB
+        $attemptEnd = Get-Date
+        $failed = @($script:UpdateEntries | Select-Object -Skip $firstEntry |
+            Where-Object { $_.Result -match 'Failed|Error' -or $_.Status -match 'Failed|Error' })
+        if ($failed.Count -eq 0) { break }
+
+        # PSWindowsUpdate may expose only "Failed", hiding native MSI 1618.
+        # Retain WU diagnostics and correlate the native error with this attempt
+        # and the exact update ID discovered beside the failed KB title.
+        $diagnostic = Join-Path $LogFolder ("06-WU-Diagnostic-{0}-Attempt{1}.log" -f $script:RunId,($attempt + 1))
+        $retryKB = @()
+        try {
+            Get-WindowsUpdateLog -LogPath $diagnostic -ErrorAction Stop | Out-Null
+            $lines = @(Get-Content -LiteralPath $diagnostic | Where-Object {
+                if ($_ -match '^(d{4}/d{2}/d{2} d{2}:d{2}:d{2})') {
+                    $time = [datetime]::ParseExact($Matches[1],'yyyy/MM/dd HH:mm:ss',[Globalization.CultureInfo]::InvariantCulture)
+                    $time -ge $attemptStart.AddSeconds(-1) -and $time -le $attemptEnd
+                }
+            })
+            foreach ($failure in $failed) {
+                if ([string]::IsNullOrWhiteSpace($failure.KB)) { continue }
+                $ids = @($lines | Where-Object { $_ -match [regex]::Escape($failure.KB) } |
+                    ForEach-Object {
+                        if ($_ -match '(?i)UpdateIds*=s*([0-9a-f-]{36})') { $Matches[1] }
+                    } | Select-Object -Unique)
+                foreach ($id in $ids) {
+                    $busy = @($lines | Where-Object {
+                        $_ -match [regex]::Escape($id) -and
+                        $_ -match '(?i)(?:unmapped result|error code)s*=s*0x0*652'
+                    })
+                    if ($busy.Count -gt 0) {
+                        $retryKB += [string]$failure.KB
+                        Write-Log "INSTALLER_BUSY|KB=$($failure.KB)|NativeCode=1618|Attempt=$($attempt + 1)|Diagnostic=$diagnostic" 'WARN'
+                        break
+                    }
+                }
+            }
+        }
+        catch { Write-Log "Failure diagnostics unavailable; no unconfirmed retry: $($_.Exception.Message)" 'WARN' }
+        $retryKB = @($retryKB | Select-Object -Unique)
+        if ($retryKB.Count -eq 0 -or $attempt -ge $InstallerBusyRetryCount) { break }
+        $onlyKB = $retryKB
+        Write-Log ("Retrying installer-busy updates only: {0}. Retry {1}/{2}." -f ($onlyKB -join ','),($attempt + 1),$InstallerBusyRetryCount) 'WARN'
+        Start-Sleep -Seconds 15
+    }
+}
 
 function Get-UpdateIdentityKey {
     param([Parameter(Mandatory)][object]$Update)
@@ -775,6 +873,15 @@ function Get-UpdateSummary {
             if ($entry.Phase -eq 'Install') { $entry }
         }
     )
+
+    $terminal = @{}
+    foreach ($entry in $installEntries) {
+        if ($entry.Result -match 'Installed|Succeeded|Success|Failed|Error' -or
+            $entry.Status -match 'Installed|Succeeded|Success|Failed|Error') {
+            $terminal[(Get-UpdateIdentityKey -Update $entry)] = $entry
+        }
+    }
+    $installEntries = @($terminal.Values)
 
     [object[]]$installed = @(
         foreach ($entry in $installEntries) {
@@ -1028,6 +1135,8 @@ function Write-Telemetry {
             RebootDelaySeconds = $RebootDelaySeconds
             ShutdownExitCode = $script:ShutdownExitCode
             TextLogPath = $script:PublishedLogPath
+            InstallerWaitSeconds = $InstallerWaitSeconds
+            InstallerBusyRetryCount = $InstallerBusyRetryCount
             UpdateResults = (ConvertTo-NormalArray -InputObject $script:UpdateEntries)
             AvailableUpdatesBefore = (ConvertTo-NormalArray -InputObject $script:UpdatesBefore)
             RemainingUpdatesAfter = (ConvertTo-NormalArray -InputObject $script:UpdatesAfter)

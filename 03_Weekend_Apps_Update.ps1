@@ -1,6 +1,8 @@
-# ScriptVersion: 2.3.0
-# LastUpdated: 2026-10-12
-# Changes: v2.3.0 adds SYSTEM-aware WinGet preflight, native executable selection,
+# Changes v2.3.1 (2026-10-28): Firefox pending-update reporting; shared scheduled
+# task deadline; unlimited manual waits, including name-based installer retries.
+# ScriptVersion: 2.3.1
+# LastUpdated: 2026-10-28
+# Previous: v2.3.0 adds SYSTEM-aware WinGet preflight, native executable selection,
 #          numeric package version ordering, bounded execution and diagnostic telemetry.
 #          No user alias/PATH edits or automatic App Installer repairs.
 # Previous: v2.2.0 adds application inventory for maintenance planning.
@@ -14,6 +16,10 @@
 
 [CmdletBinding()]
 param(
+    [ValidateSet('Auto','Manual','Scheduled')][string]$ExecutionMode = 'Auto',
+    [string]$ScheduledTaskName = '04. Weekend Apps Update',
+    [ValidateRange(0,300)][int]$TaskLogReserveSeconds = 60,
+    # Legacy timeout parameters retained for caller compatibility; shared task budget governs waits.
     [ValidateRange(5,120)][int]$WingetPreflightTimeoutSeconds = 20,
     [ValidateRange(10,600)][int]$WingetQueryTimeoutSeconds = 120,
     [ValidateRange(1,120)][int]$WingetUpgradeTimeoutMinutes = 45,
@@ -35,10 +41,14 @@ $SpecialHandlingPackageIds = @(
 
 $ErrorActionPreference = 'Stop'
 
-$ScriptVersion = '2.3.0'
+$ScriptVersion = '2.3.1'
 $ScriptName = '03_Weekend_Apps_Update.ps1'
 $ComputerName = $env:COMPUTERNAME
 $ExecutionStart = Get-Date
+$script:EffectiveExecutionMode = 'Manual'
+$script:TaskDeadline = $null
+$script:TaskTimeLimit = $null
+$script:FirefoxUpdateState = $null
 $RunId = [guid]::NewGuid().Guid
 $WarningCount = 0
 $ErrorCount = 0
@@ -173,6 +183,74 @@ function ConvertTo-WingetNativeArgument {
     return '"' + (($Argument -replace '(\\*)"', '$1$1\"') -replace '(\\+)$', '$1$1') + '"'
 }
 
+
+function Initialize-ApplicationExecutionBudget {
+    $task = Get-ScheduledTask -TaskName $ScheduledTaskName -ErrorAction SilentlyContinue
+    $system = [Security.Principal.WindowsIdentity]::GetCurrent().IsSystem
+    $scheduled = ($ExecutionMode -eq 'Scheduled') -or (
+        $ExecutionMode -eq 'Auto' -and $system -and $null -ne $task -and $task.State -eq 'Running')
+    if (-not $scheduled) {
+        Write-Log 'Execution mode: Manual. Process and output waits have no time limit.' 'INFO'
+        return
+    }
+    if ($null -eq $task) { throw "Cannot resolve scheduled task '$ScheduledTaskName'; refusing an unbounded scheduled run." }
+    $script:EffectiveExecutionMode = 'Scheduled'
+    $limit = [Xml.XmlConvert]::ToTimeSpan([string]$task.Settings.ExecutionTimeLimit)
+    $script:TaskTimeLimit = $limit.ToString()
+    if ($limit -eq [timespan]::Zero) {
+        Write-Log 'Scheduled task has no execution time limit; process waits are unlimited.' 'INFO'
+        return
+    }
+    $info = Get-ScheduledTaskInfo -TaskName $ScheduledTaskName -ErrorAction Stop
+    $start = $ExecutionStart
+    if ($task.State -eq 'Running' -and $info.LastRunTime -le $ExecutionStart -and
+        $info.LastRunTime -gt [datetime]'2000-01-01') { $start = $info.LastRunTime }
+    $script:TaskDeadline = $start.Add($limit).AddSeconds(-$TaskLogReserveSeconds)
+    Write-Log "Scheduled task budget: $limit; operation deadline: $($script:TaskDeadline.ToString('o')); log reserve: $TaskLogReserveSeconds seconds." 'INFO'
+}
+
+function Get-ApplicationRemainingSeconds {
+    if ($null -eq $script:TaskDeadline) { return 0 }
+    $remaining = [math]::Floor(($script:TaskDeadline - (Get-Date)).TotalSeconds)
+    if ($remaining -lt 1) { throw 'Scheduled application-update time budget exhausted; preserving remaining time for logs.' }
+    return [int]$remaining
+}
+
+function Get-FirefoxPendingUpdateState {
+    $markers = @()
+    $roots = @(
+        (Join-Path $env:ProgramData 'Mozilla-*'),
+        (Join-Path $env:ProgramData 'Mozilla'),
+        (Join-Path $env:LOCALAPPDATA 'Mozilla')
+    )
+    foreach ($root in $roots) {
+        foreach ($file in @(Get-ChildItem -Path @((Join-Path $root 'updates\*\updates\0\update.status'), (Join-Path $root 'updates\*\0\update.status')) -File -ErrorAction SilentlyContinue)) {
+            try {
+                $state = (Get-Content -LiteralPath $file.FullName -Raw -ErrorAction Stop).Trim()
+                if ($state -match '^(pending|pending-service|applied|applied-service)$') {
+                    $markers += [pscustomobject]@{Path=$file.FullName;State=$state;LastWriteTime=$file.LastWriteTime.ToString('o')}
+                }
+            }
+            catch { Write-Log "Could not read Firefox update marker: $($_.Exception.Message)" 'WARN' }
+        }
+    }
+    $markers = @($markers | Sort-Object Path -Unique)
+    $running = @(Get-Process -Name firefox -ErrorAction SilentlyContinue).Count -gt 0
+    $result = [pscustomobject]@{
+        PendingUpdateOrRestartDetected=($markers.Count -gt 0)
+        FirefoxRunning=$running
+        Status=if ($markers.Count -gt 0) {'PendingUpdateOrRestart'} else {'NoPendingMarkerFound'}
+        Markers=$markers
+        Scope='Machine update folders and executing user; other user profiles are not scanned'
+        BrowserClosedByScript=$false
+    }
+    if ($markers.Count -gt 0) {
+        Write-Log "FIREFOX_PENDING_UPDATE|Markers=$($markers.Count)|FirefoxRunning=$running|Action=RestartFirefoxAndVerify. Markers may be stale; this does not verify the installed version is current." 'WARN'
+    }
+    else { Write-Log 'Firefox: no pending-update marker found in inspected locations; this is not a latest-version check.' 'INFO' }
+    return $result
+}
+
 function Invoke-WingetNativeProcess {
     param([string]$Path,[string[]]$Arguments,[int]$TimeoutSeconds)
     $p = New-Object System.Diagnostics.Process
@@ -184,14 +262,24 @@ function Invoke-WingetNativeProcess {
     try {
         if (-not $p.Start()) { throw 'Process did not start.' }
         $stdout=$p.StandardOutput.ReadToEndAsync(); $stderr=$p.StandardError.ReadToEndAsync()
-        $exited=$p.WaitForExit($TimeoutSeconds*1000)
+        $waitBudget = Get-ApplicationRemainingSeconds
+        if ($waitBudget -eq 0) { $p.WaitForExit(); $exited = $true }
+        else { $exited = $p.WaitForExit($waitBudget * 1000) }
         if (-not $exited) {
             try { $p.Kill() } catch {}
             $null=$p.WaitForExit(5000)
             return [pscustomobject]@{ Status='TimedOut'; ExitCode=$null; RawOutput=@(); Error='WinGet time limit exceeded. Child installers may still be running; inspect before retrying.' }
         }
         # Installer children can retain inherited pipe handles after winget exits.
-        if (-not $stdout.Wait(5000) -or -not $stderr.Wait(5000)) {
+        $outputBudget = Get-ApplicationRemainingSeconds
+        if ($outputBudget -eq 0) {
+            $stdout.Wait(); $stderr.Wait(); $streamsComplete = $true
+        }
+        else {
+            $streamsComplete = $stdout.Wait($outputBudget * 1000)
+            if ($streamsComplete) { $streamsComplete = $stderr.Wait((Get-ApplicationRemainingSeconds) * 1000) }
+        }
+        if (-not $streamsComplete) {
             return [pscustomobject]@{ Status='OutputTimedOut'; ExitCode=$p.ExitCode; RawOutput=@(); Error='WinGet output streams did not close; inspect child installers before retrying.' }
         }
         [pscustomobject]@{ Status='Completed'; ExitCode=$p.ExitCode; RawOutput=@(($stdout.Result+"`n"+$stderr.Result) -split "`r?`n"); Error=$null }
@@ -294,7 +382,7 @@ function Invoke-Winget {
     $display = $Arguments -join ' '
     Write-Log "Running: winget $display" 'INFO'
 
-    $timeout = if ($Arguments[0] -in @('upgrade','install') -and ($Arguments -contains '--all' -or $Arguments -contains '--id')) { $WingetUpgradeTimeoutMinutes * 60 } else { $WingetQueryTimeoutSeconds }
+    $timeout = Get-ApplicationRemainingSeconds
     $processResult = Invoke-WingetNativeProcess -Path $wingetPath -Arguments $Arguments -TimeoutSeconds $timeout
     $script:WingetInvocations.Add([pscustomobject]@{ Arguments=$display; Status=$processResult.Status; ExitCode=$processResult.ExitCode; TimeoutSeconds=$timeout; Error=$processResult.Error }) | Out-Null
     if ($processResult.Status -ne 'Completed') {
@@ -749,9 +837,11 @@ function Update-OfficeClickToRun {
                           -PassThru `
                           -WindowStyle Hidden
 
-    $completed = $proc.WaitForExit($WaitMinutes * 60 * 1000)
+    $remaining = Get-ApplicationRemainingSeconds
+    if ($remaining -eq 0) { $proc.WaitForExit(); $completed = $true }
+    else { $completed = $proc.WaitForExit($remaining * 1000) }
     if (-not $completed) {
-        Write-Log "Office update process did not finish within $WaitMinutes minute(s)." 'WARN'
+        Write-Log "Office update process reached the scheduled run deadline." 'WARN'
         return [PSCustomObject]@{ Installed = $true; Attempted = $true; Status = 'TimedOut'; ExitCode = $null; TimedOut = $true }
     }
 
@@ -945,9 +1035,10 @@ try {
         throw 'This script must be run as Administrator.'
     }
 
+    Initialize-ApplicationExecutionBudget
     Initialize-NetworkDefaults
     Write-Log "Initializing application update script..." 'INFO'
-    Write-Log "Script version: $ScriptVersion | Last updated: 2026-10-12" 'INFO'
+    Write-Log "Script version: $ScriptVersion | Last updated: 2026-10-28" 'INFO'
     Write-Log "Active staged text log path: $LogPath" 'INFO'
     Write-Log "Completed text log publish path: $PublishedLogPath" 'INFO'
 
@@ -1195,12 +1286,19 @@ finally {
         foreach ($item in $pinnedPackageDetails) { $item }
     )
 
+    $script:FirefoxUpdateState = Get-FirefoxPendingUpdateState
     $details = [ordered]@{
+        ExecutionBudget = [pscustomobject]@{
+            Mode=$script:EffectiveExecutionMode; TaskName=$ScheduledTaskName
+            TaskTimeLimit=$script:TaskTimeLimit; Deadline=$script:TaskDeadline
+            LogReserveSeconds=$TaskLogReserveSeconds
+        }
+        FirefoxUpdateState = $script:FirefoxUpdateState
         WingetPreflight           = $script:WingetPreflight
         WingetInvocations         = [object[]]@(foreach ($invocation in $script:WingetInvocations) { $invocation })
         WingetExecutionBlocked    = $script:WingetExecutionBlocked
         WingetAvailable           = [bool](Get-WingetPath)
-        WingetVersion             = $(Get-WingetVersion)
+        WingetVersion             = if ($script:WingetExecutionBlocked) { $null } else { $(Get-WingetVersion) }
         ApplicationInventoryPath  = if ($applicationInventory) { $ApplicationInventoryPath } else { $null }
         ApplicationInventoryCount = if ($applicationInventory) { $applicationInventory.Applications.Count } else { 0 }
         ApplicationsToReviewCount = if ($applicationInventory) { @($applicationInventory.Applications | Where-Object MaintenanceStatus -eq 'ReviewUpdateMethod').Count } else { 0 }

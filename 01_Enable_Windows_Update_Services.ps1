@@ -1,13 +1,15 @@
 ﻿# =====================================================================
 # ScriptName: 01_Enable_Windows_Update_Services.ps1
-# ScriptVersion: 2.8.9
-# LastUpdated: 2026-10-19
+# ScriptVersion: 2.8.10
+# LastUpdated: 2026-10-22
 # Purpose: Restore Windows Update services, tasks, policy settings,
 #          Windows 11 UI preferences, and classic right-click context menu behavior for all users;
 #          verify required services are running, retry startup failures
 #          up to 4 total attempts, and force a reboot if critical
 #          services still refuse to start.
-# Changes:  v2.8.9 adds -ManualUpdateRepair: skip script refresh, task registration,
+# Changes:  v2.8.10 configures EventLog Automatic/restart recovery, starts it if stopped,
+#           and publishes bounded service/crash diagnostics through existing Elastic NDJSON.
+#           v2.8.9 adds -ManualUpdateRepair: skip script refresh, task registration,
 #           and Secure Boot coordination; leave reboot decisions to script 07.
 #           v2.8.8 restores the optional Microsoft Update Health service.
 #           v2.8.6 verifies Medic native exit codes and restores SIH healing tasks.
@@ -24,7 +26,7 @@ param([switch]$ManualUpdateRepair)
 $ErrorActionPreference = 'Stop'
 
 $script:ScriptName       = '01_Enable_Windows_Update_Services.ps1'
-$script:ScriptVersion    = '2.8.9'
+$script:ScriptVersion    = '2.8.10'
 $script:ExecutionStart   = Get-Date
 $script:WarningCount     = 0
 $script:ErrorCount       = 0
@@ -46,6 +48,15 @@ $script:LogSession = $null
 $script:FailureStage = $null
 $script:FailureMessage = $null
 $script:BootstrapExitCode = $null
+$script:EventLogDiagnosticRunId = [guid]::NewGuid().ToString()
+$script:EventLogHealth = [ordered]@{
+    Attempted=$false; Healthy=$false; RecoveryConfigurationApplied=$false; StartAttempted=$false
+    RecoveryResetSeconds=86400; RecoveryRestartDelaysSeconds=@(60,120,300); RecoveryNonCrashFailures=$true
+    Before=$null; After=$null; NativeBefore=@(); NativeAfter=@(); ConfigurationResults=@(); StartResults=@()
+    RepairErrors=@(); CollectionErrors=@(); CollectionNotes=@(); EvidenceCount=0
+    SystemDriveFreeBytes=$null; SystemDriveSizeBytes=$null; LogDirectorySddl=$null; ServiceDll=$null
+}
+
 
 
 # Load the shared framework from the same directory as this script.
@@ -239,8 +250,7 @@ function Invoke-LatestUpdaterBootstrap {
     $localUpdaterPath = Join-Path $localScriptsRoot '00_Update-Scripts-FromShare.ps1'
 
     $sourceRoots = @(
-        '\\SERVER\DeploymentShare',
-        '\\FALLBACK-SERVER\DeploymentShare'
+        '\\SERVER\DeploymentShare'
     )
 
     $sourceRoot = $null
@@ -258,7 +268,7 @@ function Invoke-LatestUpdaterBootstrap {
     }
 
     if ([string]::IsNullOrWhiteSpace($sourceRoot)) {
-        throw 'Updater bootstrap failed because neither \\SERVER\DeploymentShare nor \\FALLBACK-SERVER\DeploymentShare is available.'
+        throw ('Updater bootstrap source is unavailable: {0}' -f ($sourceRoots -join ', '))
     }
 
     $sourceUpdaterPath = Join-Path $sourceRoot '00_Update-Scripts-FromShare.ps1'
@@ -504,6 +514,178 @@ function Get-ServiceTelemetrySnapshot {
     return @($results)
 }
 
+# EventLog is an always-on platform service, not a maintenance-window update service.
+function Invoke-EventLogScCommand {
+    param([Parameter(Mandatory)][string[]]$Arguments)
+    $output = @(& "$env:SystemRoot\System32\sc.exe" @Arguments 2>&1)
+    $code = [int]$LASTEXITCODE
+    return [pscustomobject]@{ Arguments=($Arguments -join ' '); ExitCode=$code; Output=($output -join [Environment]::NewLine) }
+}
+
+function Get-EventLogHealthSnapshot {
+    try {
+        $svc = Get-CimInstance Win32_Service -Filter "Name='EventLog'" -ErrorAction Stop
+        if ($null -eq $svc) { throw 'EventLog service was not returned by WMI/CIM.' }
+        return [pscustomobject]@{
+            CollectedUtc=[datetime]::UtcNow.ToString('o'); State=[string]$svc.State
+            StartMode=[string]$svc.StartMode; ProcessId=[int]$svc.ProcessId
+            Win32ExitCode=[long]$svc.ExitCode; ServiceSpecificExitCode=[long]$svc.ServiceSpecificExitCode
+            StartName=[string]$svc.StartName; PathName=[string]$svc.PathName; QueryError=$null
+        }
+    }
+    catch {
+        return [pscustomobject]@{
+            CollectedUtc=[datetime]::UtcNow.ToString('o'); State='Unknown'; StartMode='Unknown'
+            ProcessId=0; Win32ExitCode=$null; ServiceSpecificExitCode=$null
+            StartName=$null; PathName=$null; QueryError=$_.Exception.Message
+        }
+    }
+}
+
+function Initialize-EventLogRecovery {
+    $script:EventLogHealth.Attempted = $true
+    $script:EventLogHealth.Before = Get-EventLogHealthSnapshot
+    Write-Status ("EventLog before repair: State={0}; Startup={1}; Win32ExitCode={2}; ServiceExitCode={3}" -f $script:EventLogHealth.Before.State,$script:EventLogHealth.Before.StartMode,$script:EventLogHealth.Before.Win32ExitCode,$script:EventLogHealth.Before.ServiceSpecificExitCode) 'INFO'
+    foreach ($verb in @('qc','qfailure','qfailureflag','queryex')) {
+        try {
+            $r=Invoke-EventLogScCommand -Arguments @($verb,'EventLog')
+            $script:EventLogHealth.NativeBefore += "sc.exe $($r.Arguments) [ExitCode=$($r.ExitCode)] $($r.Output)"
+        } catch { $script:EventLogHealth.CollectionErrors += "Before $verb : $($_.Exception.Message)" }
+    }
+    try {
+        $commands = @(
+            @('config','EventLog','start=','auto'),
+            @('failure','EventLog','reset=','86400','actions=','restart/60000/restart/120000/restart/300000'),
+            @('failureflag','EventLog','1')
+        )
+        foreach ($arguments in $commands) {
+            $r=Invoke-EventLogScCommand -Arguments $arguments
+            $script:EventLogHealth.ConfigurationResults += "sc.exe $($r.Arguments) [ExitCode=$($r.ExitCode)] $($r.Output)"
+            if ($r.ExitCode -ne 0) { throw "sc.exe $($r.Arguments) failed with exit code $($r.ExitCode): $($r.Output)" }
+        }
+        $script:EventLogHealth.RecoveryConfigurationApplied=$true
+        Write-Status 'EventLog recovery configured: restart after 60/120/300 seconds; failure count resets after 86400 seconds; non-crash error failures included; no reboot action.' 'OK'
+    }
+    catch {
+        $script:EventLogHealth.RepairErrors += $_.Exception.Message
+        Write-Status "EventLog recovery configuration failed: $($_.Exception.Message)" 'WARN'
+    }
+    # A recovery policy does not start a service that was already stopped.
+    # Use a bounded start-only pass. Never stop, restart, or kill a running EventLog host.
+    for ($attempt=1; $attempt -le 3; $attempt++) {
+        $current=Get-EventLogHealthSnapshot
+        if ($current.State -eq 'Running') { break }
+        $script:EventLogHealth.StartAttempted=$true
+        try {
+            $r=Invoke-EventLogScCommand -Arguments @('start','EventLog')
+            $script:EventLogHealth.StartResults += "Attempt $attempt [ExitCode=$($r.ExitCode)] $($r.Output)"
+        } catch { $script:EventLogHealth.RepairErrors += $_.Exception.Message }
+        $deadline=(Get-Date).AddSeconds(10)
+        do {
+            Start-Sleep -Seconds 1
+            $current=Get-EventLogHealthSnapshot
+            if ($current.State -eq 'Running') { break }
+        } while ((Get-Date) -lt $deadline)
+    }
+    $script:EventLogHealth.After=Get-EventLogHealthSnapshot
+    if ($script:EventLogHealth.After.State -ne 'Running' -or $script:EventLogHealth.After.StartMode -ne 'Auto') {
+        Write-Status "EventLog remains unhealthy: State=$($script:EventLogHealth.After.State); Startup=$($script:EventLogHealth.After.StartMode). See EventLog health telemetry; no additional reboot requested." 'WARN'
+    }
+}
+
+function Write-EventLogHealthTelemetry {
+    if (-not $script:EventLogHealth.Attempted) { return }
+    $script:EventLogHealth.After = Get-EventLogHealthSnapshot
+    foreach ($verb in @('qc','qfailure','qfailureflag','queryex')) {
+        try {
+            $r=Invoke-EventLogScCommand -Arguments @($verb,'EventLog')
+            $script:EventLogHealth.NativeAfter += "sc.exe $($r.Arguments) [ExitCode=$($r.ExitCode)] $($r.Output)"
+        } catch { $script:EventLogHealth.CollectionErrors += "After $verb : $($_.Exception.Message)" }
+    }
+    try {
+        $volume=Get-CimInstance Win32_LogicalDisk -Filter ("DeviceID='{0}'" -f $env:SystemDrive)
+        $script:EventLogHealth.SystemDriveFreeBytes=[long]$volume.FreeSpace
+        $script:EventLogHealth.SystemDriveSizeBytes=[long]$volume.Size
+        $eventDirectory=Join-Path $env:SystemRoot 'System32\winevt\Logs'
+        $script:EventLogHealth.LogDirectorySddl=(Get-Acl -LiteralPath $eventDirectory).Sddl
+        $parameters=Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Services\EventLog\Parameters' -ErrorAction Stop
+        $script:EventLogHealth.ServiceDll=[string]$parameters.ServiceDll
+    } catch { $script:EventLogHealth.CollectionErrors += "Environment evidence: $($_.Exception.Message)" }
+
+    $displayName='Windows Event Log'
+    try { $displayName=[string](Get-Service EventLog).DisplayName } catch {}
+    $servicePattern='(?i)EventLog|Windows Event Log|wevtsvc|'+[regex]::Escape($displayName)
+    $queries=@(
+        @{Kind='ServiceControl';Log='System';Provider='Service Control Manager';Ids=@(7000,7001,7009,7011,7022,7023,7024,7031,7032,7034,7036,7040);Pattern=$servicePattern},
+        @{Kind='EventLogProvider';Log='System';Provider='Microsoft-Windows-Eventlog';Ids=@();Pattern=''},
+        @{Kind='EventLogSecurity';Log='Security';Provider='Microsoft-Windows-Eventlog';Ids=@(1100,1101,1102,1104,1105,1108);Pattern=''},
+        @{Kind='HostCrash';Log='Application';Provider='';Ids=@(1000,1001,1002);Pattern='(?i)wevtsvc|svchost\.exe|EventLog'}
+    )
+    foreach ($query in $queries) {
+        $job=$null
+        try {
+            # Isolate queries in a child process so a broken EventLog/RPC cannot hang script 01.
+            $job=Start-Job -ArgumentList $query -ScriptBlock {
+                param($q)
+                $filter=@{LogName=$q.Log;StartTime=(Get-Date).AddDays(-7)}
+                if ($q.Provider) { $filter.ProviderName=$q.Provider }
+                if ($q.Ids.Count) { $filter.Id=$q.Ids }
+                $errors=@()
+                $rows=@(Get-WinEvent -FilterHashtable $filter -MaxEvents 1000 -ErrorAction SilentlyContinue -ErrorVariable errors)
+                $queryFailures=@($errors | Where-Object {$_.FullyQualifiedErrorId -notlike 'NoMatchingEventsFound*'} | ForEach-Object {[string]$_})
+                $matches=@($rows | Where-Object {
+                    -not $q.Pattern -or ($_.ToXml()+' '+$_.Message) -match $q.Pattern
+                })
+                $selected=@($matches | Select-Object -First 100 | ForEach-Object {
+                    $message=[string]$_.Message
+                    if ($message.Length -gt 8000) { $message=$message.Substring(0,8000) }
+                    [pscustomobject]@{TimeUtc=$_.TimeCreated.ToUniversalTime().ToString('o');LogName=$_.LogName;Provider=$_.ProviderName;Id=[int]$_.Id;RecordId=[long]$_.RecordId;Level=[int]$_.Level;Message=$message}
+                })
+                [pscustomobject]@{Events=$selected;Errors=$queryFailures;QueryLimitReached=($rows.Count -ge 1000);MatchLimitReached=($matches.Count -gt 100)}
+            }
+            if ($null -eq (Wait-Job -Job $job -Timeout 20)) { throw "Event query $($query.Kind) timed out after 20 seconds." }
+            if ($job.State -ne 'Completed') { throw "Event query $($query.Kind) ended with job state $($job.State)." }
+            $result=Receive-Job -Job $job -ErrorAction Stop
+            $script:EventLogHealth.CollectionErrors += @($result.Errors)
+            if ($result.QueryLimitReached -or $result.MatchLimitReached) { $script:EventLogHealth.CollectionNotes += "$($query.Kind): limited to newest 1000 source records / 100 matches." }
+            foreach ($record in @($result.Events)) {
+                $evidence=[ordered]@{
+                    '@timestamp'=[datetime]::UtcNow.ToString('o');Timestamp=[datetime]::UtcNow.ToString('o')
+                    EventType='maintenance.eventlog_evidence';ComputerName=$env:COMPUTERNAME
+                    ScriptName=$script:ScriptName;ScriptVersion=$script:ScriptVersion
+                    EventLogDiagnosticRunId=$script:EventLogDiagnosticRunId
+                    EventLogEvidenceKind=[string]$query.Kind;EventLogEvidenceTime=[string]$record.TimeUtc
+                    EventLogEvidenceChannel=[string]$record.LogName;EventLogEvidenceProvider=[string]$record.Provider
+                    EventLogEvidenceId=[int]$record.Id;EventLogEvidenceRecordId=[long]$record.RecordId
+                    EventLogEvidenceLevel=[int]$record.Level;EventLogEvidenceMessage=[string]$record.Message
+                }
+                Write-MaintenanceTelemetryLine -Path $script:NdjsonPath -JsonLine ($evidence | ConvertTo-Json -Depth 5 -Compress)
+                $script:EventLogHealth.EvidenceCount++
+            }
+        }
+        catch { $script:EventLogHealth.CollectionErrors += "$($query.Kind): $($_.Exception.Message)" }
+        finally {
+            if ($null -ne $job) {
+                Remove-Job -Job $job -Force -ErrorAction SilentlyContinue
+            }
+        }
+    }
+    $script:EventLogHealth.Healthy=($script:EventLogHealth.After.State -eq 'Running' -and $script:EventLogHealth.After.StartMode -eq 'Auto')
+    $status=if (-not $script:EventLogHealth.Healthy) {'Failed'} elseif (-not $script:EventLogHealth.RecoveryConfigurationApplied -or $script:EventLogHealth.CollectionErrors.Count) {'SuccessWithWarnings'} else {'Success'}
+    foreach ($errorText in @($script:EventLogHealth.CollectionErrors)) { Write-Status "EventLog diagnostics: $errorText" 'WARN' }
+    if (-not $script:EventLogHealth.Healthy) { Write-Status 'EventLog is not Running/Automatic at final verification.' 'WARN' }
+    $summary=[ordered]@{
+        '@timestamp'=[datetime]::UtcNow.ToString('o');Timestamp=[datetime]::UtcNow.ToString('o')
+        EventType='maintenance.eventlog_health';ComputerName=$env:COMPUTERNAME
+        ScriptName=$script:ScriptName;ScriptVersion=$script:ScriptVersion;Status=$status
+        EventLogDiagnosticRunId=$script:EventLogDiagnosticRunId;EventLogHealth=$script:EventLogHealth
+    }
+    $json=$summary | ConvertTo-Json -Depth 10 -Compress
+    Write-MaintenanceTelemetryLine -Path $script:NdjsonPath -JsonLine $json
+    $summary | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath (Join-Path $script:TelemetryDirectory '01_EventLog_Health.latest.json') -Encoding UTF8
+    Write-Status "EventLog health: Status=$status; Before=$($script:EventLogHealth.Before.State); After=$($script:EventLogHealth.After.State); RecoveryApplied=$($script:EventLogHealth.RecoveryConfigurationApplied); EvidenceCount=$($script:EventLogHealth.EvidenceCount)" $(if ($status -eq 'Success') {'OK'} else {'WARN'})
+}
+
 function Get-WindowsUpdatePolicyConflicts {
     [CmdletBinding()]
     param()
@@ -604,6 +786,9 @@ function Write-ExecutionTelemetry {
             ServiceStateBefore        = @($script:ServiceStateBefore)
             ServiceStateAfter         = @($script:ServiceStateAfter)
             ApprovedServiceState      = ($servicesFailed.Count -eq 0)
+            EventLogState             = if ($script:EventLogHealth.After) { $script:EventLogHealth.After.State } else { 'NotChecked' }
+            EventLogRecoveryApplied   = [bool]$script:EventLogHealth.RecoveryConfigurationApplied
+            EventLogDiagnosticRunId   = $script:EventLogDiagnosticRunId
             TextLogPath                = $script:PublishedLogPath
         }
 
@@ -1108,6 +1293,12 @@ try {
         throw $script:FailureMessage
     }
 
+    try { Initialize-EventLogRecovery }
+    catch {
+        $script:EventLogHealth.RepairErrors += $_.Exception.Message
+        Write-Status "EventLog recovery encountered an error: $($_.Exception.Message)" 'WARN'
+    }
+
     $script:ServiceStateBefore = @(Get-ServiceTelemetrySnapshot -Names $script:ServiceNames)
     $script:PolicyConflictsBefore = @(Get-WindowsUpdatePolicyConflicts)
 Write-Status "Initializing script..." 'INFO'
@@ -1334,6 +1525,9 @@ catch {
     Write-Status "Unhandled failure: $($_.Exception.Message)" 'ERROR'
 }
 finally {
+    try { Write-EventLogHealthTelemetry }
+    catch { Write-Status "EventLog telemetry publication failed: $($_.Exception.Message)" 'WARN' }
+    if ($script:WarningCount -gt 0 -and $script:FinalStatus -eq 'Success') { $script:FinalStatus = 'SuccessWithWarnings' }
     $script:ServiceStateAfter = @(Get-ServiceTelemetrySnapshot -Names $script:ServiceNames)
     Write-ExecutionTelemetry
 

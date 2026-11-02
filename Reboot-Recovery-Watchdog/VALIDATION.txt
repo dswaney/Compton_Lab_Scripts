@@ -1,0 +1,3 @@
+Current validation: see ../BUILD-VALIDATION.json.
+Native Windows PowerShell 5.1 and live recovery validation remain required.
+Supplied historical validation results are not asserted for this release.

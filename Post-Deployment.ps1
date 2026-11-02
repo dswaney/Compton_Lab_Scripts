@@ -1,10 +1,16 @@
 # =====================================================================
 # ScriptName: Post-Deployment.ps1
-# ScriptVersion: 2.3.0
-# LastUpdated: 2026-09-18
-# Changes:       v2.3.0 adds comprehensive Microsoft Copilot removal through
-#                the canonical module on the central maintenance-script share.
-#                The module does not depend on C:\Scripts already existing.
+# ScriptVersion: 2.4.0
+# LastUpdated: 2026-10-14
+# Changes:       v2.4.0 adds SHARP BP-70C31 PCL6 driver staging, package
+#                fingerprint checks, verification, and StudentSecurePrint
+#                connection from script 04; retains the existing PaperCut install.
+#                v2.3.0 uses the canonical Copilot-removal module directly from
+#                \\SERVER\DeploymentShare so C:\Scripts does not need to exist first.
+#                v2.2.0 removes installed and provisioned Microsoft Copilot and
+#                Microsoft 365 Copilot app packages, removes Copilot shortcuts,
+#                and applies machine/user policies that disable Windows Copilot
+#                and the Microsoft Edge Copilot sidebar.
 #                v2.1.0 adds idempotent PaperCut Print Deploy and Action1 Agent
 #                installation sections. Each installer is verified after it runs,
 #                reports reboot-required MSI results, and cannot stop later
@@ -18,33 +24,40 @@
 
 [CmdletBinding()]
 param(
-    # Public template values use placeholder server/share names. Replace these
-    # paths with organization-approved deployment sources before production use.
     [Alias('HPDriversWorkingRoot')]
     [string]$DriverWorkingRoot = 'C:\Temp\DriverUpdates',
     [string]$LogFolder = 'C:\Logs',
     [switch]$IncludeSoftware = $false,
     [bool]$IncludeBiosAndFirmwareUpdates = $true,
     [string]$DellCommandUpdateSharePath = '\\SERVER\DeploymentShare\Dell-Command-Update-Windows-Universal-Application.exe',
-    [string]$DotNetDesktopRuntimeSharePath = '\\SERVER\DeploymentShare\windowsdesktop-runtime-8-win-x64.exe',
+    [string]$DotNetDesktopRuntimeSharePath = '\\SERVER\DeploymentShare\windowsdesktop-runtime-8.0.25-win-x64.exe',
     [string]$DotNetDesktopRuntimeInternetUrl = 'https://aka.ms/dotnet/8.0/windowsdesktop-runtime-win-x64.exe',
     [string]$DellCommandUpdateWingetId = 'Dell.CommandUpdate.Universal',
     [int]$CleanupRetryCount = 12,
     [int]$CleanupRetryDelaySeconds = 10,
     [int]$RebootDelaySeconds = 15,
     [bool]$RebootWhenComplete = $true,
-    [string]$ScriptsSourcePath = '\\SERVER\DeploymentShare\Scripts',
+    [string]$ScriptsSourcePath = '\\SERVER\DeploymentShare',
     [string]$LocalScriptsPath = 'C:\Scripts',
     [bool]$ActivateInstalledOffice = $true,
+    [bool]$InstallSharpPrinter = $true,
+    [string]$DriverSourcePath = '\\papercut\Printer Drivers\MFP\win\SH_D31_PCL6_PS_2410a_EnglishUS_64bit',
+    [string]$PrinterDriverName = 'Sharp BP-70C31 PCL6',
+    [string]$SharpDriverStageRoot = 'C:\ProgramData\Compton\Drivers\Sharp',
+    [ValidateRange(1,7200)][int]$SharpDriverInstallTimeoutSeconds = 900,
+    [bool]$ConnectStudentSecurePrint = $true,
+    [string]$PrinterSharePath = '\\papercut\StudentSecurePrint',
+    [ValidateRange(1,7200)][int]$PrinterConnectionTimeoutSeconds = 120,
+    [ValidateRange(0,60)][int]$PrinterVerificationDelaySeconds = 5,
     [bool]$InstallPaperCut = $true,
-    [string]$PaperCutMsiPath = '\\PRINT-SERVER\PrintDeploy\pc-print-deploy-client.msi',
+    [string]$PaperCutMsiPath = '\\papercut\Print Deploy Clients\win\pc-print-deploy-client[10.2.3.44].msi',
     [int]$PaperCutInstallTimeoutSeconds = 900,
     [bool]$InstallAction1 = $true,
     [string]$Action1AgentPath = 'C:\Windows\Action1\action1_agent.exe',
-    [string]$Action1InstallerPath = '\\SERVER\DeploymentShare\Action1-Agent.msi',
+    [string]$Action1InstallerPath = '\\SERVER\DeploymentShare\action1_agent(Compton_College).msi',
     [int]$Action1InstallTimeoutSeconds = 900,
     [bool]$RemoveMicrosoftCopilot = $true,
-    [string]$CopilotModuleSharePath = '\\SERVER\DeploymentShare\Scripts\Maintenance.Copilot.psm1',
+    [string]$CopilotModuleSharePath = '\\SERVER\DeploymentShare\Maintenance.Copilot.psm1',
     [bool]$UpdateApplications = $true,
     [bool]$InstallWindowsUpdates = $true,
     [int]$WindowsUpdateTimeoutMinutes = 90
@@ -610,6 +623,339 @@ function Invoke-InstallerAndValidateExitCode {
     }
 }
 
+function Get-PrinterInfFiles {
+    param([Parameter(Mandatory)][string]$Path)
+    $allInfFiles = @(Get-ChildItem -LiteralPath $Path -Filter '*.inf' -File -Recurse -ErrorAction Stop)
+    if ($allInfFiles.Count -eq 0) { throw "No INF files were found under: $Path" }
+    $printerInfFiles = foreach ($inf in $allInfFiles) {
+        $content = Get-Content -LiteralPath $inf.FullName -ErrorAction SilentlyContinue
+        if ($content -match '^\s*Class\s*=\s*Printer\s*$') { $inf }
+    }
+    if (@($printerInfFiles).Count -gt 0) { return @($printerInfFiles) }
+    Write-Log 'No INF explicitly declared Class=Printer; all INF files will be staged.' 'WARN'
+    return $allInfFiles
+}
+
+function Get-DriverPackageFingerprint {
+    param([Parameter(Mandatory)][string]$Path)
+    $files = @(Get-ChildItem -LiteralPath $Path -File -Recurse -ErrorAction Stop | Sort-Object FullName)
+    if ($files.Count -eq 0) { throw "No files were found in the driver source package: $Path" }
+    $root = $Path.TrimEnd('\')
+    $manifestLines = foreach ($file in $files) {
+        $relativePath = $file.FullName.Substring($root.Length).TrimStart('\')
+        $hash = Get-FileHash -LiteralPath $file.FullName -Algorithm SHA256 -ErrorAction Stop
+        '{0}|{1}|{2}' -f $relativePath.ToLowerInvariant(), $file.Length, $hash.Hash
+    }
+    $sha256 = [Security.Cryptography.SHA256]::Create()
+    try {
+        $bytes = [Text.Encoding]::UTF8.GetBytes(($manifestLines -join "`n"))
+        return ([BitConverter]::ToString($sha256.ComputeHash($bytes))).Replace('-','')
+    }
+    finally { $sha256.Dispose() }
+}
+
+function Convert-PrinterDriverVersion {
+    param($DriverVersion)
+
+    if ($null -eq $DriverVersion) { return $null }
+    try {
+        $value = [uint64]$DriverVersion
+        return '{0}.{1}.{2}.{3}' -f `
+            (($value -shr 48) -band 0xFFFF), `
+            (($value -shr 32) -band 0xFFFF), `
+            (($value -shr 16) -band 0xFFFF), `
+            ($value -band 0xFFFF)
+    }
+    catch { return [string]$DriverVersion }
+}
+
+function Get-SafePropertyValue {
+    [CmdletBinding()]
+    param(
+        [AllowNull()]$InputObject,
+        [Parameter(Mandatory)][string[]]$PropertyNames
+    )
+
+    if ($null -eq $InputObject) {
+        return $null
+    }
+
+    foreach ($propertyName in $PropertyNames) {
+        $property = $InputObject.PSObject.Properties[$propertyName]
+        if ($null -ne $property) {
+            try {
+                $value = $property.Value
+                if ($null -ne $value -and -not [string]::IsNullOrWhiteSpace([string]$value)) {
+                    return $value
+                }
+            }
+            catch { }
+        }
+    }
+
+    return $null
+}
+
+function Get-InstalledPrinterDriverState {
+    [CmdletBinding()]
+    param(
+        [int]$RetryCount = 1,
+        [int]$RetryDelaySeconds = 0
+    )
+
+    $driver = $null
+    $cimDriver = $null
+
+    for ($attempt = 1; $attempt -le $RetryCount; $attempt++) {
+        try {
+            $driver = Get-PrinterDriver -Name $PrinterDriverName -ErrorAction SilentlyContinue
+
+            if (-not $driver) {
+                # Some SHARP packages register a slightly different display name.
+                # Fall back to a constrained BP-70C31/PCL6 match rather than
+                # declaring the deployment failed immediately.
+                $driver = Get-PrinterDriver -ErrorAction SilentlyContinue |
+                    Where-Object {
+                        $_.Name -match '(?i)\bBP-70C31\b' -and
+                        $_.Name -match '(?i)\bPCL6\b'
+                    } |
+                    Select-Object -First 1
+            }
+
+            $cimDriver = Get-CimInstance -ClassName Win32_PrinterDriver -ErrorAction SilentlyContinue |
+                Where-Object {
+                    $_.Name -eq $PrinterDriverName -or
+                    $_.Name -like "$PrinterDriverName,*" -or
+                    ($_.Name -match '(?i)\bBP-70C31\b' -and $_.Name -match '(?i)\bPCL6\b')
+                } |
+                Select-Object -First 1
+
+            if ($driver -or $cimDriver) {
+                break
+            }
+        }
+        catch {
+            # Retry below.
+        }
+
+        if ($attempt -lt $RetryCount -and $RetryDelaySeconds -gt 0) {
+            Start-Sleep -Seconds $RetryDelaySeconds
+        }
+    }
+
+    if (-not $driver -and -not $cimDriver) {
+        return [pscustomobject][ordered]@{
+            Installed        = $false
+            Name             = $PrinterDriverName
+            Manufacturer     = $null
+            Version          = $null
+            DriverVersionRaw = $null
+            InfPath          = $null
+            DriverPath       = $null
+            ConfigFile       = $null
+            DataFile         = $null
+            MajorVersion     = $null
+        }
+    }
+
+    $cimDriverPath = Get-SafePropertyValue -InputObject $cimDriver -PropertyNames @('DriverPath')
+    $cimVersionRaw = Get-SafePropertyValue -InputObject $cimDriver -PropertyNames @('DriverVersion','Version')
+    $driverFileVersion = $null
+
+    if ($cimDriverPath -and (Test-Path -LiteralPath ([string]$cimDriverPath) -PathType Leaf)) {
+        try {
+            $driverFileVersion = [Diagnostics.FileVersionInfo]::GetVersionInfo([string]$cimDriverPath).FileVersion
+        }
+        catch { }
+    }
+
+    $driverName = Get-SafePropertyValue -InputObject $driver -PropertyNames @('Name')
+    $cimName = Get-SafePropertyValue -InputObject $cimDriver -PropertyNames @('Name')
+    $manufacturer = Get-SafePropertyValue -InputObject $driver -PropertyNames @('Manufacturer','ProviderName')
+    $infPath = Get-SafePropertyValue -InputObject $driver -PropertyNames @('InfPath','InfName')
+    $majorVersion = Get-SafePropertyValue -InputObject $driver -PropertyNames @('MajorVersion')
+    $configFile = Get-SafePropertyValue -InputObject $cimDriver -PropertyNames @('ConfigFile')
+    $dataFile = Get-SafePropertyValue -InputObject $cimDriver -PropertyNames @('DataFile')
+
+    $normalizedVersion = $null
+    if ($driverFileVersion) {
+        $normalizedVersion = [string]$driverFileVersion
+    }
+    elseif ($null -ne $cimVersionRaw) {
+        # Win32_PrinterDriver commonly exposes Version rather than DriverVersion.
+        # If it is a large packed integer, decode it; otherwise retain the string.
+        try {
+            $numericVersion = [uint64]$cimVersionRaw
+            if ($numericVersion -gt 65535) {
+                $normalizedVersion = Convert-PrinterDriverVersion -DriverVersion $numericVersion
+            }
+            else {
+                $normalizedVersion = [string]$cimVersionRaw
+            }
+        }
+        catch {
+            $normalizedVersion = [string]$cimVersionRaw
+        }
+    }
+
+    [pscustomobject][ordered]@{
+        Installed        = $true
+        Name             = if ($driverName) { [string]$driverName } elseif ($cimName) { [string]$cimName } else { $PrinterDriverName }
+        Manufacturer     = if ($manufacturer) { [string]$manufacturer } else { $null }
+        Version          = $normalizedVersion
+        DriverVersionRaw = if ($null -ne $cimVersionRaw) { [string]$cimVersionRaw } else { $null }
+        InfPath          = if ($infPath) { [string]$infPath } else { $null }
+        DriverPath       = if ($cimDriverPath) { [string]$cimDriverPath } else { $null }
+        ConfigFile       = if ($configFile) { [string]$configFile } else { $null }
+        DataFile         = if ($dataFile) { [string]$dataFile } else { $null }
+        MajorVersion     = $majorVersion
+    }
+}
+
+
+
+function Get-PrinterDeploymentExecutable {
+    param([Parameter(Mandatory)][string]$Name)
+    $folder = if ([Environment]::Is64BitOperatingSystem -and -not [Environment]::Is64BitProcess) { 'Sysnative' } else { 'System32' }
+    return Join-Path $env:SystemRoot "$folder\$Name"
+}
+
+function Test-IsSystemAccount {
+    return [Security.Principal.WindowsIdentity]::GetCurrent().User.Value -eq 'S-1-5-18'
+}
+
+function Invoke-PrinterDeploymentProcess {
+    param(
+        [Parameter(Mandatory)][string]$FilePath,
+        [Parameter(Mandatory)][string[]]$ArgumentList,
+        [int[]]$SuccessExitCodes = @(0),
+        [ValidateRange(1,7200)][int]$TimeoutSeconds = 900,
+        [Parameter(Mandatory)][string]$Operation
+    )
+    Write-Log ("Running {0}: {1} {2}" -f $Operation, $FilePath, ($ArgumentList -join ' ')) 'INFO'
+    $process = Start-Process -FilePath $FilePath -ArgumentList $ArgumentList -PassThru -WindowStyle Hidden -ErrorAction Stop
+    try {
+        if (-not $process.WaitForExit($TimeoutSeconds * 1000)) {
+            try { $process.Kill() } catch { }
+            throw "$Operation timed out after $TimeoutSeconds seconds."
+        }
+        $process.Refresh()
+        $code = [int]$process.ExitCode
+        Write-Log "$Operation exit code: $code" 'INFO'
+        if ($code -notin $SuccessExitCodes) { throw "$Operation failed with exit code $code." }
+        if ($code -eq 3010) { $script:RebootRequired = $true }
+        return $code
+    }
+    finally { $process.Dispose() }
+}
+
+function Install-SharpPrinterDriver {
+    # Same package fingerprint and verification approach as script 04.
+    $before = Get-InstalledPrinterDriverState
+    Write-Log "SHARP driver before: Installed=$($before.Installed); Name=$($before.Name); Version=$($before.Version)" 'INFO'
+    if (-not (Test-Path -LiteralPath $DriverSourcePath -PathType Container)) {
+        if ($before.Installed) {
+            Write-Log "Driver source unavailable; retaining installed SHARP driver: $DriverSourcePath" 'WARN'
+            return
+        }
+        throw "SHARP driver is missing and the source folder is unavailable: $DriverSourcePath"
+    }
+    $fingerprint = Get-DriverPackageFingerprint -Path $DriverSourcePath
+    $statePath = Join-Path $env:ProgramData 'Compton\State\PostDeployment-SharpDriver-State.json'
+    $storedFingerprint = $null
+    if (Test-Path -LiteralPath $statePath -PathType Leaf) {
+        try {
+            $state = Get-Content -LiteralPath $statePath -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
+            if ($state.DriverName -eq $PrinterDriverName -and $state.SourcePath -eq $DriverSourcePath) {
+                $storedFingerprint = $state.SourceFingerprintSHA256
+            }
+        }
+        catch { Write-Log "Could not read SHARP driver state; the package will be reapplied. $($_.Exception.Message)" 'WARN' }
+    }
+    if ($before.Installed -and $storedFingerprint -eq $fingerprint) {
+        Write-Log 'SHARP driver is installed and the source package is unchanged.' 'OK'
+        return
+    }
+    # Use a fresh unique staging folder; never recursively delete a configurable root.
+    $null = New-Item -Path $SharpDriverStageRoot -ItemType Directory -Force
+    $stage = Join-Path $SharpDriverStageRoot ([guid]::NewGuid().ToString('N'))
+    $null = New-Item -Path $stage -ItemType Directory -Force
+    try {
+        Write-Log "Copying SHARP driver package to $stage" 'INFO'
+        Copy-Item -Path (Join-Path $DriverSourcePath '*') -Destination $stage -Recurse -Force -ErrorAction Stop
+        $infFiles = @(Get-PrinterInfFiles -Path $stage)
+        foreach ($inf in $infFiles) {
+            Invoke-PrinterDeploymentProcess -FilePath (Get-PrinterDeploymentExecutable -Name 'pnputil.exe') `
+                -ArgumentList @('/add-driver', "`"$($inf.FullName)`"") -SuccessExitCodes @(0,3010) `
+                -TimeoutSeconds $SharpDriverInstallTimeoutSeconds -Operation ("Stage SHARP driver {0}" -f $inf.Name) | Out-Null
+        }
+        Add-PrinterDriver -Name $PrinterDriverName -ErrorAction Stop
+        $after = Get-InstalledPrinterDriverState -RetryCount 6 -RetryDelaySeconds 2
+        if (-not $after.Installed) { throw "SHARP driver could not be verified after installation: $PrinterDriverName" }
+        $null = New-Item -Path (Split-Path -Parent $statePath) -ItemType Directory -Force
+        $tempState = "$statePath.$([guid]::NewGuid().ToString('N')).tmp"
+        [ordered]@{
+            DriverName = $PrinterDriverName
+            SourcePath = $DriverSourcePath
+            SourceFingerprintSHA256 = $fingerprint
+            LastSuccessfulUpdate = (Get-Date).ToUniversalTime().ToString('o')
+            ScriptVersion = '2.4.0'
+        } | ConvertTo-Json | Set-Content -LiteralPath $tempState -Encoding UTF8 -ErrorAction Stop
+        Move-Item -LiteralPath $tempState -Destination $statePath -Force -ErrorAction Stop
+        Write-Log "SHARP driver verified: Name=$($after.Name); Version=$($after.Version); INF=$($after.InfPath)" 'OK'
+    }
+    finally {
+        try { Remove-Item -LiteralPath $stage -Recurse -Force -ErrorAction Stop }
+        catch { Write-Log "Unable to clean SHARP staging folder $stage. $($_.Exception.Message)" 'WARN' }
+    }
+}
+
+function Test-PerMachinePrinterConnection {
+    param([Parameter(Mandatory)][string]$ConnectionPath)
+    $connectionsPath = 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Print\Connections'
+    if (-not (Test-Path -LiteralPath $connectionsPath)) { return $false }
+    $parts = $ConnectionPath.TrimStart('\') -split '\\',2
+    if ($parts.Count -ne 2) { return $false }
+    $expected = ',,' + $parts[0] + ',' + $parts[1]
+    return $null -ne (Get-ChildItem -LiteralPath $connectionsPath -ErrorAction SilentlyContinue | Where-Object { $_.PSChildName -ieq $expected } | Select-Object -First 1)
+}
+
+function Get-PrinterConnectionState {
+    param([Parameter(Mandatory)][string]$ConnectionPath)
+    if (Test-IsSystemAccount) {
+        return [pscustomobject]@{ Scope='PerMachine'; Connected=(Test-PerMachinePrinterConnection -ConnectionPath $ConnectionPath); Name=$ConnectionPath }
+    }
+    $parts = $ConnectionPath.TrimStart('\') -split '\\',2
+    $server = if ($parts.Count -eq 2) { $parts[0] } else { $null }
+    $share = if ($parts.Count -eq 2) { $parts[1] } else { $null }
+    $existing = Get-Printer -ErrorAction SilentlyContinue | Where-Object { $_.Name -eq $ConnectionPath -or ($_.ComputerName -ieq $server -and $_.ShareName -ieq $share) } | Select-Object -First 1
+    [pscustomobject]@{ Scope='CurrentUser'; Connected=($null -ne $existing); Name=$ConnectionPath }
+}
+
+function Ensure-SharedPrinterConnection {
+    param([Parameter(Mandatory)][string]$ConnectionPath)
+    $before = Get-PrinterConnectionState -ConnectionPath $ConnectionPath
+    if ($before.Connected) {
+        Write-Log "Printer connection is already configured: $ConnectionPath" 'OK'
+        return $before
+    }
+    if (Test-IsSystemAccount) {
+        Invoke-PrinterDeploymentProcess -FilePath (Get-PrinterDeploymentExecutable -Name 'rundll32.exe') -ArgumentList @('printui.dll,PrintUIEntry','/ga',"/n`"$ConnectionPath`"") -SuccessExitCodes @(0) -TimeoutSeconds $PrinterConnectionTimeoutSeconds -Operation 'Create per-machine printer connection' | Out-Null
+    }
+    else {
+        try { Add-Printer -ConnectionName $ConnectionPath -ErrorAction Stop }
+        catch {
+            Write-Log "Add-Printer failed; using PrintUIEntry fallback. $($_.Exception.Message)" 'WARN'
+            Invoke-PrinterDeploymentProcess -FilePath (Get-PrinterDeploymentExecutable -Name 'rundll32.exe') -ArgumentList @('printui.dll,PrintUIEntry','/in',"/n`"$ConnectionPath`"") -SuccessExitCodes @(0) -TimeoutSeconds $PrinterConnectionTimeoutSeconds -Operation 'Create current-user printer connection' | Out-Null
+        }
+    }
+    Start-Sleep -Seconds $PrinterVerificationDelaySeconds
+    $after = Get-PrinterConnectionState -ConnectionPath $ConnectionPath
+    if (-not $after.Connected) { throw "Printer connection could not be verified: $ConnectionPath" }
+    Write-Log "Printer connection created successfully: $ConnectionPath" 'OK'
+    return $after
+}
+
 function Get-PaperCutProduct {
     $uninstallRoots = @(
         'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*',
@@ -1059,6 +1405,177 @@ function Invoke-DellDriverUpdate {
     }
 }
 
+function Set-RegistryDwordValue {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)][string]$Name,
+        [Parameter(Mandatory)][int]$Value
+    )
+
+    if (-not (Test-Path -LiteralPath $Path)) {
+        New-Item -Path $Path -Force -ErrorAction Stop | Out-Null
+    }
+    New-ItemProperty -Path $Path -Name $Name -PropertyType DWord -Value $Value -Force -ErrorAction Stop | Out-Null
+}
+
+function Remove-CopilotAppxPackages {
+    [CmdletBinding()]
+    param()
+
+    $namePatterns = @(
+        '*Copilot*',
+        'Microsoft.MicrosoftOfficeHub'
+    )
+    $installedPackages = @(
+        Get-AppxPackage -AllUsers -ErrorAction SilentlyContinue |
+            Where-Object {
+                $packageName = [string]$_.Name
+                $packageFullName = [string]$_.PackageFullName
+                ($namePatterns | Where-Object {
+                    $packageName -like $_ -or $packageFullName -like $_
+                }).Count -gt 0
+            } |
+            Sort-Object PackageFullName -Unique
+    )
+
+    foreach ($package in $installedPackages) {
+        Write-Log "Removing installed Appx package: $($package.PackageFullName)" 'INFO'
+        try {
+            Remove-AppxPackage -Package $package.PackageFullName -AllUsers -ErrorAction Stop
+            Write-Log "Removed installed Appx package: $($package.PackageFullName)" 'OK'
+        }
+        catch {
+            # Older Windows builds do not support -AllUsers for every package.
+            Write-Log "All-users removal failed for $($package.PackageFullName); trying the current user. $($_.Exception.Message)" 'WARN'
+            Remove-AppxPackage -Package $package.PackageFullName -ErrorAction Stop
+            Write-Log "Removed current-user Appx package: $($package.PackageFullName)" 'OK'
+        }
+    }
+
+    $provisionedPackages = @(
+        Get-AppxProvisionedPackage -Online -ErrorAction Stop |
+            Where-Object {
+                $displayName = [string]$_.DisplayName
+                $packageName = [string]$_.PackageName
+                ($namePatterns | Where-Object {
+                    $displayName -like $_ -or $packageName -like $_
+                }).Count -gt 0
+            } |
+            Sort-Object PackageName -Unique
+    )
+
+    foreach ($package in $provisionedPackages) {
+        Write-Log "Removing provisioned Appx package: $($package.PackageName)" 'INFO'
+        Remove-AppxProvisionedPackage -Online -PackageName $package.PackageName -AllUsers -ErrorAction Stop | Out-Null
+        Write-Log "Removed provisioned Appx package: $($package.PackageName)" 'OK'
+    }
+
+    if ($installedPackages.Count -eq 0 -and $provisionedPackages.Count -eq 0) {
+        Write-Log 'No installed or provisioned Microsoft Copilot Appx packages were found.' 'INFO'
+    }
+}
+
+function Remove-CopilotShortcuts {
+    [CmdletBinding()]
+    param()
+
+    $shortcutRoots = New-Object System.Collections.Generic.List[string]
+    foreach ($root in @(
+        (Join-Path $env:ProgramData 'Microsoft\Windows\Start Menu\Programs'),
+        (Join-Path $env:PUBLIC 'Desktop')
+    )) {
+        if (-not [string]::IsNullOrWhiteSpace($root)) {
+            [void]$shortcutRoots.Add($root)
+        }
+    }
+
+    $profilesRoot = Join-Path $env:SystemDrive 'Users'
+    if (Test-Path -LiteralPath $profilesRoot -PathType Container) {
+        foreach ($profile in Get-ChildItem -LiteralPath $profilesRoot -Directory -Force -ErrorAction SilentlyContinue) {
+            [void]$shortcutRoots.Add((Join-Path $profile.FullName 'Desktop'))
+            [void]$shortcutRoots.Add((Join-Path $profile.FullName 'AppData\Roaming\Microsoft\Windows\Start Menu\Programs'))
+        }
+    }
+
+    $removedCount = 0
+    foreach ($root in $shortcutRoots | Select-Object -Unique) {
+        if (-not (Test-Path -LiteralPath $root -PathType Container)) { continue }
+
+        foreach ($shortcut in Get-ChildItem -LiteralPath $root -Recurse -Force -File -ErrorAction SilentlyContinue |
+            Where-Object { $_.Name -match '(?i)copilot' -and $_.Extension -in @('.lnk','.url') }) {
+            Remove-Item -LiteralPath $shortcut.FullName -Force -ErrorAction Stop
+            $removedCount++
+            Write-Log "Removed Copilot shortcut: $($shortcut.FullName)" 'OK'
+        }
+    }
+    Write-Log "Copilot shortcut cleanup completed. Removed=$removedCount" 'INFO'
+}
+
+function Disable-MicrosoftCopilot {
+    [CmdletBinding()]
+    param()
+
+    Write-Log 'Applying machine-wide policies that disable Microsoft Copilot...' 'INFO'
+    Set-RegistryDwordValue -Path 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsCopilot' -Name 'TurnOffWindowsCopilot' -Value 1
+    Set-RegistryDwordValue -Path 'HKLM:\SOFTWARE\Policies\Microsoft\Edge' -Name 'HubsSidebarEnabled' -Value 0
+    Set-RegistryDwordValue -Path 'HKLM:\SOFTWARE\Policies\Microsoft\Edge' -Name 'EdgeCopilotEnabled' -Value 0
+    Set-RegistryDwordValue -Path 'HKLM:\SOFTWARE\Policies\Microsoft\Edge' -Name 'CopilotPageContext' -Value 0
+    Set-RegistryDwordValue -Path 'HKLM:\SOFTWARE\Policies\Microsoft\Edge' -Name 'EdgeEntraCopilotPageContext' -Value 0
+    Set-RegistryDwordValue -Path 'HKLM:\SOFTWARE\Policies\Microsoft\Edge' -Name 'Microsoft365CopilotChatIconEnabled' -Value 0
+
+    $userPolicySubPath = 'Software\Policies\Microsoft\Windows\WindowsCopilot'
+    $loadedUserSids = @(
+        Get-ChildItem -Path Registry::HKEY_USERS -ErrorAction SilentlyContinue |
+            Where-Object { $_.PSChildName -match '^S-1-5-21-(?:\d+-){3}\d+$' } |
+            Select-Object -ExpandProperty PSChildName
+    )
+    foreach ($sid in $loadedUserSids) {
+        Set-RegistryDwordValue -Path "Registry::HKEY_USERS\$sid\$userPolicySubPath" -Name 'TurnOffWindowsCopilot' -Value 1
+    }
+
+    # Apply the same user policy to the default profile so new accounts inherit it.
+    $defaultHivePath = Join-Path $env:SystemDrive 'Users\Default\NTUSER.DAT'
+    $defaultHiveName = 'ComptonDefaultUserCopilot'
+    if (Test-Path -LiteralPath $defaultHivePath -PathType Leaf) {
+        $loadOutput = & reg.exe load "HKU\$defaultHiveName" $defaultHivePath 2>&1
+        if ($LASTEXITCODE -eq 0) {
+            try {
+                Set-RegistryDwordValue -Path "Registry::HKEY_USERS\$defaultHiveName\$userPolicySubPath" -Name 'TurnOffWindowsCopilot' -Value 1
+            }
+            finally {
+                [gc]::Collect()
+                [gc]::WaitForPendingFinalizers()
+                $unloadOutput = & reg.exe unload "HKU\$defaultHiveName" 2>&1
+                if ($LASTEXITCODE -ne 0) {
+                    Write-Log "Could not unload the default-user registry hive: $($unloadOutput -join ' ')" 'WARN'
+                }
+            }
+        }
+        else {
+            Write-Log "Could not load the default-user registry hive: $($loadOutput -join ' ')" 'WARN'
+        }
+    }
+
+    Remove-CopilotAppxPackages
+    Remove-CopilotShortcuts
+
+    # Refresh policy processing without making failure fatal.
+    try {
+        $gpOutput = & gpupdate.exe /target:computer /force 2>&1
+        if ($LASTEXITCODE -ne 0) {
+            Write-Log "Computer policy refresh returned exit code $LASTEXITCODE : $($gpOutput -join ' ')" 'WARN'
+        }
+    }
+    catch {
+        Write-Log "Computer policy refresh could not be started: $($_.Exception.Message)" 'WARN'
+    }
+
+    Write-Log 'Microsoft Copilot removal and local disablement completed.' 'OK'
+}
+
+# Canonical Copilot implementation. The module is loaded directly from the
+# central share so this works on computers that do not yet have C:\Scripts.
 function Disable-MicrosoftCopilot {
     [CmdletBinding()]
     param()
@@ -1569,7 +2086,7 @@ function Invoke-FinalReboot {
 
 try {
     Initialize-Log
-    Write-Log 'Starting Post-Deployment.ps1 version 2.3.0.' 'INFO'
+    Write-Log 'Starting Post-Deployment.ps1 version 2.4.0.' 'INFO'
 
     if (-not (Test-IsAdministrator)) {
         throw 'Please run this script as Administrator.'
@@ -1589,6 +2106,15 @@ try {
         Update-LocalMaintenanceScripts -SourcePath $ScriptsSourcePath -DestinationPath $LocalScriptsPath
     })
 
+    if ($InstallSharpPrinter) {
+        [void](Invoke-PostDeploymentSection -Name 'SHARP printer driver installation' -Operation {
+            Install-SharpPrinterDriver
+        })
+    }
+    else {
+        Write-Log 'SHARP printer driver installation was disabled by configuration.' 'WARN'
+    }
+
     if ($InstallPaperCut) {
         [void](Invoke-PostDeploymentSection -Name 'PaperCut Print Deploy installation' -Operation {
             Install-PaperCutPrintDeploy `
@@ -1598,6 +2124,15 @@ try {
     }
     else {
         Write-Log 'PaperCut Print Deploy installation was disabled by configuration.' 'WARN'
+    }
+
+    if ($ConnectStudentSecurePrint) {
+        [void](Invoke-PostDeploymentSection -Name 'StudentSecurePrint printer connection' -Operation {
+            Ensure-SharedPrinterConnection -ConnectionPath $PrinterSharePath | Out-Null
+        })
+    }
+    else {
+        Write-Log 'StudentSecurePrint printer connection was disabled by configuration.' 'WARN'
     }
 
     if ($InstallAction1) {

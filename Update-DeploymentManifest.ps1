@@ -1,7 +1,10 @@
+# Changes v2.4.3: color console status: unchanged green, changes yellow, errors red.
+# Previous: catalog the three reboot recovery runtime files.
 #requires -Version 5.1
 # ScriptName:    Update-DeploymentManifest.ps1
-# ScriptVersion: 2.3.1
-# LastUpdated:   2026-10-15
+# ScriptVersion: 2.4.3
+# Changes: Adds 15_Sunday_Update_Closeout.ps1 to the approved manifest catalog.
+# LastUpdated:   2026-11-02
 
 <#
 .SYNOPSIS
@@ -18,9 +21,11 @@
 
 .NOTES
     ScriptName:    Update-DeploymentManifest.ps1
-    ScriptVersion: 2.3.1
-    LastUpdated:   2026-10-15
-    Changes:       v2.3.1 adds Sunday closeout and preserves software policy/component-store helper entries.
+    ScriptVersion: 2.4.3
+    LastUpdated:   2026-11-02
+    Changes:       v2.4.3 adds colored console status without changing deployment behavior.
+    Previous:      v2.4.2 adds SoftwareInventory.Policy.json to the approved catalog
+                   so its version and hash are maintained with Script 14.
                    v2.3.0 adds Repair-MicrosoftEdgeUpdate.ps1 to the approved catalog.
                    v2.2.0 adds Maintenance.Copilot.psm1 to the approved catalog.
                    v2.1.0 removes former script 12 from the approved catalog,
@@ -45,7 +50,7 @@ param(
 Set-StrictMode -Version 2.0
 $ErrorActionPreference = 'Stop'
 
-$ScriptVersion = '2.3.1'
+$ScriptVersion = '2.4.3'
 
 # Keep this catalog synchronized with $ApprovedMaintenanceFiles in
 # 00_Update-Scripts-FromShare.ps1. Files absent from the manifest are added.
@@ -62,16 +67,19 @@ $ApprovedFileCatalog = @(
     [pscustomobject]@{ Name='09_Disable_Windows_Update_Services.ps1';                  Role='MaintenanceScript' },
     [pscustomobject]@{ Name='10_Sync_System_Time.ps1';                                 Role='MaintenanceScript' },
     [pscustomobject]@{ Name='14_Endpoint_Health_Inventory.ps1';                        Role='MaintenanceScript' },
-    [pscustomobject]@{ Name='15_Sunday_Update_Closeout.ps1';                          Role='MaintenanceScript' },
+    [pscustomobject]@{ Name='15_Sunday_Update_Closeout.ps1'; Role='MaintenanceScript' },
     [pscustomobject]@{ Name='16_Check_Deep_Freeze_Status.ps1';                         Role='MaintenanceScript' },
     [pscustomobject]@{ Name='Get-MaintenanceFleetStatus.ps1';                          Role='Utility' },
     [pscustomobject]@{ Name='Invoke-MaintenanceScript.ps1';                            Role='Launcher' },
     [pscustomobject]@{ Name='Maintenance.Copilot.psm1';                                Role='Framework' },
     [pscustomobject]@{ Name='Maintenance.Framework.psm1';                              Role='Framework' },
     [pscustomobject]@{ Name='Maintenance.Policy.json';                                Role='Policy' },
-    [pscustomobject]@{ Name='SoftwareInventory.Policy.json';                         Role='Policy' },
-    [pscustomobject]@{ Name='Repair-Windows-ComponentStore.ps1';                     Role='Remediation' },
+    [pscustomobject]@{ Name='SoftwareInventory.Policy.json';                          Role='Policy' },
+    [pscustomobject]@{ Name='Repair-Windows-ComponentStore.ps1'; Role='RepairHelper' },
     [pscustomobject]@{ Name='Repair-MicrosoftEdgeUpdate.ps1';                         Role='Remediation' },
+    [pscustomobject]@{ Name='Watch-RebootRecovery.ps1'; Role='RecoveryWatchdog' },
+    [pscustomobject]@{ Name='RepairScreen.psm1'; Role='RecoveryDisplay' },
+    [pscustomobject]@{ Name='Show-RecoveryNotice.ps1'; Role='RecoveryNotice' },
     [pscustomobject]@{ Name='Register-Tasks_SYSTEM.ps1';                              Role='TaskRegistration' }
 )
 
@@ -112,7 +120,14 @@ function Write-Status {
     )
 
     $timestamp = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
-    Write-Host ('[{0}] [{1,-6}] {2}' -f $timestamp, $Level, $Message)
+    $text = '[{0}] [{1,-6}] {2}' -f $timestamp, $Level, $Message
+    switch ($Level) {
+        'OK'     { Write-Host $text -ForegroundColor Green }
+        'CHANGE' { Write-Host $text -ForegroundColor Yellow }
+        'WARN'   { Write-Host $text -ForegroundColor Yellow }
+        'ERROR'  { Write-Host $text -ForegroundColor Red }
+        default  { Write-Host $text }
+    }
 }
 
 function Get-EmbeddedVersion {
@@ -223,7 +238,7 @@ function Write-ManifestSafely {
     $null = Get-Content -LiteralPath $temp -Raw | ConvertFrom-Json
 
     Move-Item -LiteralPath $temp -Destination $ManifestPath -Force
-    Write-Status -Level OK -Message "Updated manifest: $ManifestPath"
+    Write-Status -Level CHANGE -Message "Updated manifest: $ManifestPath"
 }
 
 $manifestPath = Join-Path $SourceRoot $ManifestName
@@ -269,14 +284,14 @@ foreach ($approvedFile in $ApprovedFileCatalog) {
 
     $sourcePath = Join-Path $SourceRoot $name
     if (-not (Test-Path -LiteralPath $sourcePath -PathType Leaf)) {
-        Write-Status -Level WARN -Message "Approved file is missing from the source share and cannot be added: $sourcePath"
+        Write-Status -Level ERROR -Message "Approved file is missing from the source share and cannot be added: $sourcePath"
         $warnings += "Missing approved file: $name"
         continue
     }
 
     $currentVersion = Get-EmbeddedVersion -Path $sourcePath
     if ([string]::IsNullOrWhiteSpace($currentVersion)) {
-        Write-Status -Level WARN -Message "Could not determine version for approved file $name. Entry was not added."
+        Write-Status -Level ERROR -Message "Could not determine version for approved file $name. Entry was not added."
         $warnings += "Version unreadable: $name"
         continue
     }
@@ -316,7 +331,7 @@ foreach ($replacement in $RetiredFileReplacements) {
     $replacementEntry = @($manifest.Files | Where-Object { [string]$_.Name -ieq $replacementName }) | Select-Object -First 1
 
     if (-not (Test-Path -LiteralPath $replacementSourcePath -PathType Leaf) -or $null -eq $replacementEntry) {
-        Write-Status -Level WARN -Message "Retired entry was retained because its replacement is not ready: $retiredName -> $replacementName"
+        Write-Status -Level ERROR -Message "Retired entry was retained because its replacement is not ready: $retiredName -> $replacementName"
         $warnings += "Replacement not ready: $replacementName"
         continue
     }
@@ -337,7 +352,7 @@ foreach ($entry in @($manifest.Files)) {
     $name = [string]$entry.Name
 
     if ([string]::IsNullOrWhiteSpace($name)) {
-        Write-Status -Level WARN -Message 'Skipping entry with no Name.'
+        Write-Status -Level ERROR -Message 'Skipping entry with no Name.'
         $warnings += 'Unnamed manifest entry'
         continue
     }
@@ -345,7 +360,7 @@ foreach ($entry in @($manifest.Files)) {
     $sourcePath = Join-Path $SourceRoot $name
 
     if (-not (Test-Path -LiteralPath $sourcePath -PathType Leaf)) {
-        Write-Status -Level WARN -Message "Missing referenced file: $sourcePath"
+        Write-Status -Level ERROR -Message "Missing referenced file: $sourcePath"
         $warnings += "Missing: $name"
         continue
     }
@@ -355,7 +370,7 @@ foreach ($entry in @($manifest.Files)) {
     $manifestHash = [string](Get-ObjectPropertyValue -InputObject $entry -Name 'SHA256')
 
     if ([string]::IsNullOrWhiteSpace($currentVersion)) {
-        Write-Status -Level WARN -Message "Could not determine version for $name. Entry left unchanged."
+        Write-Status -Level ERROR -Message "Could not determine version for $name. Entry left unchanged."
         $warnings += "Version unreadable: $name"
         continue
     }
@@ -363,12 +378,17 @@ foreach ($entry in @($manifest.Files)) {
     $sha256 = (Get-FileHash -LiteralPath $sourcePath -Algorithm SHA256).Hash.ToUpperInvariant()
 
     if ($currentVersion -eq $manifestVersion -and $sha256 -eq $manifestHash) {
-        Write-Status -Level OK -Message "$name is current. Version=$currentVersion; SHA256 verified."
+        if (@($changes | Where-Object { $_.Name -ieq $name -and $_.ChangeType -eq 'Added' }).Count -gt 0) {
+            Write-Status -Level CHANGE -Message "$name added entry verified. Version=$currentVersion; SHA256 verified."
+        }
+        else {
+            Write-Status -Level OK -Message "$name is current. Version=$currentVersion; SHA256 verified."
+        }
         continue
     }
 
     Write-Status -Level CHANGE -Message "$name requires a manifest update. Version: $manifestVersion -> $currentVersion"
-    Write-Status -Message "SHA256: $sha256"
+    Write-Status -Level CHANGE -Message "SHA256: $sha256"
 
     Set-ObjectProperty -InputObject $entry -Name 'Version' -Value $currentVersion
     Set-ObjectProperty -InputObject $entry -Name 'SHA256' -Value $sha256

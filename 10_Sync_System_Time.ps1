@@ -1,5 +1,6 @@
+# TechConsoleForcePatch: 1.0.0
 #requires -Version 5.1
-# ScriptVersion: 2.0.11
+# ScriptVersion: 2.0.12
 <#
 .SYNOPSIS
     Configures and verifies Windows Time synchronization.
@@ -55,13 +56,15 @@ param(
     [double]$ClockOffsetAlertThresholdMilliseconds = 5000,
 
     [string]$LogDirectory = 'C:\Logs'
+,
+    [switch]$Force
 )
 
 Set-StrictMode -Version 2.0
 $ErrorActionPreference = 'Stop'
 
 $script:ScriptName = '10_Sync_System_Time.ps1'
-$script:ScriptVersion = '2.0.11'
+$script:ScriptVersion = '2.0.12'
 $script:RunId = [guid]::NewGuid().Guid
 $script:StartTime = Get-Date
 $script:Warnings = @()

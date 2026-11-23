@@ -1,15 +1,23 @@
+# TechConsoleForcePatch: 1.0.0
 #requires -Version 5.1
 #requires -RunAsAdministrator
 # ScriptName:    04_Sunday_Lab_Application_Maintenance.ps1
-# ScriptVersion: 1.19.15
-# Changes: v1.19.15 repairs Event Log registry limits even when EventLog RPC is unavailable.
+# ScriptVersion: 1.19.25
+# Changes: v1.19.25 verifies classic registry writes immediately and reports delayed channel readback per log.
+# Previous: v1.19.24 triples the four retained Event Log minimum sizes.
+# Previous: v1.19.23 replaces the blocking student OneDrive Active Setup with account-specific logon tasks and helper v1.1.0.
+# Previous: v1.19.22 configures WinRM for the Tech Console on domain workstations.
+# Previous: v1.19.21 removes and verifies absence of ForceAutoLogon; preserves other autologon settings.
+# Previous: v1.19.20 adds SSB-130* to CC-Student Chrome Incognito startup targets.
+# Previous: v1.19.19 targets Elastic Agent installation by compton.edu domain membership instead of hostname prefixes.
+# Previous: v1.19.15 repairs Event Log registry limits even when EventLog RPC is unavailable.
 # Previous: v1.19.14 leaves MISAdmin startup profile untouched and removes MISAdmin logon suppression.
 # Previous: v1.19.13 excludes MISAdmin from OneDrive startup and contains unexpected section errors.
 # Previous: v1.19.12 improves OneDrive silent setup and contains startup hive-unload failures.
 # Previous: v1.19.11 disables OneDrive startup for CC-Student, including newly created profiles.
 # Previous: v1.19.10 keeps PaperCut Print Deploy UI startup enabled for all user profiles.
 # Previous: v1.19.9 adds LIB-128-CAT* / CC-Student Edge library kiosk logon launcher and startup approval.
-# LastUpdated:   2026-11-01
+# LastUpdated:   2026-11-23
 # Changes:       v1.19.8 synchronizes Event Log MaxSize while thawed for Deep Freeze resizing.
 # Previous:      v1.19.7 enables OneDrive login startup and Windows-credential sign-in.
 # Previous:      v1.19.6 repairs PaperCut initialise.bat startup approvals for all profiles.
@@ -170,6 +178,8 @@
 param(
     # Reinstall Elastic Agent even if an existing installation is healthy.
     [switch]$ForceElasticAgentReinstall
+,
+    [switch]$Force
 )
 
 Set-StrictMode -Version 2.0
@@ -181,8 +191,8 @@ $ErrorActionPreference = 'Stop'
 # Use PowerShell wildcard patterns for Chrome Incognito, Honorlock, and Stellarium.
 # Examples: 'SSB-122-*', 'SSC-216*', or '*' for every computer.
 #
-# Elastic Agent uses computer-name PREFIXES, not wildcard patterns.
-# Example: 'IB1-103' matches IB1-103-01, IB1-103-02, and so on.
+# Elastic Agent requires membership in the configured Active Directory domain.
+# Hostname prefixes do not restrict Elastic Agent installation.
 #
 # Add or remove quoted entries in the appropriate list. Keep the @(...)
 # structure and separate entries with commas.
@@ -191,20 +201,13 @@ $ErrorActionPreference = 'Stop'
 [string[]]$ChromeIncognitoComputerPatterns = @(
     'SSB-122-*',
     'SSB-114*',
-    'SSB-171*'
+    'SSB-171*',
+    'SSB-130*'
 )
 
 # --- Elastic Agent installation targets (former script 15) -----------------
-# Does not require the * in the prefix to include all the computers in the lab
-[string[]]$ElasticAgentComputerPrefixes = @(
-    'IB1',
-    'IB2',
-    'SSC',
-    'AHB',
-	'SSB',
-	'MS',
-	'VT'
-)
+# Requires actual Active Directory domain membership, regardless of hostname.
+[string]$ElasticAgentRequiredDomain = 'compton.edu'
 
 # --- Honorlock Chrome extension targets (former script 18) -----------------
 # Add one wildcard/prefix per lab that requires Honorlock. The same list is
@@ -246,7 +249,8 @@ $ErrorActionPreference = 'Stop'
     'OneDrive.exe',
     'student.exe',
     'teacher.exe',
-    'RtkAudUService64.exe'
+    'RtkAudUService64.exe',
+    'edvrclient.exe'
 )
 
 # ============================================================================
@@ -279,7 +283,7 @@ $ErrorActionPreference = 'Stop'
 [string]$Office2024ConfigurationFile = 'office2024config.xml'
 [string]$LogDirectory = 'C:\Logs'
 [string]$RunnerScriptName = '04_Sunday_Lab_Application_Maintenance.ps1'
-[string]$RunnerVersion = '1.19.15'
+[string]$RunnerVersion = '1.19.25'
 [string]$CopilotModuleLocalPath = 'C:\Scripts\Maintenance.Copilot.psm1'
 [string]$CopilotModuleSharePath = '\\SERVER\DeploymentShare\Maintenance.Copilot.psm1'
 [string]$RunnerLogPath = Join-Path $LogDirectory '04_Sunday_Lab_Application_Maintenance.log'
@@ -2434,16 +2438,16 @@ exit $finalExitCode
         Source = @'
 #requires -Version 5.1
 #requires -RunAsAdministrator
-# ScriptVersion: 2.1.5
+# ScriptVersion: 2.1.6
 
 <#
 .SYNOPSIS
-    Installs and enrolls Elastic Agent only on approved lab computers using
+    Installs and enrolls Elastic Agent only on approved domain members using
     the configured Fleet Server and enrollment token.
 
 .DESCRIPTION
-    - Uses a configurable computer-name prefix allowlist.
-    - Defaults to the IB1-103 lab prefix.
+    - Requires actual Active Directory domain membership.
+    - Defaults to the compton.edu domain, regardless of hostname.
     - Installs Elastic Agent from the internal ZIP package, with automatic official Elastic Internet fallback.
     - Uses the current Fleet Server URL and enrollment token from Install.ps1.
     - Performs a fully unattended Fleet installation with no Y/N prompt.
@@ -2452,9 +2456,10 @@ exit $finalExitCode
 
 .NOTES
     Script:  15_Install_Elastic_Agent.ps1
-    Version: 2.1.5
-    LastUpdated: 2026-08-19
-    Changes: v2.1.5 adds structured, mapping-safe Elastic Agent deployment telemetry,
+    Version: 2.1.6
+    LastUpdated: 2026-11-10
+    Changes: v2.1.6 requires domain membership instead of hostname prefixes.
+             v2.1.5 adds structured, mapping-safe Elastic Agent deployment telemetry,
              explicit result/failure-stage reporting, package-source/hash/enrollment state,
              existing/final agent health snapshots, and enrollment-token redaction.
              v2.1.4 uses Maintenance.Framework v2.4 staged text logging.
@@ -2465,14 +2470,12 @@ exit $finalExitCode
 param(
     [switch]$ForceReinstall,
 
-    [string[]]$AllowedComputerPrefixes = @(
-        'IB1-103'
-    )
+    [ValidateNotNullOrEmpty()][string]$RequiredDomain = 'compton.edu'
 )
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
-$ScriptVersion = '2.1.5'
+$ScriptVersion = '2.1.6'
 
 # ============================================================================
 # CONFIGURATION
@@ -2492,7 +2495,7 @@ $ScriptVersion = '2.1.5'
 
 # Preferred and fallback ZIP locations.
 [string]$PreferredInstallerPath = "\\SERVER\DeploymentShare\ElasticAgent\elastic-agent-$ElasticAgentVersion-windows-x86_64.zip"
-[string]$FallbackInstallerPath = "\\10.2.3.30\Labscripts\ElasticAgent\elastic-agent-$ElasticAgentVersion-windows-x86_64.zip"
+[string]$FallbackInstallerPath = "\\FALLBACK-SERVER\DeploymentShare\ElasticAgent\elastic-agent-$ElasticAgentVersion-windows-x86_64.zip"
 
 # Official Elastic download fallback. Used automatically when both internal shares are unavailable.
 [string]$DownloadUri = "https://artifacts.elastic.co/downloads/beats/elastic-agent/elastic-agent-$ElasticAgentVersion-windows-x86_64.zip"
@@ -2520,7 +2523,9 @@ $script:ErrorCount   = 0
 $script:CurrentStage = 'Initialization'
 $script:FailureStage = $null
 $script:FailureMessage = $null
-$script:MatchedPrefix = $null
+$script:DomainApproved = $false
+$script:ComputerPartOfDomain = $null
+$script:ComputerDomain = $null
 $script:ExistingHealth = $null
 $script:FinalHealth = $null
 $script:PackageSource = $null
@@ -2697,9 +2702,11 @@ function Write-ElasticAgentTelemetry {
         TextLogPath    = $PublishedLogPath
 
         Targeting = [ordered]@{
-            Approved        = ($null -ne $script:MatchedPrefix)
-            MatchedPrefix   = $script:MatchedPrefix
-            AllowedPrefixes = New-StringArrayForJson -InputObject $AllowedComputerPrefixes
+            Approved        = [bool]$script:DomainApproved
+            PartOfDomain    = $script:ComputerPartOfDomain
+            ComputerDomain  = $script:ComputerDomain
+            RequiredDomain  = $RequiredDomain
+            Method          = 'ActiveDirectoryDomainMembership'
         }
 
         ExistingAgent = Convert-AgentHealthForTelemetry -Health $script:ExistingHealth
@@ -2756,15 +2763,15 @@ function Test-ApprovedComputer {
     [CmdletBinding()]
     param()
 
-    foreach ($prefix in $AllowedComputerPrefixes) {
-        if (-not [string]::IsNullOrWhiteSpace($prefix) -and
-            $env:COMPUTERNAME.StartsWith($prefix, [System.StringComparison]::OrdinalIgnoreCase)) {
-            $script:MatchedPrefix = [string]$prefix
-            return $true
-        }
-    }
-
-    return $false
+    # Query machine membership, not the current user's domain or DNS suffix.
+    # A query failure throws and is reported by the existing failure handler.
+    $computer = Get-CimInstance -ClassName Win32_ComputerSystem -ErrorAction Stop
+    if ($null -eq $computer) { throw 'Unable to determine computer domain membership.' }
+    $script:ComputerPartOfDomain = [bool]$computer.PartOfDomain
+    $script:ComputerDomain = [string]$computer.Domain
+    $script:DomainApproved = $script:ComputerPartOfDomain -and
+        [string]::Equals($script:ComputerDomain, $RequiredDomain, [System.StringComparison]::OrdinalIgnoreCase)
+    return [bool]$script:DomainApproved
 }
 
 function Test-IsAdministrator {
@@ -3036,14 +3043,14 @@ try {
 
     $script:CurrentStage = 'Targeting'
     if (-not (Test-ApprovedComputer)) {
-        Write-Log -Message "Computer is not in an approved lab prefix. Allowed prefixes: $($AllowedComputerPrefixes -join ', '). No changes were made."
+        Write-Log -Message "Computer is not joined to the required domain. RequiredDomain=$RequiredDomain; PartOfDomain=$script:ComputerPartOfDomain; ComputerDomain=$script:ComputerDomain. No changes were made."
         $script:OverallResult = 'NotTargeted'
         $script:FinalHealth = Get-ElasticAgentHealth
         $exitCode = 0
         return
     }
 
-    Write-Log -Message "Computer matched the approved Elastic Agent pilot prefix list."
+    Write-Log -Message "Computer is joined to the approved Elastic Agent domain: $script:ComputerDomain."
 
     $script:CurrentStage = 'ExistingAgentCheck'
     $installed = Get-InstalledElasticAgent
@@ -4647,12 +4654,12 @@ function New-SectionBootstrap {
         'ElasticAgent' {
             return @'
 $settings = $env:COMPTON_SECTION_SETTINGS | ConvertFrom-Json
-[string[]]$prefixes = @($settings.Prefixes | ForEach-Object { [string]$_ })
+[string]$requiredDomain = $settings.RequiredDomain
 if ([bool]$settings.ForceReinstall) {
-    & $env:COMPTON_SECTION_SCRIPT -AllowedComputerPrefixes $prefixes -ForceReinstall
+    & $env:COMPTON_SECTION_SCRIPT -RequiredDomain $requiredDomain -ForceReinstall
 }
 else {
-    & $env:COMPTON_SECTION_SCRIPT -AllowedComputerPrefixes $prefixes
+    & $env:COMPTON_SECTION_SCRIPT -RequiredDomain $requiredDomain
 }
 '@
         }
@@ -6095,6 +6102,81 @@ catch {
     }
 }
 
+function Invoke-TechConsoleWinRMSection {
+    $ErrorActionPreference = 'Stop'
+    $adminNetworks = @('10.2.0.0/16', '10.3.0.0/16')
+    $computer = Get-CimInstance Win32_ComputerSystem
+    $status = 'Skipped'
+    if ($computer.PartOfDomain -and $computer.Domain -eq 'compton.edu' -and
+        (Get-CimInstance Win32_OperatingSystem).ProductType -eq 1) {
+        $ruleName = 'Compton-TechConsole-WinRM'
+        $ruleSettings = @{
+            Profile='Domain'; Direction='Inbound'; Action='Allow'; Enabled='True'
+            Protocol='TCP'; LocalPort=5985; RemoteAddress=$adminNetworks; Service='WinRM'
+        }
+        if (Get-NetFirewallRule -PolicyStore PersistentStore -Name $ruleName -ErrorAction SilentlyContinue) {
+            Set-NetFirewallRule -PolicyStore PersistentStore -Name $ruleName @ruleSettings | Out-Null
+        } else {
+            New-NetFirewallRule -PolicyStore PersistentStore -Name $ruleName -DisplayName 'Compton Tech Console WinRM' @ruleSettings | Out-Null
+        }
+        Set-Service WinRM -StartupType Automatic
+        Start-Service WinRM
+        $listeners = @(Get-ChildItem WSMan:\localhost\Listener)
+        if (-not ($listeners | Where-Object { $_.Keys -contains 'Transport=HTTP' })) {
+            New-Item -Path WSMan:\localhost\Listener -Transport HTTP -Address '*' -Force | Out-Null
+        }
+        Test-WSMan -ComputerName localhost -Port 5985 | Out-Null
+        $endpoint = Get-Item WSMan:\localhost\Plugin\Microsoft.PowerShell\Enabled
+        if ($endpoint.Value -ne 'true') {
+            Enable-PSSessionConfiguration -Name Microsoft.PowerShell -Force -ErrorAction Stop | Out-Null
+        }
+        $config = Get-PSSessionConfiguration -Name Microsoft.PowerShell
+        $descriptor = [System.Security.AccessControl.CommonSecurityDescriptor]::new($false, $false, $config.SecurityDescriptorSddl)
+        $admins = [System.Security.Principal.SecurityIdentifier]'S-1-5-32-544'
+        $grant = @($descriptor.DiscretionaryAcl | Where-Object {
+            $_.SecurityIdentifier -eq $admins -and $_.AceType -eq 'AccessAllowed' -and
+            ($_.AccessMask -band 0x30000000)
+        })
+        if (-not $grant.Count) {
+            $descriptor.DiscretionaryAcl.AddAccess('Allow', $admins, 0x20000000, 'None', 'None')
+            Set-PSSessionConfiguration -Name Microsoft.PowerShell -SecurityDescriptorSddl ($descriptor.GetSddlForm('All')) -Force | Out-Null
+        }
+        $status = 'Success'
+        Write-RunnerLog -Message "Verified local WinRM on 5985. Configured Domain firewall rule for $($adminNetworks -join ', ')." -Level 'SUCCESS'
+    }
+    return [pscustomobject]@{
+        SectionId='TechConsoleWinRM'; DisplayName='Tech Console WinRM'; ExitCode=0
+        Success=$true; Status=$status; RebootRequired=$false
+    }
+}
+
+function Invoke-ForceAutoLogonRemovalSection {
+    [CmdletBinding()]
+    param()
+
+    $timer = [Diagnostics.Stopwatch]::StartNew()
+    $path = 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon'
+    # Remove only ForceAutoLogon; retain automatic startup login and its credentials.
+    $key = Get-Item -LiteralPath $path -ErrorAction Stop
+    if (@($key.GetValueNames()) -contains 'ForceAutoLogon') {
+        Remove-ItemProperty -LiteralPath $path -Name 'ForceAutoLogon' -ErrorAction Stop
+        Write-RunnerLog -Message 'Removed ForceAutoLogon from Winlogon.' -Level 'SUCCESS'
+    }
+    else {
+        Write-RunnerLog -Message 'ForceAutoLogon is already absent.' -Level 'INFO'
+    }
+    $key = Get-Item -LiteralPath $path -ErrorAction Stop
+    if (@($key.GetValueNames()) -contains 'ForceAutoLogon') {
+        throw 'ForceAutoLogon is still present after removal.'
+    }
+    $timer.Stop()
+    return [pscustomobject]@{
+        SectionId='ForceAutoLogonRemoval'; DisplayName='Remove forced automatic logon'
+        ExitCode=0; Success=$true; Status='Success'; RebootRequired=$false
+        DurationSeconds=[math]::Round($timer.Elapsed.TotalSeconds, 2)
+    }
+}
+
 function Invoke-ChromeIncognitoStartupSection {
     [CmdletBinding()]
     param([string[]]$Patterns)
@@ -6365,8 +6447,6 @@ function Disable-StudentOneDriveStartupForHive {
 }
 
 function Install-StudentOneDriveLogonPolicy {
-    # Active Setup runs before Explorer processes Run entries, including first sign-in.
-    # It runs without elevation and applies only to CC-Student; MISAdmin is untouched.
     $folder = Join-Path $env:ProgramData 'Compton\StudentStartup'
     New-Item -Path $folder -ItemType Directory -Force -ErrorAction Stop | Out-Null
     $acl = New-Object Security.AccessControl.DirectorySecurity
@@ -6382,28 +6462,92 @@ function Install-StudentOneDriveLogonPolicy {
     $code = @'
 #requires -Version 5.1
 # ScriptName: Set-StudentOneDriveStartup.ps1
-# ScriptVersion: 1.0.2
+# ScriptVersion: 1.1.0
+# Version history
+# 1.1.0 - 2026-11-18
+#   Check existing OneDrive startup settings and write only when needed.
+#   Add -Account for elevated maintenance of an existing CC-Student profile,
+#   including when the student is signed out. Skip absent profiles.
+#   Without -Account, continue to exit immediately for other users.
+# 1.0.2
+#   Disable OneDrive automatic startup for the signed-in CC-Student account
+#   through its OneDrive policy, Run entries, and StartupApproved settings.
+[CmdletBinding()]
+param(
+    # Optional elevated maintenance mode, e.g. COMPTON\CC-Student
+    [string]$Account
+)
 $ErrorActionPreference = 'Stop'
-if (([Security.Principal.WindowsIdentity]::GetCurrent().Name -split '\\')[-1] -ine 'CC-Student') { exit 0 }
-$policy = 'HKCU:\Software\Policies\Microsoft\OneDrive'
-New-Item -Path $policy -Force | Out-Null
-New-ItemProperty -LiteralPath $policy -Name EnableAutoStart -PropertyType DWord -Value 0 -Force | Out-Null
-foreach ($run in @('HKCU:\Software\Microsoft\Windows\CurrentVersion\Run','HKCU:\Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Run')) {
-    if (-not (Test-Path -LiteralPath $run)) { continue }
-    $key = Get-Item -LiteralPath $run
-    foreach ($name in @($key.GetValueNames())) {
-        if ($name -like '*OneDrive*' -or [string]$key.GetValue($name) -match '(?i)OneDrive\.exe') {
-            Remove-ItemProperty -LiteralPath $run -Name $name
+$identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+$users = [Microsoft.Win32.Registry]::Users
+$mount = $null
+if (!$Account) {
+    if (($identity.Name -split '\\')[-1] -ine 'CC-Student') { return }
+    $root = [Microsoft.Win32.Registry]::CurrentUser
+    $prefix = ''
+} else {
+    if ($Account -notmatch '^[^\\]+\\CC-Student$') { throw 'Specify DOMAIN\CC-Student or COMPUTER\CC-Student.' }
+    $sid = ([Security.Principal.NTAccount]$Account).Translate([Security.Principal.SecurityIdentifier]).Value
+    $profileKey = "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList\$sid"
+    if (!(Test-Path -LiteralPath $profileKey)) { return }
+    $root = $users
+    $prefix = "$sid\"
+}
+
+function Set-StudentStartupValue($Path, $Name, $Value, $Kind) {
+    $key = $root.OpenSubKey($prefix + $Path)
+    try {
+        if ($key -and $key.GetValueNames() -contains $Name -and $key.GetValueKind($Name) -eq $Kind) {
+            $old = $key.GetValue($Name)
+            if ($Kind -eq 'DWord' -and $old -eq 0) { return }
+            if ($Kind -eq 'Binary' -and $old.Length -eq 12 -and [BitConverter]::ToUInt32($old, 0) -eq 3) { return }
+        }
+    } finally { if ($key) { $key.Dispose() } }
+    $key = $root.CreateSubKey($prefix + $Path)
+    try { $key.SetValue($Name, $Value, $Kind) } finally { $key.Dispose() }
+}
+
+try {
+    if ($Account -and !(Test-Path -LiteralPath "Registry::HKEY_USERS\$sid")) {
+        $dir = (Get-ItemProperty -LiteralPath $profileKey -Name ProfileImagePath).ProfileImagePath
+        $hive = Join-Path ([Environment]::ExpandEnvironmentVariables($dir)) 'NTUSER.DAT'
+        if (!(Test-Path -LiteralPath $hive -PathType Leaf)) { return }
+        $temporary = 'ComptonStudent_' + [guid]::NewGuid().ToString('N')
+        & reg.exe load "HKU\$temporary" $hive | Out-Null
+        if ($LASTEXITCODE -ne 0) { throw "Could not load the profile hive for $Account." }
+        $mount = $temporary
+        $prefix = "$mount\"
+    }
+    Set-StudentStartupValue 'Software\Policies\Microsoft\OneDrive' 'EnableAutoStart' 0 DWord
+    foreach ($base in 'Software\Microsoft','Software\WOW6432Node\Microsoft') {
+        $path = "$prefix$base\Windows\CurrentVersion\Run"
+        $key = $root.OpenSubKey($path)
+        if (!$key) { continue }
+        try {
+            $remove = @($key.GetValueNames() | Where-Object {
+                $_ -like '*OneDrive*' -or [string]$key.GetValue($_) -match 'OneDrive\.exe'
+            })
+        } finally { $key.Dispose() }
+        if ($remove.Count) {
+            $key = $root.OpenSubKey($path, $true)
+            try { foreach ($name in $remove) { $key.DeleteValue($name, $false) } } finally { $key.Dispose() }
         }
     }
-}
-foreach ($category in @('Run','Run32','StartupFolder','StartupTask')) {
-    $approval = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\$category"
-    $names = @('OneDrive')
-    if (Test-Path -LiteralPath $approval) { $names += @((Get-Item -LiteralPath $approval).GetValueNames() | Where-Object {$_ -like '*OneDrive*'}) }
-    New-Item -Path $approval -Force | Out-Null
-    foreach ($name in @($names | Select-Object -Unique)) {
-        New-ItemProperty -LiteralPath $approval -Name $name -PropertyType Binary -Value ([byte[]](3,0,0,0,0,0,0,0,0,0,0,0)) -Force | Out-Null
+    $disabled = [byte[]](3,0,0,0,0,0,0,0,0,0,0,0)
+    foreach ($category in 'Run','Run32','StartupFolder','StartupTask') {
+        $path = "Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\$category"
+        $names = @('OneDrive')
+        $key = $root.OpenSubKey($prefix + $path)
+        if ($key) {
+            try { $names += @($key.GetValueNames() | Where-Object { $_ -like '*OneDrive*' -and $_ -ne 'OneDrive' }) }
+            finally { $key.Dispose() }
+        }
+        foreach ($name in $names) { Set-StudentStartupValue $path $name $disabled Binary }
+    }
+} finally {
+    if ($mount) {
+        & reg.exe unload "HKU\$mount" | Out-Null
+        if ($LASTEXITCODE -ne 0) { throw "Could not unload HKU\$mount." }
     }
 }
 '@
@@ -6412,13 +6556,26 @@ foreach ($category in @('Run','Run32','StartupFolder','StartupTask')) {
     if ($errors.Count -gt 0) {throw 'Student OneDrive logon helper has parser errors.'}
     [IO.File]::WriteAllText($path,$code,(New-Object Text.UTF8Encoding($true)))
     $component = 'HKLM:\SOFTWARE\Microsoft\Active Setup\Installed Components\{2D9F5842-281D-4BCF-9AEC-9A4624CA7341}'
-    New-Item -Path $component -Force -ErrorAction Stop | Out-Null
+    # A user-specific interactive task also covers a freshly created student profile.
+    $computer = Get-CimInstance Win32_ComputerSystem -ErrorAction Stop
+    $accounts = @()
+    if ($computer.PartOfDomain) { $accounts += "$($computer.Domain)\CC-Student" }
+    $local = Get-LocalUser -Name 'CC-Student' -ErrorAction SilentlyContinue
+    if ($local) { $accounts += "$env:COMPUTERNAME\CC-Student" }
+
     $ps = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
-    $command = '"'+$ps+'" -NoLogo -NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File "'+$path+'"'
-    New-ItemProperty -LiteralPath $component -Name StubPath -PropertyType String -Value $command -Force -ErrorAction Stop | Out-Null
-    New-ItemProperty -LiteralPath $component -Name Version -PropertyType String -Value '1,0,2,0' -Force -ErrorAction Stop | Out-Null
-    New-ItemProperty -LiteralPath $component -Name IsInstalled -PropertyType DWord -Value 1 -Force -ErrorAction Stop | Out-Null
-    Write-RunnerLog -Message 'Registered CC-Student OneDrive startup suppression; MISAdmin is excluded from changes.'
+    $action = New-ScheduledTaskAction -Execute $ps -Argument ('-NoLogo -NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File "' + $path + '"')
+    foreach ($account in $accounts) {
+        $sid = ([Security.Principal.NTAccount]$account).Translate([Security.Principal.SecurityIdentifier]).Value
+        $trigger = New-ScheduledTaskTrigger -AtLogOn -User $sid
+        $principal = New-ScheduledTaskPrincipal -UserId $sid -LogonType Interactive -RunLevel Limited
+        $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
+        Register-ScheduledTask -TaskName "Compton. Student OneDrive Startup ($sid)" -Action $action -Trigger $trigger -Principal $principal -Settings $settings -Force -ErrorAction Stop | Out-Null
+    }
+    if (Test-Path -LiteralPath $component) {
+        Remove-Item -LiteralPath $component -Recurse -Force -ErrorAction Stop
+    }
+    Write-RunnerLog -Message "Retired student OneDrive Active Setup. Installed helper v1.1.0 and configured student logon task(s) for: $($accounts -join ', ')."
 }
 
 function Invoke-StartupHiveUnload {
@@ -7043,7 +7200,7 @@ function Invoke-EventLogCapacitySection {
         elseif ($freeze -eq 'Frozen') {$status='SkippedFrozen'}
         elseif ($freeze -ne 'Thawed') {throw "Event Log capacity changes blocked: Deep Freeze state is unknown. $($runtime.Detail)"}
         else {
-            $minimums=[ordered]@{System=32MB;Application=32MB;Security=192MB;HardwareEvents=20MB}
+            $minimums=[ordered]@{System=96MB;Application=96MB;Security=576MB;HardwareEvents=60MB}
             # Read the entire plan before changing anything. Preserve larger limits.
             foreach ($name in $minimums.Keys) {
                 $effective=$null; $file=$null; $apiAvailable=$false; $apiFailure=$null
@@ -7120,7 +7277,10 @@ function Invoke-EventLogCapacitySection {
                         $config=New-Object System.Diagnostics.Eventing.Reader.EventLogConfiguration -ArgumentList $row.Log
                         try {$row.EffectiveAfterBytes=[long]$config.MaximumSizeInBytes}
                         finally {$config.Dispose()}
-                        if ($row.EffectiveAfterBytes -ne $row.TargetBytes) {throw "Event Log effective size verification failed for $($row.Log). Policy may be overriding the limit."}
+                        if ($row.EffectiveAfterBytes -ne $row.TargetBytes) {
+                            $row.EffectiveVerificationDeferred=$true
+                            Write-RunnerLog -Message ("{0}: registry verified at {1} bytes; channel reports {2}. Verify after a thawed restart and check policy if the mismatch persists." -f $row.Log,$row.RegistryAfterBytes,$row.EffectiveAfterBytes) -Level 'WARNING'
+                        }
                     }
                 }
                 $status='ConfiguredPendingThawedRestart'
@@ -7486,13 +7646,15 @@ try {
     }
 
     $sectionPlan = @(
+        [pscustomobject]@{ Id='TechConsoleWinRM'; Name='Tech Console WinRM'; Enabled=$true; Settings=[ordered]@{} }
+        [pscustomobject]@{ Id='ForceAutoLogonRemoval'; Name='Remove forced automatic logon'; Enabled=$true; Settings=[ordered]@{} }
         [pscustomobject]@{ Id='EventLogCapacity'; Name='Deep Freeze retained Event Log capacity configuration'; Enabled=$true; Settings=[ordered]@{} }
         [pscustomobject]@{ Id='RemoteAccessDisable'; Name='Disable lab RemoteAccess and IPv4 routing'; Enabled=$RunRemoteAccessDisable; Settings=[ordered]@{} }
         [pscustomobject]@{ Id='SystemRestore'; Name='System Restore and verified restore point'; Enabled=$RunSystemRestore; Settings=[ordered]@{} }
         [pscustomobject]@{ Id='PrinterAndPaperCut'; Name='SHARP driver, PaperCut, and printer'; Enabled=$RunPrinterAndPaperCut; Settings=[ordered]@{} }
         [pscustomobject]@{ Id='Office2024Maintenance'; Name='Office LTSC detection, Office 2024 migration, and activation'; Enabled=$RunOffice2024Maintenance; Settings=[ordered]@{} }
         [pscustomobject]@{ Id='ChromeIncognito'; Name='CC-Student Chrome Incognito startup'; Enabled=$RunChromeIncognito; Settings=[ordered]@{ Patterns=@($ChromeIncognitoComputerPatterns) } }
-        [pscustomobject]@{ Id='ElasticAgent'; Name='Elastic Agent installation'; Enabled=$RunElasticAgent; Settings=[ordered]@{ Prefixes=@($ElasticAgentComputerPrefixes); ForceReinstall=[bool]$ForceElasticAgentReinstall } }
+        [pscustomobject]@{ Id='ElasticAgent'; Name='Elastic Agent installation'; Enabled=$RunElasticAgent; Settings=[ordered]@{ RequiredDomain=$ElasticAgentRequiredDomain; ForceReinstall=[bool]$ForceElasticAgentReinstall } }
         [pscustomobject]@{ Id='BrowserHomepage'; Name='Browser homepage policies'; Enabled=$RunBrowserHomepage; Settings=[ordered]@{ HomepageUrl=$HomepageUrl } }
         [pscustomobject]@{ Id='AdobeReaderPolicy'; Name='Adobe Reader local-only lab policy'; Enabled=$RunAdobeReaderPolicy; Settings=[ordered]@{} }
         [pscustomobject]@{ Id='Honorlock'; Name='Honorlock Chrome extension'; Enabled=$RunHonorlock; Settings=[ordered]@{ Patterns=@($HonorlockComputerPatterns) } }
@@ -7518,6 +7680,15 @@ try {
         }
 
         try {
+        if ($section.Id -eq 'TechConsoleWinRM') {
+            [void]$results.Add((Invoke-TechConsoleWinRMSection))
+            continue
+        }
+        if ($section.Id -eq 'ForceAutoLogonRemoval') {
+            [void]$results.Add((Invoke-ForceAutoLogonRemovalSection))
+            continue
+        }
+
         if ($section.Id -eq 'EventLogCapacity') {
             [void]$results.Add((Invoke-EventLogCapacitySection))
             continue

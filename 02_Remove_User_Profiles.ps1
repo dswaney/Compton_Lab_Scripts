@@ -1,9 +1,11 @@
-﻿# =====================================================================
+﻿# TechConsoleForcePatch: 1.0.0
+# =====================================================================
 # ScriptName: 02_Remove_User_Profiles.ps1
-# ScriptVersion: 2.5.24
-# LastUpdated: 2026-10-27
-# Changes: v2.5.23 skips all profile deletion on hostnames beginning with
-#          CP, CCDP, or PD (case-insensitive); other preferences still apply.
+# ScriptVersion: 2.5.26
+# LastUpdated: 2026-11-04
+# Changes: v2.5.26 adds CCPD to the protected hostname prefixes.
+#          CP, CCPD, CCDP, and PD skip all profile deletion (case-insensitive);
+#          other preferences still apply.
 #          v2.5.1 removes only ForceAutoLogon for enabled CC-Students autologon.
 #          All other Winlogon/autologon values remain unchanged.
 #          v2.5.0 removes Copilot removal/policies and Edge InPrivate startup
@@ -54,6 +56,8 @@ param(
     [int]$ProfileFolderJobTimeoutMinutes = 15,
 
     [string]$ProfileCleanupStatePath = 'C:\ProgramData\Compton\ProfileCleanupState.json'
+,
+    [switch]$Force
 )
 
 $ErrorActionPreference = 'Stop'
@@ -65,7 +69,7 @@ $script:BaseFileName = "{0}-RemoveUserProfiles-{1}" -f $script:ComputerName, $sc
 $script:YamlLogPath = Join-Path $LogDirectory ($script:BaseFileName + '.yaml')
 $script:RunId = [guid]::NewGuid().ToString('N')
 $script:ScriptName = '02_Remove_User_Profiles.ps1'
-$script:ScriptVersion = '2.5.23'
+$script:ScriptVersion = '2.5.26'
 $script:Domain = $env:USERDNSDOMAIN
 $script:TextLogPath = $null
 $script:PublishedTextLogPath = $null
@@ -1472,8 +1476,8 @@ Write-Log "YAML log path: $($script:YamlLogPath)" 'INFO'
 
 # Protect these computer groups from every profile-deletion path, including
 # profile registration removal, folder deletion, and cleanup-state processing.
-if ($script:ComputerName -imatch '^(CP|CCDP|PD)') {
-    Write-Log "Profile deletion skipped: hostname '$($script:ComputerName)' begins with a protected prefix (CP, CCDP, or PD). No profiles will be deleted." 'INFO'
+if ($script:ComputerName -imatch '^(CP|CCPD|CCDP|PD)') {
+    Write-Log "Profile deletion skipped: hostname '$($script:ComputerName)' begins with a protected prefix (CP, CCPD, CCDP, or PD). No profiles will be deleted." 'INFO'
 }
 else {
     try {

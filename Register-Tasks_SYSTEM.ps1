@@ -1,7 +1,9 @@
-﻿#requires -Version 5.1
+﻿# TechConsoleForcePatch: 1.0.0
+#requires -Version 5.1
 #requires -RunAsAdministrator
 # ScriptName:    Register-Tasks_SYSTEM.ps1
-# ScriptVersion: 4.14.0
+# ScriptVersion: 4.14.2
+# Changes: Add a Sunday-only startup action to reconnect an existing CC-IOT profile.
 # LastUpdated:   2026-10-15
 <#
 .SYNOPSIS
@@ -55,6 +57,7 @@ param(
     [string]$ScriptsRoot = 'C:\Scripts',
     [string]$TaskPath = '\',
     [string]$LogDirectory = 'C:\Logs',
+    [switch]$SundayWifiReconnect,
     [switch]$SystemRepairOnly = $false,
     [switch]$InventoryReportingOnly = $false
 )
@@ -62,8 +65,63 @@ param(
 Set-StrictMode -Version 2.0
 $ErrorActionPreference = 'Stop'
 
+# Standalone startup action. It must work before the share or framework is available.
+if ($SundayWifiReconnect) {
+    if ((Get-Date).DayOfWeek -ne 'Sunday') { exit 0 }
+    if (-not $PSCmdlet.ShouldProcess('CC-IOT', 'Check startup connectivity and reconnect if needed')) { return }
+    $wifiLog = Join-Path $LogDirectory 'Sunday-WiFi-Reconnect.log'
+    [IO.Directory]::CreateDirectory($LogDirectory) | Out-Null
+    function Write-WifiResult([string]$Message) {
+        Add-Content -LiteralPath $wifiLog -Value ("{0:s} [{1}] {2}" -f (Get-Date), $env:COMPUTERNAME, $Message)
+    }
+    Start-Sleep -Seconds 15
+    $lastReason = 'No enabled Wi-Fi adapter found.'
+    $nextConnect = [datetime]::MinValue
+    $deadline = [datetime]::UtcNow.AddMinutes(2)
+    do {
+        if ((Get-Date).DayOfWeek -ne 'Sunday') { exit 0 }
+        try {
+            $physical = @(Get-NetAdapter -ErrorAction Stop | Where-Object { $_.HardwareInterface -and -not $_.Virtual })
+            $wireless = @($physical | Where-Object {
+                $_.InterfaceType -eq 71 -or $_.PhysicalMediaType -match '802[._]11|Wireless LAN' -or
+                "$($_.Name) $($_.InterfaceDescription)" -match 'Wi[- ]?Fi|WLAN|Wireless LAN|802[.]11'
+            })
+            $wirelessIndices = @($wireless | ForEach-Object { $_.ifIndex })
+            $wired = $physical | Where-Object {
+                $_.Status -eq 'Up' -and $_.ifIndex -notin $wirelessIndices -and
+                ($_.InterfaceType -eq 6 -or $_.PhysicalMediaType -eq '802.3')
+            } | Select-Object -First 1
+            if ($wired) { Write-WifiResult "Ethernet active on $($wired.Name)."; exit 0 }
+            $wifi = $wireless | Where-Object { $_.Status -in 'Up','Disconnected' } |
+                Sort-Object @{Expression={ $_.Status -eq 'Up' }; Descending=$true}, ifIndex | Select-Object -First 1
+            if ($wifi) {
+                if ($wifi.Status -eq 'Up') {
+                    foreach ($source in '\\SERVER\DeploymentShare','\\FALLBACK-SERVER\DeploymentShare') {
+                        if (Test-Path -LiteralPath $source -ErrorAction SilentlyContinue) {
+                            Write-WifiResult "Source accessible: $source ($($wifi.Name))."
+                            exit 0
+                        }
+                    }
+                    $lastReason = 'Wireless link up; Labscripts is not yet accessible.'
+                }
+                if ([datetime]::UtcNow -ge $nextConnect) {
+                    Start-Service WlanSvc
+                    $reply = & netsh.exe wlan connect name=CC-IOT ssid=CC-IOT "interface=$($wifi.Name)" 2>&1
+                    $code = $LASTEXITCODE
+                    $lastReason = "CC-IOT request on $($wifi.Name): exit $code. $($reply -join ' ')"
+                    Write-WifiResult $lastReason
+                    $nextConnect = [datetime]::UtcNow.AddSeconds(45)
+                }
+            }
+        } catch { $lastReason = $_.Exception.Message }
+        Start-Sleep -Seconds 5
+    } while ([datetime]::UtcNow -lt $deadline)
+    Write-WifiResult "Timed out. $lastReason"
+    exit 1
+}
+
 $script:ScriptName       = 'Register-Tasks_SYSTEM.ps1'
-$script:ScriptVersion    = '4.14.0'
+$script:ScriptVersion    = '4.14.2'
 $script:RunId            = [guid]::NewGuid().Guid
 $script:StartTime        = Get-Date
 $script:WarningCount     = 0
@@ -889,6 +947,43 @@ Write-Log -Message ("Starting {0} version {1}. RunId={2}" -f $script:ScriptName,
 Write-Log -Message ("Active staged text log: {0}" -f $script:LogPath)
 Write-Log -Message ("Completed text log publish path: {0}" -f $script:PublishedLogPath)
 
+# Tech Console manual tasks have no triggers and do not replace weekly tasks.
+function Register-TechConsoleManualTasks {
+    $rows=@'
+[{"Script": "00_Update-Scripts-FromShare.ps1", "ActionId": "UpdateScripts"}, {"Script": "01_Enable_Windows_Update_Services.ps1", "ActionId": "EnableWindowsUpdateServices"}, {"Script": "02_Remove_User_Profiles.ps1", "ActionId": "RemoveUserProfiles"}, {"Script": "03_Weekend_Apps_Update.ps1", "ActionId": "WeekendAppsUpdate"}, {"Script": "04_Sunday_Lab_Application_Maintenance.ps1", "ActionId": "SundayLabApplicationMaintenance"}, {"Script": "05_Weekend_HP_Drivers_Update.ps1", "ActionId": "VendorDriverUpdate"}, {"Script": "06_Weekend_Windows_Updates.ps1", "ActionId": "WindowsUpdatePass"}, {"Script": "07_Force_Reboot_Install_Updates.ps1", "ActionId": "ForceRebootInstallUpdates"}, {"Script": "08_System_Repair.ps1", "ActionId": "SystemRepairWeekly"}, {"Script": "10_Sync_System_Time.ps1", "ActionId": "SyncSystemTime"}, {"Script": "14_Endpoint_Health_Inventory.ps1", "ActionId": "EndpointHealthInventory"}, {"Script": "15_Sunday_Update_Closeout.ps1", "ActionId": "SundayUpdateCloseoutPass"}, {"Script": "16_Check_Deep_Freeze_Status.ps1", "ActionId": null}, {"Script": "09_Disable_Windows_Update_Services.ps1", "ActionId": "DisableWindowsUpdateServices"}]
+'@ | ConvertFrom-Json
+    $service=New-Object -ComObject 'Schedule.Service';$service.Connect()
+    $folder=$service.GetFolder('\')
+    foreach($part in @('Compton','TechConsole')) {
+        try {$folder=$folder.GetFolder($part)}catch{$folder=$folder.CreateFolder($part)}
+    }
+    $exe=Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+    $principal=New-ScheduledTaskPrincipal -UserId 'SYSTEM' -LogonType ServiceAccount -RunLevel Highest
+    $settings=New-ScheduledTaskSettingsSet -MultipleInstances IgnoreNew -ExecutionTimeLimit (New-TimeSpan -Hours 4) -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
+    foreach($row in $rows) {
+        $scriptPath=Join-Path $ScriptsRoot $row.Script
+        if(-not(Test-Path -LiteralPath $scriptPath)){throw ('Missing manual script: '+$row.Script)}
+        $tokens=$null;$errors=$null
+        $ast=[Management.Automation.Language.Parser]::ParseFile($scriptPath,[ref]$tokens,[ref]$errors)
+        if($errors.Count -or -not @($ast.ParamBlock.Parameters | Where-Object {$_.Name.VariablePath.UserPath -ieq 'Force'}).Count){throw ('Manual task requires Force support: '+$row.Script)}
+        if($row.ActionId){
+            $target=Join-Path $ScriptsRoot 'Invoke-MaintenanceScript.ps1'
+            $arguments='-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "'+$target+'" -ActionId "'+$row.ActionId+'" -Force'
+        } else {
+            $arguments='-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "'+$scriptPath+'" -Force'
+        }
+        $action=New-ScheduledTaskAction -Execute $exe -Argument $arguments
+        $task=New-ScheduledTask -Action $action -Principal $principal -Settings $settings -Description 'Tech Console manual Force. No automatic triggers. Calendar override; existing child protections remain.'
+        $existing=Get-ScheduledTask -TaskPath '\Compton\TechConsole\' -TaskName $row.Script -ErrorAction SilentlyContinue
+        if($existing -and $existing.State -eq 'Running') {
+            Write-Log -Level 'WARN' -Message ('Manual task is running; preserving registration: '+$row.Script)
+            continue
+        }
+        Register-ScheduledTask -TaskPath '\Compton\TechConsole\' -TaskName $row.Script -InputObject $task -Force | Out-Null
+    }
+    Write-Log -Level 'OK' -Message 'Tech Console manual Force tasks reconciled; weekly schedules retained.'
+}
+
 try {
     $createdNew = $false
     $script:Mutex = New-Object Threading.Mutex($true, 'Global\Compton_RegisterTasks_SYSTEM', [ref]$createdNew)
@@ -1006,6 +1101,7 @@ try {
     $desiredTaskNames = @($taskDefinitions.Name) + @(
         '00. Sync System Time Every 4 Hours',
         $rebootResumeStartupTaskName,
+        '00A. Reconnect Sunday Wi-Fi at Startup',
         $deepFreezeWeeklyTaskName,
         '14A. Endpoint Health Refresh Every 4 Hours'
     )
@@ -1026,6 +1122,8 @@ try {
         -ScriptPath (Join-Path $ScriptsRoot '07_Force_Reboot_Install_Updates.ps1') `
         -ExtraArguments '-StartupResume'
 
+    Ensure-StartupTask -Name '00A. Reconnect Sunday Wi-Fi at Startup' -ScriptPath (Join-Path $ScriptsRoot 'Register-Tasks_SYSTEM.ps1') -ExtraArguments '-SundayWifiReconnect'
+
     # Run script 16 directly so its purpose-built Installed=false event can replace
     # stale prior Deep Freeze state without generic launcher telemetry. The dashboard
     # excludes those records. StartWhenAvailable catches computers that miss Monday.
@@ -1045,6 +1143,7 @@ try {
             -ExtraArguments $definition.Args
     }
 
+    Register-TechConsoleManualTasks
     $missingRegisteredTasks = @()
     foreach ($expectedName in $desiredTaskNames) {
         if (-not (Get-ScheduledTask -TaskName $expectedName -TaskPath $TaskPath -ErrorAction SilentlyContinue)) {
@@ -1118,3 +1217,5 @@ finally {
 }
 
 exit $exitCode
+
+

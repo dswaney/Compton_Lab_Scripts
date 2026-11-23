@@ -1,6 +1,7 @@
-﻿#requires -Version 5.1
+﻿# TechConsoleForcePatch: 1.0.0
+#requires -Version 5.1
 #requires -RunAsAdministrator
-# ScriptVersion: 1.1.7
+# ScriptVersion: 1.1.8
 # LastUpdated: 2026-11-02
 # Changes: v1.1.7 uses unique per-run logs and retries temporary log sharing violations.
 # Previous: Manual -Force bypasses the closeout calendar gate; thaw/servicing/Secure Boot safeguards remain.
@@ -11,7 +12,7 @@
 param([string]$ScriptsRoot='C:\Scripts',[switch]$VerifyOnly,[string]$LogDirectory='C:\Logs',[switch]$SecureBootOnly,[switch]$SecureBootAuditOnly,[switch]$SecureBootStartup,[switch]$Force)
 $ErrorActionPreference='Stop'
 New-Item -Path $LogDirectory -ItemType Directory -Force|Out-Null
-$start=Get-Date;$result=[ordered]@{ComputerName=$env:COMPUTERNAME;ScriptVersion='1.1.7';StartTime=$start.ToString('o');Status='Running';ReadyToFreeze=$false;RemainingUpdates=$null;RebootRequired=$null;FailureMessage=$null;FreezeScheduleControlled=$false;ForceRequested=[bool]$Force}
+$start=Get-Date;$result=[ordered]@{ComputerName=$env:COMPUTERNAME;ScriptVersion='1.1.8';StartTime=$start.ToString('o');Status='Running';ReadyToFreeze=$false;RemainingUpdates=$null;RebootRequired=$null;FailureMessage=$null;FreezeScheduleControlled=$false;ForceRequested=[bool]$Force}
 $logRunId=[guid]::NewGuid().ToString('N')
 $log=Join-Path $LogDirectory ($env:COMPUTERNAME+'-15_Sunday_Update_Closeout-'+$start.ToString('yyyyMMdd-HHmmss')+'-'+$PID+'-'+$logRunId+'.log')
 function Log([string]$Text){
@@ -264,7 +265,7 @@ function Request-SecureBootReboot($State,$Policy,[string]$StatePath) {
  return 'RebootRequested'
 }
 function Invoke-SecureBootMaintenance {
- $report=[ordered]@{EventType='maintenance.secure_boot';ComputerName=$env:COMPUTERNAME;ScriptName='15_Sunday_Update_Closeout.ps1';ScriptVersion='1.1.7';'@timestamp'=(Get-Date).ToUniversalTime().ToString('o');Status='Checking';Ready=$false;Message=$null;Snapshot=$null;BitLockerProtection=$null;DeepFreezeVersion=$null;Phase=$null;RebootsRequested=0;FreezeScheduleControlled=$false}
+ $report=[ordered]@{EventType='maintenance.secure_boot';ComputerName=$env:COMPUTERNAME;ScriptName='15_Sunday_Update_Closeout.ps1';ScriptVersion='1.1.8';'@timestamp'=(Get-Date).ToUniversalTime().ToString('o');Status='Checking';Ready=$false;Message=$null;Snapshot=$null;BitLockerProtection=$null;DeepFreezeVersion=$null;Phase=$null;RebootsRequested=0;FreezeScheduleControlled=$false}
  $state=$null;$statePath=$null;$held=$false;$mutex=$null
  try{
   if(![Environment]::Is64BitProcess -and [Environment]::Is64BitOperatingSystem){throw 'Run the coordinator in native 64-bit Windows PowerShell.'}

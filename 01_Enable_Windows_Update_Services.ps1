@@ -1,6 +1,7 @@
-﻿# =====================================================================
+﻿# TechConsoleForcePatch: 1.0.0
+# =====================================================================
 # ScriptName: 01_Enable_Windows_Update_Services.ps1
-# ScriptVersion: 2.8.10
+# ScriptVersion: 2.8.11
 # LastUpdated: 2026-10-22
 # Purpose: Restore Windows Update services, tasks, policy settings,
 #          Windows 11 UI preferences, and classic right-click context menu behavior for all users;
@@ -21,12 +22,14 @@
 # =====================================================================
 
 [CmdletBinding()]
-param([switch]$ManualUpdateRepair)
+param([switch]$ManualUpdateRepair,
+    [switch]$Force
+)
 
 $ErrorActionPreference = 'Stop'
 
 $script:ScriptName       = '01_Enable_Windows_Update_Services.ps1'
-$script:ScriptVersion    = '2.8.10'
+$script:ScriptVersion    = '2.8.11'
 $script:ExecutionStart   = Get-Date
 $script:WarningCount     = 0
 $script:ErrorCount       = 0

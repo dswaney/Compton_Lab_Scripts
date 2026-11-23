@@ -1,6 +1,7 @@
+# TechConsoleForcePatch: 1.0.0
 # ScriptName: 05_Weekend_HP_Drivers_Update.ps1
-# ScriptVersion: 3.4.3
-# LastUpdated: 2026-10-06
+# ScriptVersion: 3.4.5
+# LastUpdated: 2026-11-06
 # Purpose: Weekend vendor driver update script with clean HP + Dell support,
 #          HP-only HPCMSL maintenance after vendor detection,
 #          YAML logging, colored output,
@@ -10,7 +11,8 @@
 #          Dell wired Wake-on-LAN BIOS and Ethernet-adapter verification,
 #          and staged per-run text logs that are published to C:\Logs only after completion,
 #          with automatic archival of prior script 05 logs.
-# ChangeLog: v3.3.1 supports both combined and separate HP BIOS scheduled-power-on
+# ChangeLog: v3.4.5 applies HP Wake-on-LAN/S5 and Dell shared BIOS settings.
+#            v3.3.1 supports both combined and separate HP BIOS scheduled-power-on
 #            time fields, including HP ProOne models that expose writable integer
 #            settings named BIOS Power-On Hour and BIOS Power-On Minute.
 #            v3.3.2 safely removes the orphaned HP SFU service/driver package from
@@ -43,6 +45,9 @@ param([string]$WorkingRoot = 'C:\Temp\DriverUpdates',
     [string]$DotNetDesktopRuntimeSharePath = '\\SERVER\DeploymentShare\windowsdesktop-runtime-8.0.25-win-x64.exe',
     [string]$DotNetDesktopRuntimeInternetUrl = 'https://aka.ms/dotnet/8.0/windowsdesktop-runtime-win-x64.exe',
     [string]$DellCommandUpdateWingetId = 'Dell.CommandUpdate.Universal'
+,
+    [switch]$Force,
+    [string]$DellBiosSettingsScript = '\\SERVER\DeploymentShare\Set-Dell-BIOS-Settings.ps1'
 )
 
 Set-StrictMode -Version Latest
@@ -52,7 +57,7 @@ $ErrorActionPreference = 'Stop'
 # Script metadata
 # -----------------------------
 $script:ScriptName        = '05_Weekend_HP_Drivers_Update.ps1'
-$script:ScriptVersion     = '3.4.3'
+$script:ScriptVersion     = '3.4.5'
 $script:StartTime         = Get-Date
 $script:RunFailures       = New-Object System.Collections.Generic.List[string]
 $script:InstalledList     = New-Object System.Collections.Generic.List[string]
@@ -3618,6 +3623,99 @@ function Invoke-HpNetworkBiosUpdatePolicy {
     }
 }
 
+function Invoke-HpWakeOnLanBiosSettings {
+    Write-Section 'HP Wake-on-LAN BIOS Settings'
+    $local = $null
+    try {
+        $source = Join-Path $HpBiosConfigShare 'config.txt'
+        $password = Join-Path $HpBiosConfigShare 'password.bin'
+        $desiredConfig = @(Get-Content -LiteralPath $source -ErrorAction Stop)
+        $local = Join-Path $WorkingRoot ('HpWakeOnLan-' + [guid]::NewGuid().ToString('N'))
+        New-Item -Path $local -ItemType Directory -Force | Out-Null
+        foreach ($file in @(Get-ChildItem -LiteralPath $HpBiosConfigShare -File -ErrorAction Stop |
+            Where-Object { $_.Name -match '^(BIOSConfigUtility64\.exe|BCUsignature64\.dll)$' })) {
+            Copy-Item -LiteralPath $file.FullName -Destination $local -Force -ErrorAction Stop
+        }
+        $bcu = Join-Path $local 'BIOSConfigUtility64.exe'
+        $snapshot = Join-Path $local 'readback.txt'
+        $output = @(& $bcu "/Get:$snapshot" 2>&1)
+        if ($LASTEXITCODE -ne 0) { throw "HP BIOS export failed: $($output -join ' ')" }
+        $current = @(Get-Content -LiteralPath $snapshot -ErrorAction Stop)
+        $desired = [ordered]@{
+            'Wake On LAN' = 'Boot to Hard Drive'
+            'S5 Maximum Power Savings' = 'Disable'
+        }
+        $settings = @('BIOSConfig 1.0')
+        $verify = @()
+        foreach ($name in $desired.Keys) {
+            $value = $desired[$name]
+            if ((Get-HpBcuSetting -Lines $desiredConfig -Name $name) -ne $value) {
+                throw "Expected '$name' to select '$value' in $source."
+            }
+            $options = @(Get-HpBcuSettingOptions -Lines $current -Name $name)
+            $option = $options | Where-Object {
+                $_ -ieq $value -or ($value -eq 'Disable' -and $_ -ieq 'Disabled')
+            } | Select-Object -First 1
+            if (-not $option) {
+                Add-RunFailure "HP BIOS '$name' does not expose '$value' on this model."
+                continue
+            }
+            $verify += $name
+            if ((Get-HpBcuSetting -Lines $current -Name $name) -ne $value) {
+                $settings += @($name, ("`t*" + $option))
+            }
+        }
+        if ($settings.Count -gt 1) {
+            if (-not (Test-Path -LiteralPath $password -PathType Leaf)) {
+                throw "HP BIOS password file missing: $password"
+            }
+            $config = Join-Path $local 'wake-settings.txt'
+            Set-Content -LiteralPath $config -Value $settings -Encoding Ascii
+            $output = @(& $bcu "/Set:$config" "/cpwdfile:$password" '/WarningAsErr' 2>&1)
+            if ($LASTEXITCODE -ne 0) { throw "HP BIOS settings failed: $($output -join ' ')" }
+            $snapshot = Join-Path $local 'after.txt'
+            $output = @(& $bcu "/Get:$snapshot" 2>&1)
+            if ($LASTEXITCODE -ne 0) { throw "HP BIOS readback failed: $($output -join ' ')" }
+            $current = @(Get-Content -LiteralPath $snapshot -ErrorAction Stop)
+        }
+        foreach ($name in $verify) {
+            $actual = Get-HpBcuSetting -Lines $current -Name $name
+            if ($actual -ne $desired[$name]) { throw "HP BIOS '$name' readback mismatch: '$actual'." }
+            Write-Log "HP BIOS verified: $name = $actual." 'OK'
+            Add-YamlAction "HP BIOS verified: $name = $actual."
+        }
+    }
+    catch {
+        Add-RunFailure "HP Wake-on-LAN BIOS settings: $($_.Exception.Message)"
+    }
+    finally {
+        if ($local -and (Test-Path -LiteralPath $local)) {
+            Remove-Item -LiteralPath $local -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+}
+
+function Invoke-DellSharedBiosSettings {
+    Write-Section 'Dell Shared BIOS Settings'
+    try {
+        if (-not (Test-Path -LiteralPath $DellBiosSettingsScript -PathType Leaf)) {
+            throw "Dell BIOS settings script missing: $DellBiosSettingsScript"
+        }
+        $powershell = Join-Path $env:WINDIR 'System32\WindowsPowerShell\v1.0\powershell.exe'
+        if ([Environment]::Is64BitOperatingSystem -and -not [Environment]::Is64BitProcess) {
+            $powershell = Join-Path $env:WINDIR 'Sysnative\WindowsPowerShell\v1.0\powershell.exe'
+        }
+        $output = @(& $powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $DellBiosSettingsScript 2>&1)
+        $exitCode = $LASTEXITCODE
+        foreach ($line in $output) { Write-Log ([string]$line) 'INFO' }
+        if ($exitCode -ne 0) { throw "Dell BIOS settings script exited with code $exitCode." }
+        Add-YamlAction 'Dell shared BIOS settings script completed successfully.'
+    }
+    catch {
+        Add-RunFailure "Dell shared BIOS settings: $($_.Exception.Message)"
+    }
+}
+
 function Set-HpAvAutoPowerOn {
     $tool = Join-Path $HpBiosConfigShare 'BIOSConfigUtility64.exe'
     $password = Join-Path $HpBiosConfigShare 'password.bin'
@@ -4026,6 +4124,10 @@ try {
 
     if ($script:DetectedVendor -eq 'HP') {
         Invoke-HpNetworkBiosUpdatePolicy
+        Invoke-HpWakeOnLanBiosSettings
+    }
+    elseif ($script:DetectedVendor -eq 'Dell') {
+        Invoke-DellSharedBiosSettings
     }
 
     Invoke-AvAutoPowerOn

@@ -1,10 +1,11 @@
+# TechConsoleForcePatch: 1.0.0
 #requires -Version 5.1
 <#
 .SYNOPSIS
     Checks Faronics Deep Freeze state and writes one Elastic-friendly JSON event file per run.
 .NOTES
     Script: 16_Check_Deep_Freeze_Status.ps1
-    Version: 1.3.0
+    Version: 1.3.1
     Updated: 2026-09-09
     Changes: 1.3.0 tracks the first observation of the current state and publishes
              ThawedSinceUtc, ThawedForDays, ThawedForHours, PreviousState, and
@@ -18,13 +19,13 @@
              Per-run JSON event files remain atomic and are not converted to staged text logging.
 #>
 [CmdletBinding()]
-param()
+param([switch]$Force)
 
 Set-StrictMode -Version 2.0
 $ErrorActionPreference = 'Stop'
 
 $ScriptName = '16_Check_Deep_Freeze_Status.ps1'
-$ScriptVersion = '1.3.0'
+$ScriptVersion = '1.3.1'
 $LogDirectory = 'C:\Logs'
 $DeepFreezeLogDirectory = Join-Path $LogDirectory 'DeepFreeze'
 $DeepFreezeStateDirectory = Join-Path $env:ProgramData 'Compton\DeepFreeze'

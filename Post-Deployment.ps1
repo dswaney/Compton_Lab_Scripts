@@ -1,8 +1,9 @@
 # =====================================================================
 # ScriptName: Post-Deployment.ps1
-# ScriptVersion: 2.4.0
-# LastUpdated: 2026-10-14
-# Changes:       v2.4.0 adds SHARP BP-70C31 PCL6 driver staging, package
+# ScriptVersion: 2.4.1
+# LastUpdated: 2026-11-03
+# Changes:       v2.4.1 carries script03 SYSTEM tar extraction and native WinGet selection fixes.
+# Previous:      v2.4.0 adds SHARP BP-70C31 PCL6 driver staging, package
 #                fingerprint checks, verification, and StudentSecurePrint
 #                connection from script 04; retains the existing PaperCut install.
 #                v2.3.0 uses the canonical Copilot-removal module directly from
@@ -899,7 +900,7 @@ function Install-SharpPrinterDriver {
             SourcePath = $DriverSourcePath
             SourceFingerprintSHA256 = $fingerprint
             LastSuccessfulUpdate = (Get-Date).ToUniversalTime().ToString('o')
-            ScriptVersion = '2.4.0'
+            ScriptVersion = '2.4.1'
         } | ConvertTo-Json | Set-Content -LiteralPath $tempState -Encoding UTF8 -ErrorAction Stop
         Move-Item -LiteralPath $tempState -Destination $statePath -Force -ErrorAction Stop
         Write-Log "SHARP driver verified: Name=$($after.Name); Version=$($after.Version); INF=$($after.InfPath)" 'OK'
@@ -1202,26 +1203,14 @@ function Ensure-DellCommandUpdateInstalled {
     }
     else {
         Write-Log 'The Dell Command Update share installer is unavailable; using winget as the fallback.' 'WARN'
-        $winget = Get-Command -Name 'winget.exe' -ErrorAction SilentlyContinue
-        if (-not $winget) {
+        $wingetPath = Get-WingetPath
+        if ([string]::IsNullOrWhiteSpace([string]$wingetPath)) {
             throw 'Dell Command | Update is not on the file share and winget.exe is unavailable.'
         }
-
-        $wingetArguments = @(
+        Invoke-WingetLogged -WingetPath $wingetPath -Operation 'install Dell Command Update fallback' -Arguments @(
             'install','--id',$DellCommandUpdateWingetId,'--exact','--silent',
             '--accept-package-agreements','--accept-source-agreements','--disable-interactivity'
         )
-        $wingetProcess = Start-Process `
-            -FilePath $winget.Source `
-            -ArgumentList $wingetArguments `
-            -Wait `
-            -PassThru `
-            -NoNewWindow `
-            -ErrorAction Stop
-
-        if ([int]$wingetProcess.ExitCode -ne 0) {
-            throw "winget failed to install Dell Command | Update. Exit code: $($wingetProcess.ExitCode)"
-        }
     }
 
     Start-Sleep -Seconds 3
@@ -1888,25 +1877,192 @@ function Enable-InstalledOfficeActivation {
     Write-Log 'Office activation completed and the machine-wide LICENSED state was verified for all users.' 'OK'
 }
 
+function Get-WingetCandidates {
+    $native = if ($env:PROCESSOR_ARCHITEW6432) { $env:PROCESSOR_ARCHITEW6432 } else { $env:PROCESSOR_ARCHITECTURE }
+    $architecture = switch ($native) { 'ARM64' {'arm64'} 'AMD64' {'x64'} default {'x86'} }
+    $paths = @()
+    $programRoot = if ($env:ProgramW6432) { $env:ProgramW6432 } else { $env:ProgramFiles }
+    $pattern = Join-Path $programRoot 'WindowsApps\Microsoft.DesktopAppInstaller_*'
+    foreach ($folder in @(Get-ChildItem -Path $pattern -Directory -ErrorAction SilentlyContinue)) {
+        if ($folder.Name -match '^Microsoft\.DesktopAppInstaller_([0-9.]+)_(x64|x86|arm64)__8wekyb3d8bbwe$') {
+            $version = [version]$Matches[1]; $arch = $Matches[2]
+            if ($arch -eq $architecture) {
+                $exe = Join-Path $folder.FullName 'winget.exe'
+                if (Test-Path -LiteralPath $exe -PathType Leaf) { $paths += [pscustomobject]@{ Path=$exe; PackageVersion=$version; Origin='NativeAppInstaller'; Architecture=$arch } }
+            }
+        }
+    }
+    $ordered = @($paths | Sort-Object PackageVersion -Descending)
+    foreach ($command in @(Get-Command winget.exe -CommandType Application -All -ErrorAction SilentlyContinue)) {
+        $ordered += [pscustomobject]@{ Path=$command.Source; PackageVersion=[version]'0.0'; Origin='PATH'; Architecture='Unknown' }
+    }
+    $seen = @{}
+    foreach ($item in $ordered) { if ($item.Path -and -not $seen.ContainsKey($item.Path.ToLowerInvariant())) { $seen[$item.Path.ToLowerInvariant()]=$true; $item } }
+}
+
+function ConvertFrom-WingetJsonC {
+    param([Parameter(Mandatory)][AllowEmptyString()][string]$Text)
+    $buffer=New-Object Text.StringBuilder
+    $quoted=$false;$escaped=$false;$lineComment=$false;$blockComment=$false
+    for($i=0;$i -lt $Text.Length;$i++) {
+        $c=$Text[$i];$next=if($i+1 -lt $Text.Length){$Text[$i+1]}else{[char]0}
+        if($lineComment){if($c -eq "`n" -or $c -eq "`r"){$lineComment=$false;[void]$buffer.Append($c)};continue}
+        if($blockComment){if($c -eq '*' -and $next -eq '/'){$blockComment=$false;$i++;[void]$buffer.Append(' ')};continue}
+        if($quoted){
+            [void]$buffer.Append($c)
+            if($escaped){$escaped=$false}elseif($c -eq '\'){$escaped=$true}elseif($c -eq '"'){$quoted=$false}
+            continue
+        }
+        if($c -eq '"'){$quoted=$true;[void]$buffer.Append($c);continue}
+        if($c -eq '/' -and $next -eq '/'){$lineComment=$true;$i++;[void]$buffer.Append(' ');continue}
+        if($c -eq '/' -and $next -eq '*'){$blockComment=$true;$i++;[void]$buffer.Append(' ');continue}
+        [void]$buffer.Append($c)
+    }
+    if($quoted -or $blockComment){throw 'Unterminated JSON string or comment in SYSTEM WinGet settings; original settings left untouched.'}
+    $clean=$buffer.ToString();$buffer=New-Object Text.StringBuilder;$quoted=$false;$escaped=$false
+    for($i=0;$i -lt $clean.Length;$i++) {
+        $c=$clean[$i]
+        if($quoted){[void]$buffer.Append($c);if($escaped){$escaped=$false}elseif($c -eq '\'){$escaped=$true}elseif($c -eq '"'){$quoted=$false};continue}
+        if($c -eq '"'){$quoted=$true}
+        if($c -eq ','){
+            $j=$i+1;while($j -lt $clean.Length -and [char]::IsWhiteSpace($clean[$j])){$j++}
+            if($j -lt $clean.Length -and $clean[$j] -in @('}',']')){continue}
+        }
+        [void]$buffer.Append($c)
+    }
+    $json=$buffer.ToString().Trim()
+    if(-not $json.StartsWith('{') -or -not $json.EndsWith('}')){throw 'SYSTEM WinGet settings must be a JSON object; original settings left untouched.'}
+    try{return ($json | ConvertFrom-Json -ErrorAction Stop)}catch{throw 'Could not parse existing SYSTEM WinGet settings; original settings left untouched.'}
+}
+
+function Merge-WingetTarSettings {
+    param([Parameter(Mandatory)][string]$Text)
+    $settings=ConvertFrom-WingetJsonC -Text $Text
+    $property=$settings.PSObject.Properties['installBehavior']
+    if($property -and $property.Name -cne 'installBehavior'){throw 'Unexpected installBehavior capitalization; original settings left untouched.'}
+    if($property -and $null -ne $property.Value -and $property.Value -isnot [pscustomobject]){throw 'Existing installBehavior is not an object; original settings left untouched.'}
+    if(-not $property){$settings | Add-Member NoteProperty installBehavior ([pscustomobject]@{})}
+    elseif($null -eq $property.Value){$settings.installBehavior=[pscustomobject]@{}}
+    $method=$settings.installBehavior.PSObject.Properties['archiveExtractionMethod']
+    if($method -and $method.Name -cne 'archiveExtractionMethod'){throw 'Unexpected archiveExtractionMethod capitalization; original settings left untouched.'}
+    if($method -and [string]$method.Value -ceq 'tar'){return [pscustomobject]@{Changed=$false;Text=$Text}}
+    $settings.installBehavior | Add-Member NoteProperty archiveExtractionMethod 'tar' -Force
+    return [pscustomobject]@{Changed=$true;Text=($settings | ConvertTo-Json -Depth 64)}
+}
+
+function Resolve-WingetSettingsPath {
+    param([Parameter(Mandatory)][AllowEmptyString()][AllowEmptyCollection()][string[]]$InfoLines)
+    $candidates=@(foreach($line in $InfoLines){
+        if([string]::IsNullOrWhiteSpace($line)){continue}
+        $plain=[regex]::Replace($line,([char]27+'\[[0-?]*[ -/]*[@-~]'),'')
+        foreach($match in [regex]::Matches($plain,'(?i)(?<![A-Z0-9])(?:[A-Z]:[\\/]|%[A-Z_][A-Z0-9_]*%[\\/]).*?[\\/]settings\.json')){
+            $candidate=[Environment]::ExpandEnvironmentVariables($match.Value)
+            if($candidate -match '%[^%]+%'){throw 'WinGet settings path contains an unresolved environment variable.'}
+            [IO.Path]::GetFullPath($candidate)
+        }
+    })
+    $paths=@($candidates | Select-Object -Unique)
+    if($paths.Count -ne 1){throw 'Could not resolve exactly one settings.json path from SYSTEM winget --info; no settings file changed.'}
+    return $paths[0]
+}
+
+function Set-WingetTarSettingsFile {
+    param([Parameter(Mandatory)][string]$Path)
+    $encoding=New-Object Text.UTF8Encoding($false,$true)
+    $existed=Test-Path -LiteralPath $Path -PathType Leaf
+    $before=if($existed){[IO.File]::ReadAllBytes($Path)}else{$null}
+    $text=if($existed){[IO.File]::ReadAllText($Path,$encoding)}else{'{}'}
+    $merged=Merge-WingetTarSettings -Text $text
+    if(-not $merged.Changed){return [pscustomobject]@{Status='AlreadyTar';SettingsPath=$Path;BackupPath=$null;Method='tar'}}
+    $parent=Split-Path -Parent $Path
+    if(-not(Test-Path -LiteralPath $parent)){New-Item -ItemType Directory -Path $parent -Force | Out-Null}
+    $backup=$null
+    if($existed){
+        $backup=$Path+'.before-compton-tar-'+[datetime]::UtcNow.ToString('yyyyMMddTHHmmssfffZ')+'.bak'
+        [IO.File]::WriteAllBytes($backup,$before)
+    }
+    $temporary=Join-Path $parent ('.compton-tar-'+[guid]::NewGuid().ToString('N')+'.tmp')
+    try{
+        [IO.File]::WriteAllText($temporary,$merged.Text,$encoding)
+        # Recheck concurrent changes before atomically replacing settings.
+        if($existed){
+            if(-not(Test-Path -LiteralPath $Path -PathType Leaf) -or [Convert]::ToBase64String([IO.File]::ReadAllBytes($Path)) -cne [Convert]::ToBase64String($before)){throw 'SYSTEM WinGet settings changed during preparation; no replacement made.'}
+            [IO.File]::Replace($temporary,$Path,[System.Management.Automation.Language.NullString]::Value)
+        }else{[IO.File]::Move($temporary,$Path)}
+    }finally{if(Test-Path -LiteralPath $temporary){Remove-Item -LiteralPath $temporary -Force -ErrorAction SilentlyContinue}}
+    return [pscustomobject]@{Status='ConfiguredTar';SettingsPath=$Path;BackupPath=$backup;Method='tar'}
+}
+
+function Test-WingetSystemIdentity {
+    return [Security.Principal.WindowsIdentity]::GetCurrent().IsSystem
+}
+
+function Get-SystemWingetTarPath {
+    if($env:PROCESSOR_ARCHITEW6432){return (Join-Path $env:WINDIR 'Sysnative\tar.exe')}
+    return (Join-Path $env:WINDIR 'System32\tar.exe')
+}
+
+function Initialize-SystemWingetArchiveExtractor {
+    param([string]$WingetPath)
+    $script:WingetArchiveSettings=[ordered]@{Status='NotRun';Method=$null;SettingsPath=$null;BackupPath=$null;TarPath=$null}
+    if(-not(Test-WingetSystemIdentity)){
+        $script:WingetArchiveSettings.Status='SkippedNonSystem'
+        Write-Log 'WinGet archive settings: non-SYSTEM execution; user settings unchanged.' 'INFO'
+        return
+    }
+    try{
+        $tar=Get-SystemWingetTarPath
+        $script:WingetArchiveSettings.TarPath=$tar
+        if(-not(Test-Path -LiteralPath $tar -PathType Leaf)){throw 'Native Windows tar.exe is missing; SYSTEM WinGet settings unchanged.'}
+        $winget=if([string]::IsNullOrWhiteSpace($WingetPath)){Get-WingetPath}else{$WingetPath}
+        if(-not $winget){throw 'WinGet executable not found; settings unchanged.'}
+        $info=Invoke-WingetNativeProcess -Path $winget -Arguments @('--info','--disable-interactivity') -TimeoutSeconds 60
+        if($info.Status -ne 'Completed' -or $info.ExitCode -ne 0){throw 'SYSTEM winget --info failed; settings unchanged.'}
+        $path=Resolve-WingetSettingsPath -InfoLines @($info.RawOutput)
+        $result=Set-WingetTarSettingsFile -Path $path
+        foreach($key in @('Status','Method','SettingsPath','BackupPath')){$script:WingetArchiveSettings[$key]=$result.$key}
+        Write-Log ('SYSTEM WinGet archive extractor: '+$result.Method+'; '+$result.Status+'; settings='+$path) 'INFO'
+        if($result.BackupPath){Write-Log ('Previous WinGet settings backed up to: '+$result.BackupPath) 'INFO'}
+    }catch{
+        $script:WingetArchiveSettings.Status='Failed'
+        $script:WingetArchiveSettings['Error']=$_.Exception.Message
+        throw
+    }
+}
+
 function Get-WingetPath {
     [CmdletBinding()]
     param()
-
-    $command = Get-Command winget.exe -ErrorAction SilentlyContinue
-    if ($null -ne $command) {
-        return $command.Source
-    }
-
-    $candidate = Get-ChildItem -Path 'C:\Program Files\WindowsApps\Microsoft.DesktopAppInstaller_*\winget.exe' -ErrorAction SilentlyContinue |
-        Sort-Object VersionInfo -Descending |
-        Select-Object -First 1
-    if ($null -ne $candidate) {
-        return $candidate.FullName
-    }
-
+    $candidate = Get-WingetCandidates | Select-Object -First 1
+    if ($candidate) { return $candidate.Path }
     return $null
 }
 
+# Isolated native invocation for --info only. Both output streams are drained
+# asynchronously; settings discovery cannot hang indefinitely.
+function Invoke-WingetNativeProcess {
+    param([string]$Path,[string[]]$Arguments,[int]$TimeoutSeconds=60)
+    if (($Arguments -join ' ') -ne '--info --disable-interactivity') {
+        throw 'This helper is restricted to WinGet settings discovery.'
+    }
+    $info=New-Object Diagnostics.ProcessStartInfo
+    $info.FileName=$Path;$info.Arguments='--info --disable-interactivity'
+    $info.UseShellExecute=$false;$info.CreateNoWindow=$true
+    $info.RedirectStandardOutput=$true;$info.RedirectStandardError=$true
+    $process=New-Object Diagnostics.Process;$process.StartInfo=$info
+    try {
+        if (!$process.Start()) { throw 'WinGet --info failed to start.' }
+        $stdout=$process.StandardOutput.ReadToEndAsync();$stderr=$process.StandardError.ReadToEndAsync()
+        if (!$process.WaitForExit($TimeoutSeconds*1000)) {
+            try{$process.Kill()}catch{}
+            return [pscustomobject]@{Status='TimedOut';ExitCode=$null;RawOutput=@()}
+        }
+        if (!$stdout.Wait(5000) -or !$stderr.Wait(5000)) {
+            return [pscustomobject]@{Status='OutputTimedOut';ExitCode=$process.ExitCode;RawOutput=@()}
+        }
+        return [pscustomobject]@{Status='Completed';ExitCode=$process.ExitCode;RawOutput=@(($stdout.Result+"`n"+$stderr.Result) -split "`r?`n")}
+    } finally { $process.Dispose() }
+}
 function Invoke-WingetLogged {
     [CmdletBinding()]
     param(
@@ -1915,6 +2071,7 @@ function Invoke-WingetLogged {
         [Parameter(Mandatory)][string]$Operation
     )
 
+    Initialize-SystemWingetArchiveExtractor -WingetPath $wingetPath
     Write-Log "Running winget operation: $Operation" 'INFO'
     $output = & $WingetPath @Arguments 2>&1
     $exitCode = [int]$LASTEXITCODE
@@ -1937,6 +2094,8 @@ function Update-InstalledApplications {
     if ([string]::IsNullOrWhiteSpace([string]$wingetPath)) {
         throw 'Windows Package Manager (winget.exe) was not found.'
     }
+
+    Initialize-SystemWingetArchiveExtractor -WingetPath $wingetPath
 
     try {
         Invoke-WingetLogged -WingetPath $wingetPath -Operation 'source update' -Arguments @(
@@ -2086,7 +2245,7 @@ function Invoke-FinalReboot {
 
 try {
     Initialize-Log
-    Write-Log 'Starting Post-Deployment.ps1 version 2.4.0.' 'INFO'
+    Write-Log 'Starting Post-Deployment.ps1 version 2.4.1.' 'INFO'
 
     if (-not (Test-IsAdministrator)) {
         throw 'Please run this script as Administrator.'

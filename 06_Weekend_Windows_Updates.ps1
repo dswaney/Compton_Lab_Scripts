@@ -1,6 +1,7 @@
-﻿# =====================================================================
+﻿# TechConsoleForcePatch: 1.0.0
+# =====================================================================
 # ScriptName: 06_Weekend_Windows_Updates.ps1
-# ScriptVersion: 2.1.14
+# ScriptVersion: 2.1.15
 # LastUpdated: 2026-10-27
 # Changes: v2.1.14 waits for MSI availability, retries confirmed installer-busy
 #          failures, uses direct Microsoft Update snapshots, and retains diagnostics.
@@ -40,13 +41,15 @@ param(
     [ValidateRange(30,3600)][int]$RebootDelaySeconds = 60,
     [int]$OperationTimeoutSeconds = 1800,
     [string]$LogFolder = "$env:SystemDrive\Logs"
+,
+    [switch]$Force
 )
 
 $ErrorActionPreference = 'Stop'
 if ($AllowReboot -and $NoReboot) { throw '-AllowReboot and -NoReboot cannot be combined.' }
 
 $script:ScriptName       = '06_Weekend_Windows_Updates.ps1'
-$script:ScriptVersion    = '2.1.14'
+$script:ScriptVersion    = '2.1.15'
 $script:RunId            = [guid]::NewGuid().Guid
 $script:RunStart         = Get-Date
 $script:ComputerName     = $env:COMPUTERNAME

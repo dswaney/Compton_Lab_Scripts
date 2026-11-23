@@ -1,3 +1,4 @@
+# TechConsoleForcePatch: 1.0.0
 #requires -version 5.1
 <#
 .SYNOPSIS
@@ -10,7 +11,7 @@
 
 .NOTES
     ScriptName:    09_Disable_Windows_Update_Services.ps1
-    ScriptVersion: 2.0.9
+    ScriptVersion: 2.0.10
     LastUpdated:   2026-10-13
     Changes:       v2.0.9 controls the optional Microsoft Update Health service.
                    v2.0.8 adds a verified Medic registry fallback and SIH task controls.
@@ -30,13 +31,15 @@ param(
     [switch]$KeepBITSAvailable,
     [switch]$SkipScheduledTasks,
     [switch]$SkipUpdatePolicy
+,
+    [switch]$Force
 )
 
 Set-StrictMode -Version 2.0
 $ErrorActionPreference = 'Stop'
 
 $ScriptName = '09_Disable_Windows_Update_Services.ps1'
-$ScriptVersion = '2.0.9'
+$ScriptVersion = '2.0.10'
 $RunId = [guid]::NewGuid().Guid
 $StartTime = Get-Date
 $UtcTimestamp = $StartTime.ToUniversalTime().ToString('o')

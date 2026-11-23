@@ -1,9 +1,10 @@
-﻿# Changes v2.3.1 (2026-10-27): retry manual background-update closeout;
+﻿# TechConsoleForcePatch: 1.0.0
+# Changes v2.3.1 (2026-10-27): retry manual background-update closeout;
 # recover service configuration; explicit -Force defers failed pre-reboot
 # closeout to startup without suppressing the single verified-thawed reboot.
 # =====================================================================
 # ScriptName: 07_Force_Reboot_Install_Updates.ps1
-# ScriptVersion: 2.3.1
+# ScriptVersion: 2.3.2
 # LastUpdated: 2026-10-19
 # ChangeLog: v2.3.1 makes -Force one reboot for existing pending work followed by
 #            one verification-only startup check. No update scans/downloads,
@@ -50,7 +51,7 @@ $ErrorActionPreference = 'Stop'
 
 $script:RunStart         = Get-Date
 $script:ScriptName       = '07_Force_Reboot_Install_Updates.ps1'
-$script:ScriptVersion    = '2.3.1'
+$script:ScriptVersion    = '2.3.2'
 $script:RunId            = [guid]::NewGuid().ToString()
 $script:Domain           = if ($env:USERDNSDOMAIN) { $env:USERDNSDOMAIN } else { $env:USERDOMAIN }
 $script:TelemetryPath    = Join-Path $LogDirectory 'Maintenance-Telemetry.ndjson'

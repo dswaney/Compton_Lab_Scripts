@@ -2,91 +2,91 @@
   "SchemaVersion": 1,
   "ManifestVersion": "3.0.23",
   "PackageVersion": "3.0.23",
-  "GeneratedUtc": "2026-11-02T19:16:05Z",
+  "GeneratedUtc": "2026-11-23T21:29:15Z",
   "Files": [
     {
       "Name": "00_Update-Scripts-FromShare.ps1",
       "Role": "Updater",
-      "Version": "4.12.3",
-      "SHA256": "E5459AFB7D44B3CE07C0742A400BD144CF93FC33AA59490A441F6E43A7B375FD"
+      "Version": "4.12.7",
+      "SHA256": "BFFC95771736957920D4EE8427AFFC26FAFB17BAB8D7BC4EC9EC3000574FDE65"
     },
     {
       "Name": "01_Enable_Windows_Update_Services.ps1",
       "Role": "ManagedFile",
-      "Version": "2.8.10",
-      "SHA256": "096BDF2223D93D5D01F29411C41FD01B5B4236BEE3CC824D7F49D46868D76379"
+      "Version": "2.8.11",
+      "SHA256": "54F5C2F6DEDBD19B06B88B629B6F6DBD9CAF2CEB57B2CF7DB6603781B824EBE1"
     },
     {
       "Name": "02_Remove_User_Profiles.ps1",
       "Role": "ManagedFile",
-      "Version": "2.5.24",
-      "SHA256": "97462839559F091EA11F781B6B6CB92EEE12935ACE94C9FD75DA605AF0F24EDA"
+      "Version": "2.5.26",
+      "SHA256": "4F0C636089BCB08D6E810D72B89C36737FF3CD474D51538F08EFFCDD286884D7"
     },
     {
       "Name": "03_Weekend_Apps_Update.ps1",
       "Role": "ManagedFile",
-      "Version": "2.3.1",
-      "SHA256": "366183C1BAD25F8B25D8A623A45C567EF0F838744BC2AC84EB26E36A7463DA48"
+      "Version": "2.3.5",
+      "SHA256": "A269AA8D23C6979D3DE1D2188C0E3BEC9F1B9944BD20EE296D35D12B2BDA5210"
     },
     {
       "Name": "04_Sunday_Lab_Application_Maintenance.ps1",
       "Role": "MaintenanceScript",
-      "Version": "1.19.15",
-      "SHA256": "A04115F1F37C80F32E828C8F4B7DDFF5ABBACC9FCC8A631C1E0979EE944E830E"
+      "Version": "1.19.25",
+      "SHA256": "F9432C685F4393A8D4EE857489BD7FED78A945BA1AC69EBF20AD6E8441A01068"
     },
     {
       "Name": "05_Weekend_HP_Drivers_Update.ps1",
       "Role": "ManagedFile",
-      "Version": "3.4.3",
-      "SHA256": "AB7DDF5AFF20A8C83B0C1BF14767D17A2ACE1AF6B1205B31005AC89DB110F449"
+      "Version": "3.4.5",
+      "SHA256": "2F2DF132AEFD974EA6049F55ADFE835C42DBB39A28F1559409A032AE8EA3A3F9"
     },
     {
       "Name": "06_Weekend_Windows_Updates.ps1",
       "Role": "ManagedFile",
-      "Version": "2.1.14",
-      "SHA256": "8E3CE9A61B3EEB90A6E4FC3B76E515E5B33C7515BF03193B5575F3E308BAEDD7"
+      "Version": "2.1.15",
+      "SHA256": "B99B111413B1CC37E1D62BFE4831178681A5C572CC3F52B6E6E9CCDBA2910FC1"
     },
     {
       "Name": "07_Force_Reboot_Install_Updates.ps1",
       "Role": "ManagedFile",
-      "Version": "2.3.1",
-      "SHA256": "48A1CE608236264D02F5812550CE13D40C847615D108D147C335D0A3DAFA5B3F"
+      "Version": "2.3.2",
+      "SHA256": "BC581B9AED48FA5D234D0985BD6178E2FB1BFA8D6878D507D4DE11F20013F097"
     },
     {
       "Name": "08_System_Repair.ps1",
       "Role": "ManagedFile",
-      "Version": "4.14.0",
-      "SHA256": "F4FB0BBDEE5437DF30ECB6079D318273F003FA3C65D2B1E3F4B893AEBB892E2A"
+      "Version": "4.14.2",
+      "SHA256": "1CC1D32DDE250E4E52D9CD5DA7431E1FE9286A67869B83145F2794D9D4BEF7F6"
     },
     {
       "Name": "09_Disable_Windows_Update_Services.ps1",
       "Role": "ManagedFile",
-      "Version": "2.0.9",
-      "SHA256": "EF87737B620259BBCBD3A73526A567027BC00223C6EA6F133808B5C6A1AC42DA"
+      "Version": "2.0.10",
+      "SHA256": "0D8CD821E88BE5B464BECBFFF6C97D530E9931252B824BE6295BEC67C60F2E10"
     },
     {
       "Name": "10_Sync_System_Time.ps1",
       "Role": "ManagedFile",
-      "Version": "2.0.11",
-      "SHA256": "68E32D5BBE3CB67B37FD74D0D8CFB1B42299E9E00104DFA112FBD12C3182AE7F"
+      "Version": "2.0.12",
+      "SHA256": "FADED8D94F304D88965D3E2E7ACD0F1B0B69D37F5D68C784549075C0F715007B"
     },
     {
       "Name": "14_Endpoint_Health_Inventory.ps1",
       "Role": "ManagedFile",
-      "Version": "1.12.4",
-      "SHA256": "40C55307AC1CB6686F66064B2F8AC592A92612745A1B24DBCD5609981386817A"
+      "Version": "1.15.1",
+      "SHA256": "9DD97919CAE347CE669BDE48983404923F477919A341E3F2F99BC5A0DFC8884B"
     },
     {
       "Name": "15_Sunday_Update_Closeout.ps1",
       "Role": "MaintenanceScript",
-      "Version": "1.1.7",
-      "SHA256": "37EEB7955EC8CE8F432956207A267D705EFE0D2879F47A1AB60A0E715CFF2D0A"
+      "Version": "1.1.8",
+      "SHA256": "82F860A8DAB0C66725EF7129B39D256E41B6153DC76280F04F142F1F79ECC98B"
     },
     {
       "Name": "16_Check_Deep_Freeze_Status.ps1",
       "Role": "ManagedFile",
-      "Version": "1.3.0",
-      "SHA256": "4524322F96F027DE15790E95EDE260E8E11F0D04E2D1A7881617F3C0CA1A4F88"
+      "Version": "1.3.1",
+      "SHA256": "342FA1692E4F80F0C6C253F9D50B39E16868301ED93015533FD06B3F8FDE0CFE"
     },
     {
       "Name": "Get-MaintenanceFleetStatus.ps1",
@@ -97,8 +97,8 @@
     {
       "Name": "Invoke-MaintenanceScript.ps1",
       "Role": "Launcher",
-      "Version": "2.3.2",
-      "SHA256": "07A0E469712FEBDBEF97E4C55898D73AFC9E15B40739DC9DBB3264BD329D2515"
+      "Version": "2.3.3",
+      "SHA256": "80CF2D3C0A0E9C093BEBC5EEE7241A428BE05ADE09CDEC9C53A9A9EB785EB2AB"
     },
     {
       "Name": "Maintenance.Copilot.psm1",
@@ -139,8 +139,8 @@
     {
       "Name": "Register-Tasks_SYSTEM.ps1",
       "Role": "TaskRegistration",
-      "Version": "4.14.0",
-      "SHA256": "D57F00FA80A9F42BCDE19BD1E1BC9C5DA446BDC3A69B336151F1B30725D0D6F5"
+      "Version": "4.14.2",
+      "SHA256": "4D174679E415BA8CBA453E7FFFBA3C6B2DEB0E3576AA3F7B7F27D60E6679D2ED"
     },
     {
       "Name": "Watch-RebootRecovery.ps1",

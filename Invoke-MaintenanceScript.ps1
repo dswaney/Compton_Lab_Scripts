@@ -1,8 +1,9 @@
-﻿#requires -Version 5.1
+﻿# TechConsoleForcePatch: 1.0.0
+#requires -Version 5.1
 #requires -RunAsAdministrator
 # =====================================================================
 # ScriptName:    Invoke-MaintenanceScript.ps1
-# ScriptVersion: 2.3.2
+# ScriptVersion: 2.3.3
 # LastUpdated:   2026-10-15
 # Changes:       v2.3.2 aligns runtime version with the fixed-action launcher release.
 #                v2.3.1 separates internal correlation state from the validated input parameter.
@@ -70,6 +71,8 @@ param(
 
     [ValidateRange(1, 5)]
     [int]$AttemptNumber = 1
+,
+    [switch]$Force
 )
 
 Set-StrictMode -Version 2.0
@@ -77,7 +80,7 @@ $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 
 $script:ScriptName = 'Invoke-MaintenanceScript.ps1'
-$script:ScriptVersion = '2.3.2'
+$script:ScriptVersion = '2.3.3'
 $script:Root = 'C:\Scripts'
 $script:LogRoot = 'C:\Logs'
 $script:RunId = [guid]::NewGuid().Guid
@@ -321,6 +324,14 @@ function Get-ChildArguments {
         throw 'FindingFingerprint can be supplied only for an allowlisted remediation action.'
     }
 
+    if ($Force) {
+        $forceTokens=$null;$forceErrors=$null
+        $forceAst=[Management.Automation.Language.Parser]::ParseFile($TargetPath,[ref]$forceTokens,[ref]$forceErrors)
+        if ($forceErrors.Count -or -not @($forceAst.ParamBlock.Parameters | Where-Object {$_.Name.VariablePath.UserPath -ieq 'Force'}).Count) {
+            throw 'Manual Force requires the updated target script with an explicit Force parameter.'
+        }
+        $arguments.Add('-Force') | Out-Null
+    }
     return [string[]]$arguments.ToArray()
 }
 
@@ -371,9 +382,10 @@ try {
         }
     }
 
+    if ($Force) { Write-LauncherLog 'Manual Force requested: calendar gates bypassed; dependency checks, execution locks and child-specific protections remain.' 'WARN' }
     $windowPolicyName = if ($ActionId -eq 'EndpointHealthInventoryPeriodic') { 'EndpointHealthInventory.Periodic' } else { $script:TargetScriptName }
     $window = Test-MaintenanceWindow -ScriptName $windowPolicyName -Policy $policy
-    if (-not $window.Allowed) {
+    if (-not $Force -and -not $window.Allowed) {
         $script:Status = 'OutsideMaintenanceWindow'
         $script:ExitCode = 20
         Write-LauncherLog $window.Reason 'WARN'
@@ -406,7 +418,7 @@ try {
     }
     # A wait for either mutex must not carry execution past the approved window.
     $window = Test-MaintenanceWindow -ScriptName $windowPolicyName -Policy $policy
-    if (-not $window.Allowed) {
+    if (-not $Force -and -not $window.Allowed) {
         $script:Status = 'OutsideMaintenanceWindow'
         $script:ExitCode = 20
         Write-LauncherLog $window.Reason 'WARN'
@@ -414,8 +426,30 @@ try {
     }
 
     $powerShellExe = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
-    & $powerShellExe @childArguments
-    $script:ExitCode = [int]$LASTEXITCODE
+    if ($Force) {
+        $liveRoot=Join-Path $env:ProgramData 'Compton\TechConsole\LiveLogs'
+        if (-not (Test-Path -LiteralPath $liveRoot)) { New-Item -Path $liveRoot -ItemType Directory -Force | Out-Null }
+        $acl=New-Object Security.AccessControl.DirectorySecurity
+        $acl.SetAccessRuleProtection($true,$false)
+        foreach($sid in @('S-1-5-18','S-1-5-32-544')) {
+            $identity=New-Object Security.Principal.SecurityIdentifier($sid)
+            $rule=New-Object Security.AccessControl.FileSystemAccessRule($identity,'FullControl','ContainerInherit,ObjectInherit','None','Allow')
+            $acl.AddAccessRule($rule)
+        }
+        Set-Acl -LiteralPath $liveRoot -AclObject $acl -ErrorAction Stop
+        Get-ChildItem -LiteralPath $liveRoot -Filter '*-TechConsole-*.log' -File -ErrorAction SilentlyContinue | Where-Object {$_.LastWriteTime -lt (Get-Date).AddDays(-14)} | Remove-Item -Force -ErrorAction SilentlyContinue
+        $livePrefix=Join-Path $liveRoot ('{0}-TechConsole-{1}-{2}' -f $env:COMPUTERNAME,$ActionId,$script:RunId)
+        $stdout=$livePrefix+'.stdout.log';$stderr=$livePrefix+'.stderr.log'
+        Write-LauncherLog ('Live stdout: '+$stdout+'; stderr: '+$stderr) 'INFO'
+        # Fixed allowlisted arguments only; -File paths cannot contain quotes.
+        $quotedArguments=@($childArguments | ForEach-Object { '"'+([string]$_)+'"' }) -join ' '
+        $process=Start-Process -FilePath $powerShellExe -ArgumentList $quotedArguments -RedirectStandardOutput $stdout -RedirectStandardError $stderr -PassThru -WindowStyle Hidden
+        try { $process.WaitForExit();$process.Refresh();$script:ExitCode=[int]$process.ExitCode }
+        finally { $process.Dispose() }
+    } else {
+        & $powerShellExe @childArguments
+        $script:ExitCode = [int]$LASTEXITCODE
+    }
     $script:Status = switch ($script:ExitCode) {
         0    { 'Success' }
         1    { 'SuccessWithWarnings' }
@@ -460,6 +494,7 @@ finally {
         TargetScriptName  = $script:TargetScriptName
         FindingFingerprint = if ($FindingFingerprint) { $FindingFingerprint.ToLowerInvariant() } else { $null }
         AttemptNumber     = if ($actionCatalog.ContainsKey($ActionId) -and [string]$actionCatalog[$ActionId].Kind -eq 'Remediation') { $AttemptNumber } else { $null }
+        ForceRequested    = [bool]$Force
         LegacyInvocation  = $script:LegacyInvocation
         RunId             = $script:RunId
         CorrelationId     = $script:RunCorrelationId
@@ -504,3 +539,4 @@ finally {
 }
 
 exit $script:ExitCode
+

@@ -1,33 +1,14 @@
 {
   "PackageVersion": "3.0.23",
-  "BaseCommit": "1f4dccee52d4e40a036cc7e84cd26cb7c71cdc5e",
+  "BaseCommit": "5534388c9f95f0455d0422e0dfbbfe47c9a8d80e",
   "PowerShellParserExecuted": true,
-  "PowerShellParserVersion": "7.5.3 (Linux; parsing only)",
-  "PowerShellFilesParsed": 41,
+  "PowerShellParserVersion": "7.6.9 (Linux; parsing only)",
+  "PowerShellFilesParsed": 49,
   "PowerShellParserErrors": 0,
-  "RequiresWindowsPowerShellValidation": true,
-  "StructuralChecks": [
-    "All 41 active/support PowerShell files parsed without execution",
-    "Manifest hashes recomputed for final public files; updater and builder catalogs preserve component-store repair helper",
-    "Both closeout task action checks and existing Edge remediation-specific lock retained",
-    "Public configured DFC password and Elastic enrollment token removed, including embedded technician bundle; component hashes rebuilt",
-    "JSON and embedded bundle integrity checked; SHA256 inventory regenerated",
-    "Unchanged same-version scripts retained; no firmware rollout or Sunday timetable change"
-  ],
-  "OfflineTests": {
-    "RepairScreen": "16 assertions passed on PowerShell 7.5.3 Linux using in-memory registry backend",
-    "Watchdog": "18 pure helper assertions passed; subsequent native process test cannot run because it expects Windows powershell.exe. Full test suite not passed.",
-    "LiveWindowsOperationsExecuted": false
-  },
+  "ManifestHashesVerified": true,
+  "LiveWindowsOperationsExecuted": false,
   "PendingValidation": [
-    "Windows PowerShell 5.1 parser and SYSTEM endpoint pilot",
-    "Live DFC/share ACLs/reboot/refreeze/display restoration validation",
-    "Private production configuration and reviewed production watchdog hash pins",
-    "Missing Configure-RecoveryShare.py is not part of supplied archive"
-  ],
-  "KnownLimitations": [
-    "Script05 still uses recommendation disappearance as install verification",
-    "Script14 built-in task filtering and historical recovered-service classification remain follow-up work",
-    "Script15 direct-child locking and ordinary Script07 servicing-only persistence remain follow-up work"
+    "Windows PowerShell 5.1 SYSTEM task and reboot pilot",
+    "Site configuration and reviewed watchdog hashes before deployment"
   ]
 }

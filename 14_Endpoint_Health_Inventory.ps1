@@ -1,4 +1,5 @@
-﻿#requires -Version 5.1
+﻿# TechConsoleForcePatch: 1.0.0
+#requires -Version 5.1
 #requires -RunAsAdministrator
 <#
 .SYNOPSIS
@@ -55,12 +56,19 @@
 
 .NOTES
     ScriptName:    14_Endpoint_Health_Inventory.ps1
-    ScriptVersion: 1.12.4
+    ScriptVersion: 1.15.1
     Audit scope:   Registry Success / service SetValue auditing applies only to SSC* hosts.
                    Requires Administrator/SYSTEM and a thawed system for persistence.
                    Elastic System/Security event collection must be configured separately.
-    LastUpdated:   2026-11-02
-    Changes:       v1.12.4 includes pending rename paths, operation types and reboot evidence in finding details; existing warning severity is preserved.
+    LastUpdated:   2026-11-10
+    Changes:       v1.15.1 inventories Firefox update-channel evidence for automatic software catalog matching.
+    Previous:      v1.15.0 combines v1.13.5 collector/task fixes with seven-day crash diagnostics and publishes crash incidents/checkpoints after normal collection.
+    Previous:      v1.13.5 publishes bounded collector exception, source-line and stack evidence in findings and collector telemetry.
+    Previous:      v1.13.4 suppresses WinSAT inactivity findings while preserving actual failed executions.
+    Previous:      v1.13.3 suppresses expected Sunday/on-demand task inactivity while retaining actual execution failures.
+    Previous:      v1.13.2 excludes school-unused AppListBackup tasks from health findings while retaining inventory evidence.
+    Previous:      v1.13.0 adds read-only console logon observations and local/share script version and SHA-256 comparison.
+    Previous:      v1.12.4 includes pending rename paths, operation types and reboot evidence in finding details; existing warning severity is preserved.
     Previous:      v1.12.1 suppresses historical Sunday-only task findings outside the current run day.
     Previous:      v1.12.0 adds full-inventory per-path storage evidence and Installer package/duplicate telemetry.
     Previous:      v1.11.1 accepts active virtual adapters; inconclusive/no-link inventory is Warning with evidence, not Critical.
@@ -302,13 +310,15 @@ param(
     [string]$HpBiosConfigShare = '\\SERVER\DeploymentShare\HP_Bios_Config',
 
     [string]$DellCommandConfigureShare = '\\SERVER\DeploymentShare\Dell\Command Configure'
+,
+    [switch]$Force
 )
 
 Set-StrictMode -Version 2.0
 $ErrorActionPreference = 'Stop'
 
 $script:ScriptName       = '14_Endpoint_Health_Inventory.ps1'
-$script:ScriptVersion    = '1.12.4'
+$script:ScriptVersion    = '1.15.1'
 $script:RunId            = [guid]::NewGuid().Guid
 $script:StartTime        = Get-Date
 # One per-script mutex also protects direct/manual runs from overlapping the scheduled run.
@@ -323,6 +333,8 @@ $script:InventoryRefreshSections = [ordered]@{}
 $script:StorageEvidenceRecords = New-Object 'System.Collections.Generic.List[object]'
 $script:PendingSystemErrors = [object[]]@()
 $script:PendingErrorReportingState = $null
+$script:PendingCrashIncidents = [object[]]@()
+$script:PendingCrashCheckpoint = $null
 $script:WeeklyOnlyCollectors = @('UpdateServiceRegistryAuditing','RestrictedWinRM','LocalAutopilotHardwareHash',
     'BIOSSettingsInventory','BIOSUpdateEvidence','VendorWarranty','HardwareInventory','DriverCurrency','BiosCurrency','InstalledSoftware')
 $script:WarningCount     = 0
@@ -631,6 +643,52 @@ function Add-Finding {
     })
 }
 
+function Get-CollectorFailureDetails {
+    param(
+        [Parameter(Mandatory)][string]$Name,
+        [Parameter(Mandatory)][System.Management.Automation.ErrorRecord]$Record
+    )
+    # Strings only: never serialize the live ErrorRecord, TargetObject, bound
+    # parameters or invocation arguments. Bound diagnostic sizes per failure.
+    $truncatedFields = New-Object System.Collections.Generic.List[string]
+    $limitText = {
+        param([string]$Field, [AllowNull()]$Text, [int]$Limit)
+        $value = [string]$Text
+        if ($value.Length -gt $Limit) {
+            $truncatedFields.Add($Field) | Out-Null
+            return $value.Substring(0,$Limit) + ' [truncated]'
+        }
+        return $value
+    }
+    $invocation = $Record.InvocationInfo
+    $exception = $Record.Exception
+    $baseException = $exception.GetBaseException()
+    $details = [ordered]@{
+        CollectorName = $Name
+        ScriptName = $script:ScriptName
+        ScriptVersion = $script:ScriptVersion
+        RunId = $script:RunId
+        CollectionMode = if ($InventoryOnly) { 'InventoryOnly' } else { 'Full' }
+        ExceptionType = $exception.GetType().FullName
+        ExceptionMessage = & $limitText 'ExceptionMessage' $exception.Message 2048
+        HResult = '0x{0:X8}' -f $exception.HResult
+        BaseExceptionType = $baseException.GetType().FullName
+        BaseExceptionMessage = & $limitText 'BaseExceptionMessage' $baseException.Message 2048
+        FullyQualifiedErrorId = & $limitText 'FullyQualifiedErrorId' $Record.FullyQualifiedErrorId 1024
+        Category = [string]$Record.CategoryInfo.Category
+        ScriptPath = if ($invocation) { & $limitText 'ScriptPath' $invocation.ScriptName 1024 } else { $null }
+        ScriptLineNumber = if ($invocation) { $invocation.ScriptLineNumber } else { $null }
+        OffsetInLine = if ($invocation) { $invocation.OffsetInLine } else { $null }
+        SourceLine = if ($invocation) { & $limitText 'SourceLine' $invocation.Line 2048 } else { $null }
+        PositionMessage = if ($invocation) { & $limitText 'PositionMessage' $invocation.PositionMessage 2048 } else { $null }
+        ScriptStackTrace = & $limitText 'ScriptStackTrace' $Record.ScriptStackTrace 4096
+        ExceptionText = & $limitText 'ExceptionText' ($exception.ToString()) 8192
+    }
+    $details['TruncatedFields'] = [string[]]$truncatedFields.ToArray()
+    return [pscustomobject]$details
+}
+
+
 function Invoke-Collector {
     param(
         [Parameter(Mandatory)][string]$Name,
@@ -677,11 +735,22 @@ function Invoke-Collector {
         Write-CollectorProgress -Level 'SUCCESS' -Message ("Completed collector: {0}; DurationSeconds={1}" -f $Name, $durationSeconds)
         return $data
     } catch {
-        $message = $_.Exception.Message
+        $failureRecord = $_
+        $message = $failureRecord.Exception.Message
+        $failureDetails = $null
+        try { $failureDetails = Get-CollectorFailureDetails -Name $Name -Record $failureRecord }
+        catch {
+            # Diagnostic enrichment must never prevent the original failure report.
+            $failureDetails = [pscustomobject]@{
+                CollectorName=$Name; ExceptionMessage=$message
+                DiagnosticCaptureError=$_.Exception.Message
+            }
+        }
         $durationSeconds = [math]::Round(((Get-Date) - $started).TotalSeconds, 3)
         Write-Log -Level 'ERROR' -Message ("Collector '{0}' failed: {1}" -f $Name, $message)
         Write-CollectorProgress -Level 'ERROR' -Message ("Collector failed: {0}; DurationSeconds={1}; Error={2}" -f $Name, $durationSeconds, $message)
-        Add-Finding -Severity 'Warning' -Category 'Collection' -Check $Name -Message $message
+        Write-Log -Level 'ERROR' -Message ('COLLECTOR_FAILURE_DETAILS|' + ($failureDetails | ConvertTo-Json -Depth 4 -Compress))
+        Add-Finding -Severity 'Warning' -Category 'Collection' -Check $Name -Message $message -Details $failureDetails
         $script:CollectorResults.Add([pscustomobject]@{
             Name            = $Name
             Status          = 'Failed'
@@ -689,6 +758,7 @@ function Invoke-Collector {
             EndTime         = (Get-Date).ToUniversalTime().ToString('o')
             DurationSeconds = $durationSeconds
             Error           = $message
+            ErrorDetails    = $failureDetails
         })
         return $null
     }
@@ -1121,6 +1191,42 @@ function Test-ComptonStale365UninstallEntry {
         [string]$nameProperty.Value -match '^(?i)(?:O365ProPlusRetail|O365BusinessRetail)(?:\s+-\s+[a-z]{2,3}-[a-z]{2,3})?$')
 }
 
+function Get-FirefoxChannelEvidence {
+    param($Package)
+    $result = [ordered]@{ UpdateChannel='unknown'; UpdateChannelSource=$null }
+    if ($Package.Name -notmatch '^Mozilla Firefox(?: ESR)?(?:\s|$)' -or $Package.Publisher -ne 'Mozilla') {
+        return [pscustomobject]$result
+    }
+    $roots = @()
+    if (-not [string]::IsNullOrWhiteSpace($Package.InstallLocation)) {
+        $roots = @($Package.InstallLocation.Trim().Trim('"'))
+    } else {
+        # Fallback only to the matching architecture and installed version.
+        $programRoot = if ($Package.Architecture -eq 'x86') { ${env:ProgramFiles(x86)} } else { $env:ProgramW6432 }
+        if (-not $programRoot -and $Package.Architecture -eq 'x64') { $programRoot = $env:ProgramFiles }
+        if ($programRoot) {
+            $candidate = Join-Path $programRoot 'Mozilla Firefox'
+            try {
+                $ini = Get-Content -LiteralPath (Join-Path $candidate 'application.ini') -Raw -ErrorAction Stop
+                $versionMatch = [regex]::Match($ini, '(?m)^Version\s*=\s*([^\r\n]+)')
+                if ($versionMatch.Success -and $versionMatch.Groups[1].Value.Trim() -eq $Package.Version) { $roots = @($candidate) }
+            } catch { }
+        }
+    }
+    foreach ($root in $roots) {
+        try {
+            $path = Join-Path $root 'defaults\pref\channel-prefs.js'
+            $text = Get-Content -LiteralPath $path -Raw -ErrorAction Stop
+            $matches = [regex]::Matches($text, '(?m)^\s*pref\(\s*["'']app\.update\.channel["'']\s*,\s*["'']([a-zA-Z0-9_-]+)["'']\s*\)\s*;')
+            if ($matches.Count -eq 1) {
+                $result.UpdateChannel = $matches[0].Groups[1].Value.ToLowerInvariant()
+                $result.UpdateChannelSource = $path
+            }
+        } catch { }
+    }
+    return [pscustomobject]$result
+}
+
 function Get-InstalledSoftwareInventory {
     [CmdletBinding()]
     param(
@@ -1242,6 +1348,12 @@ function Get-InstalledSoftwareInventory {
                 RegistryPath     = [string](Get-ObjectPropertyValueSafe -InputObject $entry -Name 'PSPath')
                 HelpLink         = [string](Get-ObjectPropertyValueSafe -InputObject $entry -Name 'HelpLink')
                 AboutUrl         = [string](Get-ObjectPropertyValueSafe -InputObject $entry -Name 'URLInfoAbout')
+            }
+
+            if ($package.Name -match '^Mozilla Firefox(?: ESR)?(?:\s|$)' -and $package.Publisher -eq 'Mozilla') {
+                $channelEvidence = Get-FirefoxChannelEvidence -Package $package
+                $package | Add-Member -NotePropertyName UpdateChannel -NotePropertyValue $channelEvidence.UpdateChannel
+                $package | Add-Member -NotePropertyName UpdateChannelSource -NotePropertyValue $channelEvidence.UpdateChannelSource
             }
 
             if (-not $packageById.ContainsKey($softwareId)) {
@@ -4190,7 +4302,7 @@ function Get-MaintenanceScheduledTaskHealth {
         # Mixed/daily/unknown schedules retain the existing health assessment.
         $actionText = (@($task.Actions | ForEach-Object { & $getActionDescription $_ }) -join ' ')
         $ownedTask = $task.TaskPath -match '(?i)Compton' -or $task.TaskName -match '(?i)Compton' -or $actionText -match '(?i)C:\\Scripts\\'
-        $triggers = @($task.Triggers)
+        $triggers = @($task.Triggers | Where-Object { $null -ne $_ })
         $sundayOnly = $ownedTask -and $triggers.Count -gt 0
         foreach ($trigger in $triggers) {
             $triggerClass = Get-ObjectPropertyValueSafe -InputObject $trigger -Name 'CimClass'
@@ -4200,6 +4312,11 @@ function Get-MaintenanceScheduledTaskHealth {
                 $sundayOnly = $false
             }
         }
+        $rawUnhealthy = $unhealthy
+        $onDemandOnly = $ownedTask -and $triggers.Count -eq 0
+        # 0x41301/0x41303 are scheduler statuses, not failed executions.
+        $executionFailed = $null -ne $lastRun -and $null -ne $resultCode -and
+            $resultCode -notin @(0,267009,267011)
         $suppressed = $false
         $assessmentReason = 'NormalScheduleAssessment'
         if ($sundayOnly) {
@@ -4228,7 +4345,31 @@ function Get-MaintenanceScheduledTaskHealth {
                 $assessmentReason='HistoricalSundayResultOutsideRunDay'
             }
         }
-        $rawUnhealthy = $unhealthy
+        # A confirmed failed execution remains actionable on any day.
+        # Triggerless owned tasks have no expected run interval; do not age them.
+        if ($executionFailed) {
+            $suppressed = $false
+            $assessmentReason = 'ActualExecutionFailure'
+        }
+        elseif ($onDemandOnly -and $null -ne $info -and
+            $resultCode -in @(0,267009,267011)) {
+            $suppressed = $true
+            $assessmentReason = 'OnDemandTaskNoScheduledRunExpected'
+        }
+        # WinSAT benchmarking has no school-required freshness interval.
+        # Only suppress inactivity/status results; retain failures and unavailable info.
+        if ($task.TaskPath -ieq '\Microsoft\Windows\Maintenance\' -and
+            $task.TaskName -ieq 'WinSAT' -and $null -ne $info -and
+            $null -ne $resultCode -and $resultCode -in @(0,267009,267011)) {
+            $suppressed = $true
+            $assessmentReason = 'WinSATInactivityNotMonitored'
+        }
+        # School-wide exclusion: Windows app-list backup is not used.
+        # Preserve raw results for inventory; never change the Windows task itself.
+        if ($task.TaskPath -ieq '\Microsoft\Windows\AppListBackup\') {
+            $suppressed = $true
+            $assessmentReason = 'ExcludedAppListBackupNotUsedAtSchool'
+        }
         if ($suppressed) {$unhealthy=$false}
         $row = [pscustomobject]@{
             TaskName=$task.TaskName; TaskPath=$task.TaskPath; State=[string]$task.State; Enabled=$enabled
@@ -4236,7 +4377,7 @@ function Get-MaintenanceScheduledTaskHealth {
             LastTaskResult=$resultCode; LastTaskResultHex=if ($null -ne $resultCode) {'0x{0:X8}' -f $resultCode} else {$null}
             NextRunTime=if ($info -and $info.NextRunTime -and $info.NextRunTime.Year -gt 1999) {$info.NextRunTime.ToUniversalTime().ToString('o')} else {$null}
             MissedRuns=if ($info) {$info.NumberOfMissedRuns} else {$null}; Unhealthy=$unhealthy
-            SundayOnly=$sundayOnly; FindingSuppressed=$suppressed; AssessmentReason=$assessmentReason; RawUnhealthy=$rawUnhealthy
+            SundayOnly=$sundayOnly; OnDemandOnly=$onDemandOnly; ExecutionFailed=$executionFailed; FindingSuppressed=$suppressed; AssessmentReason=$assessmentReason; RawUnhealthy=$rawUnhealthy
             Actions=New-StringArrayForJson -InputObject @($task.Actions | ForEach-Object { & $getActionDescription $_ })
         }
         $rows += $row
@@ -4313,21 +4454,126 @@ function Get-NetworkDiagnosticsHealth {
     return $result
 }
 
+function ConvertTo-CrashEvidenceRecord {
+    param([Parameter(Mandatory)]$Event)
+    $data=[ordered]@{}
+    try {
+        [xml]$xml=$Event.ToXml()
+        foreach($node in @($xml.Event.EventData.Data)) {
+            if($null -ne $node -and $node.Name){$data[[string]$node.Name]=[string]$node.'#text'}
+        }
+    } catch {}
+    $code=0L
+    if($Event.Id -eq 41 -and $data.Contains('BugcheckCode')) {
+        try{$code=[long]$data['BugcheckCode']}catch{}
+    } elseif($Event.Id -eq 1001 -and $data.Contains('param1')) {
+        $match=[regex]::Match([string]$data['param1'],'(?i)0x([0-9a-f]+)')
+        if($match.Success){try{$code=[Convert]::ToInt64($match.Groups[1].Value,16)}catch{}}
+    }
+    $message='';try{$message=([string]$Event.Message -replace '\s+',' ').Trim()}catch{}
+    if($message.Length -gt 2048){$message=$message.Substring(0,2048)}
+    $hex=if($code -gt 0){'0x{0:X8}' -f $code}else{$null}
+    $label=switch($code){239{'CRITICAL_PROCESS_DIED'};340{'UNEXPECTED_STORE_EXCEPTION'};default{$null}}
+    [pscustomobject]@{TimeCreated=$Event.TimeCreated.ToUniversalTime().ToString('o');Id=[int]$Event.Id
+        Provider=[string]$Event.ProviderName;RecordId=[long]$Event.RecordId;Message=$message
+        BugcheckCode=$code;BugcheckHex=$hex;StopName=$label;EventData=$data}
+}
+
+function ConvertTo-CrashIncidents {
+    param([AllowEmptyCollection()][object[]]$Events=@(),[AllowEmptyCollection()][object[]]$Dumps=@())
+    $power=@($Events | Where-Object {$_.Id -eq 41 -and $_.Provider -eq 'Microsoft-Windows-Kernel-Power'})
+    $bugchecks=@($Events | Where-Object {$_.Id -eq 1001 -and $_.Provider -eq 'Microsoft-Windows-WER-SystemErrorReporting'})
+    $shutdowns=@($Events | Where-Object {$_.Id -eq 6008 -and $_.Provider -eq 'EventLog'})
+    $anchors=@($power)
+    foreach($entry in $bugchecks){
+        $near=@($power | Where-Object {[math]::Abs((([datetimeoffset]$_.TimeCreated)-([datetimeoffset]$entry.TimeCreated)).TotalSeconds) -le 180})
+        if(!$near.Count){$anchors+=@($entry)}
+    }
+    foreach($entry in $shutdowns){
+        $near=@($anchors | Where-Object {[math]::Abs((([datetimeoffset]$_.TimeCreated)-([datetimeoffset]$entry.TimeCreated)).TotalSeconds) -le 90})
+        if(!$near.Count){$anchors+=@($entry)}
+    }
+    foreach($anchor in @($anchors | Sort-Object TimeCreated -Descending)){
+        $when=[datetimeoffset]$anchor.TimeCreated
+        $near=@($Events | Where-Object {[math]::Abs((([datetimeoffset]$_.TimeCreated)-$when).TotalSeconds) -le 180} | Sort-Object TimeCreated)
+        $bug=$anchor
+        if($bug.BugcheckCode -eq 0){$candidate=@($near | Where-Object {$_.Id -eq 1001 -and $_.BugcheckCode -gt 0} | Select-Object -First 1);if($candidate.Count){$bug=$candidate[0]}}
+        $confirmed=($anchor.Id -eq 1001 -or $bug.BugcheckCode -gt 0)
+        $failed=@($near | Where-Object {$_.Provider -eq 'volmgr' -and $_.Id -eq 161})
+        $matchingDumps=@($Dumps | Where-Object {[math]::Abs((([datetimeoffset]$_.LastWriteTimeUtc)-$when).TotalMinutes) -le 15})
+        $fingerprint=New-StableFingerprint -Namespace 'endpoint.crash' -Components @($env:COMPUTERNAME,$anchor.Provider,[string]$anchor.RecordId,$anchor.TimeCreated)
+        [pscustomobject]@{Fingerprint=$fingerprint;DetectedAt=$anchor.TimeCreated;TimeMeaning='Event recording time, usually after reboot; see event details for shutdown time'
+            ConfirmedCrash=$confirmed;Kind=$(if($confirmed){'Bugcheck'}else{'UnexpectedRestart'})
+            Severity=$(if($confirmed -or $failed.Count -gt 0 -or $anchors.Count -ge 2){'Critical'}else{'Warning'})
+            BugcheckCode=$bug.BugcheckCode;BugcheckHex=$bug.BugcheckHex;StopName=$bug.StopName
+            AnchorRecordId=$anchor.RecordId;DumpCreationFailed=($failed.Count -gt 0)
+            DumpEvidenceStatus=$(if($failed.Count){'WriteFailed'}elseif($matchingDumps.Count){'FileNearEventTime_NotDebuggerVerified'}else{'NoMatchingFileObserved'})
+            NearbyDumpFiles=[object[]]$matchingDumps;RelatedEvents=[object[]]$near
+            Correlation='Related events are within three minutes; proximity does not establish cause'}
+    }
+}
+
 function Get-CrashDiagnosticsHealth {
-    $start=(Get-Date).AddHours(-$EventLookbackHours); $events=@()
-    try {$events=@(Get-WinEvent -FilterHashtable @{LogName='System';StartTime=$start;Id=41,1001,6008} -ErrorAction Stop | Where-Object {
+    # Independent seven-day window: four-hour refresh must not hide a Sunday crash.
+    $end=(Get-Date).ToUniversalTime();$start=$end.AddDays(-7)
+    $raw=@()
+    try {
+        $raw=@(Get-WinEvent -FilterHashtable @{LogName='System';StartTime=$start;EndTime=$end;Id=41,1001,6008,46,161} -MaxEvents 2001 -ErrorAction Stop)
+    } catch {if($_.FullyQualifiedErrorId -notmatch 'NoMatchingEventsFound'){throw}}
+    $truncated=$raw.Count -gt 2000
+    if($truncated){Add-Finding -Severity Warning -Category Collection -Check CrashEventLimit -Message 'Crash event query exceeded 2000 records; seven-day evidence may be incomplete.'}
+    $events=@($raw | Select-Object -First 2000 | Where-Object {
         ($_.Id -eq 41 -and $_.ProviderName -eq 'Microsoft-Windows-Kernel-Power') -or
         ($_.Id -eq 1001 -and $_.ProviderName -eq 'Microsoft-Windows-WER-SystemErrorReporting') -or
-        ($_.Id -eq 6008 -and $_.ProviderName -eq 'EventLog')
-    } | Sort-Object TimeCreated -Descending | Select-Object -First 100 | ForEach-Object {
-        [pscustomobject]@{TimeCreated=$_.TimeCreated.ToUniversalTime().ToString('o');Id=[int]$_.Id;Provider=[string]$_.ProviderName;Level=[string]$_.LevelDisplayName
-            RecordId=$_.RecordId;Message=if ($_.Message) {($_.Message -replace '\s+',' ').Trim()} else {$null}}
-    })} catch {if ($_.Exception.Message -notmatch 'No events were found') {Write-Log -Level 'WARN' -Message ("Crash diagnostic event query failed: {0}" -f $_.Exception.Message)}}
-    $dumpFiles=@(Get-ChildItem -Path "$env:SystemRoot\Minidump\*.dmp","$env:SystemRoot\MEMORY.DMP" -File -ErrorAction SilentlyContinue | Sort-Object LastWriteTimeUtc -Descending | Select-Object -First 20 | ForEach-Object {
+        ($_.Id -eq 6008 -and $_.ProviderName -eq 'EventLog') -or
+        ($_.Id -in @(46,161) -and $_.ProviderName -eq 'volmgr')
+    } | ForEach-Object {ConvertTo-CrashEvidenceRecord $_})
+    $relatedStatus='Success'
+    try {
+        $related=@(Get-WinEvent -FilterHashtable @{LogName='System';StartTime=$start;EndTime=$end;Level=1,2,3} -MaxEvents 3001 -ErrorAction Stop)
+        if($related.Count -gt 3000){$relatedStatus='Truncated'}
+        $events+=@($related | Select-Object -First 3000 | Where-Object {$_.ProviderName -match 'WHEA|^disk$|stornvme|storahci|storport|Ntfs|^Display$'} | ForEach-Object {ConvertTo-CrashEvidenceRecord $_})
+    }catch{if($_.FullyQualifiedErrorId -notmatch 'NoMatchingEventsFound'){$relatedStatus='Unavailable';Write-Log -Level WARN -Message ('Crash-related event query failed: '+$_.Exception.Message)}}
+    $dumps=@(Get-ChildItem -Path "$env:SystemRoot\Minidump\*.dmp","$env:SystemRoot\MEMORY.DMP","$env:SystemRoot\LiveKernelReports\*\*.dmp" -File -ErrorAction SilentlyContinue |
+        Sort-Object LastWriteTimeUtc -Descending | Select-Object -First 20 | ForEach-Object {
         [pscustomobject]@{Path=$_.FullName;SizeMB=[math]::Round($_.Length/1MB,2);LastWriteTimeUtc=$_.LastWriteTimeUtc.ToString('o')}})
-    if ($events.Count -gt 0) {Add-Finding -Severity 'Warning' -Category 'Reliability' -Check 'UnexpectedShutdowns' -Message ("{0} bugcheck, kernel-power, or unexpected-shutdown event(s) occurred in the last {1} hours." -f $events.Count,$EventLookbackHours) -Value $events.Count -Details $events[0]}
-    else {Add-Finding -Severity 'Healthy' -Category 'Reliability' -Check 'UnexpectedShutdowns' -Message ("No bugcheck or unexpected-shutdown events occurred in the last {0} hours." -f $EventLookbackHours) -Value 0}
-    [pscustomobject]@{EventCount=$events.Count;Events=New-ObjectArrayForJson -InputObject $events;DumpFileCount=$dumpFiles.Count;DumpFiles=New-ObjectArrayForJson -InputObject $dumpFiles}
+    $incidents=@(ConvertTo-CrashIncidents -Events $events -Dumps $dumps)
+    $checkpoint=Join-Path (Split-Path -Parent $ErrorReportingStatePath) 'CrashDiagnostics.checkpoint.json'
+    $seen=@{}
+    if(Test-Path -LiteralPath $checkpoint){
+        try {
+            $state=Get-Content -LiteralPath $checkpoint -Raw -ErrorAction Stop | ConvertFrom-Json
+            if($state.SchemaVersion -eq 1 -and $state.ComputerName -ieq $env:COMPUTERNAME){foreach($row in @($state.Seen)){$seen[[string]$row.Fingerprint]=$true}}
+        }catch{Write-Log -Level WARN -Message 'Crash checkpoint unreadable; evidence may replay with the same stable fingerprint.'}
+    }
+    $new=@($incidents | Where-Object {!$seen.ContainsKey($_.Fingerprint)})
+    $script:PendingCrashIncidents=[object[]]$new
+    $script:PendingCrashCheckpoint=[ordered]@{Path=$checkpoint;State=[ordered]@{SchemaVersion=1;ComputerName=$env:COMPUTERNAME;SavedUtc=$end.ToString('o');Seen=[object[]]@($incidents | Select-Object Fingerprint,DetectedAt)}}
+    $critical=@($incidents | Where-Object Severity -eq 'Critical')
+    if($incidents.Count){
+        $latest=$incidents[0];$severity=if($critical.Count){'Critical'}else{'Warning'}
+        $message='{0} crash/unexpected-restart incident(s) in seven days; {1} new. Latest recorded {2}; stop={3} {4}; dump={5}.' -f $incidents.Count,$new.Count,$latest.DetectedAt,$latest.BugcheckHex,$latest.StopName,$latest.DumpEvidenceStatus
+        Add-Finding -Severity $severity -Category Reliability -Check UnexpectedShutdowns -Message $message -Value $incidents.Count -Details $latest
+    }else{Add-Finding -Severity Healthy -Category Reliability -Check UnexpectedShutdowns -Message 'No crash or unexpected-restart incidents observed in the last seven days.' -Value 0}
+    [pscustomobject]@{EventCount=$events.Count;Events=[object[]]$events;DumpFileCount=$dumps.Count;DumpFiles=[object[]]$dumps
+        LookbackDays=7;IncidentCount=$incidents.Count;ConfirmedCrashCount=@($incidents | Where-Object ConfirmedCrash).Count
+        CriticalIncidentCount=$critical.Count;NewIncidentCount=$new.Count;NewCriticalIncidentCount=@($new | Where-Object Severity -eq 'Critical').Count
+        Incidents=[object[]]$incidents;Truncated=$truncated;RelatedEvidenceStatus=$relatedStatus
+        Deduplication='Local checkpoint after telemetry append; centrally deduplicate endpoint.crash by ComputerName and Fingerprint. Frozen-state replay is possible.'}
+}
+
+function Publish-CrashIncidents {
+    foreach($incident in @($script:PendingCrashIncidents)){
+        $event=[ordered]@{'@timestamp'=(Get-Date).ToUniversalTime().ToString('o');EventType='endpoint.crash';SchemaVersion='1.0'
+            ComputerName=$env:COMPUTERNAME;ScriptName=$script:ScriptName;ScriptVersion=$script:ScriptVersion;RunId=$script:RunId
+            Fingerprint=$incident.Fingerprint;FingerprintVersion='1';FingerprintAlgorithm='SHA256'
+            Severity=$incident.Severity;ObservedAt=(Get-Date).ToUniversalTime().ToString('o');Crash=$incident}
+        Write-MaintenanceTelemetryLine -Path $script:NdjsonPath -JsonLine ($event | ConvertTo-Json -Depth 14 -Compress)
+    }
+    if($null -ne $script:PendingCrashCheckpoint){
+        Ensure-Directory -Path (Split-Path -Parent $script:PendingCrashCheckpoint.Path)
+        Write-JsonAtomically -Path $script:PendingCrashCheckpoint.Path -Json ($script:PendingCrashCheckpoint.State | ConvertTo-Json -Depth 8)
+    }
 }
 
 function Get-BiosCurrencyHealth {
@@ -6115,6 +6361,76 @@ if ($InventoryOnly -and -not $script:InventoryRefreshCache) {
     exit 0
 }
 
+function Get-ConsoleObservation {
+    $result = [ordered]@{ LastSeenUtc=[datetime]::UtcNow.ToString('o'); LastInteractiveUser=$null; LastInteractiveLogonUtc=$null; LogonStatus='Not found in retained Security log'; DeepFreezeState='Unknown' }
+    try {
+        # Filter in the Event Log service rather than reading all Security events.
+        $xpath = "*[System[(EventID=4624)]] and *[EventData[(Data[@Name='LogonType']='2' or Data[@Name='LogonType']='10' or Data[@Name='LogonType']='11') and Data[@Name='TargetUserName']!='SYSTEM' and Data[@Name='TargetUserName']!='ANONYMOUS LOGON']]"
+        $events = @(Get-WinEvent -LogName Security -FilterXPath $xpath -MaxEvents 20 -ErrorAction Stop)
+        foreach ($item in $events) {
+            [xml]$xml = $item.ToXml(); $data = @{}
+            foreach ($node in $xml.Event.EventData.Data) { $data[[string]$node.Name] = [string]$node.'#text' }
+            $user = [string]$data.TargetUserName
+            if ($user -and $user -notmatch '\$$|^(DWM-|UMFD-)') {
+                $result.LastInteractiveUser = "$($data.TargetDomainName)\$user"
+                $result.LastInteractiveLogonUtc = $item.TimeCreated.ToUniversalTime().ToString('o')
+                $result.LogonStatus = 'Security 4624; latest retained interactive logon (types 2, 10, 11)'
+                break
+            }
+        }
+    } catch { $result.LogonStatus = 'Unavailable: ' + $_.Exception.Message }
+    try { $df = Get-SoftwareDeepFreezeInstallationState; if ($df.Installed -eq $false) { $result.DeepFreezeState = 'N/A' } } catch {}
+    # An installed agent alone cannot establish Frozen or UnFrozen state.
+    [pscustomobject]$result
+}
+function Get-ConsoleDirectorySnapshot {
+    param($Storage)
+    $scan = @($Storage.DiskUsageDiagnostics | Where-Object { $_.Drive -eq 'C:' } | Select-Object -First 1)
+    if ($scan.Count -gt 0) { return $scan[0] }
+    $prefix = [IO.Path]::GetFileNameWithoutExtension($script:ScriptName)
+    $path = Join-Path $LogDirectory ($prefix + '.DiskUsage.C.latest.json')
+    if (Test-Path -LiteralPath $path -PathType Leaf) {
+        $cached = Get-Content -LiteralPath $path -Raw -ErrorAction Stop | ConvertFrom-Json
+        if ($cached.ComputerName -eq $env:COMPUTERNAME -and $cached.Drive -eq 'C:') { return $cached }
+    }
+    return $null
+}
+
+function Get-ConsoleScriptInventory {
+    $pattern = '(?im)(?:ScriptVersion\s*[:=]\s*[''"'']?|\$script:ScriptVersion\s*=\s*[''"'']|^\s*#\s*(?:Version|Script Version)\s*[:=]\s*)([0-9]+(?:\.[0-9]+){1,3})'
+    $local = @{}
+    foreach ($file in @(Get-ChildItem -LiteralPath 'C:\Scripts' -File -ErrorAction Stop | Where-Object Extension -in '.ps1','.psm1')) {
+        $text = Get-Content -LiteralPath $file.FullName -Raw -ErrorAction Stop
+        $version = if ($text -match $pattern) { $Matches[1] } else { $null }
+        $local[$file.Name] = @{Version=$version; Hash=(Get-FileHash -LiteralPath $file.FullName -Algorithm SHA256 -ErrorAction Stop).Hash}
+    }
+    $share = @{}; $shareStatus = 'Unavailable'; $job = $null
+    try {
+        $job = Start-Job -ArgumentList $pattern -ScriptBlock {
+            param($pattern)
+            $ErrorActionPreference='Stop'
+            foreach ($file in @(Get-ChildItem -LiteralPath '\\SERVER\DeploymentShare' -File | Where-Object Extension -in '.ps1','.psm1')) {
+                $text = Get-Content -LiteralPath $file.FullName -Raw
+                $version = if ($text -match $pattern) { $Matches[1] } else { $null }
+                [pscustomobject]@{Name=$file.Name;Version=$version;Hash=(Get-FileHash -LiteralPath $file.FullName -Algorithm SHA256).Hash}
+            }
+        }
+        if (Wait-Job -Job $job -Timeout 30) {
+            $rows = @(Receive-Job -Job $job -ErrorAction Stop)
+            if ($job.State -ne 'Completed') { throw 'Share scan failed' }
+            foreach ($row in $rows) { $share[$row.Name]=$row }
+            $shareStatus='Compared'
+        } else { $shareStatus='Share comparison timed out after 30 seconds' }
+    } catch { $shareStatus='Share unavailable: ' + $_.Exception.Message }
+    finally { if ($job) { Stop-Job -Job $job -ErrorAction SilentlyContinue; Remove-Job -Job $job -Force -ErrorAction SilentlyContinue } }
+    $items = @(foreach ($name in @(@($local.Keys)+@($share.Keys) | Sort-Object -Unique)) {
+        $l=$local[$name]; $r=$share[$name]
+        $status=if ($shareStatus -ne 'Compared') { 'Share unavailable' } elseif (-not $l) { 'Missing locally' } elseif (-not $r) { 'Local only' } elseif ($l.Hash -eq $r.Hash) { 'Match' } else { 'Different content' }
+        [pscustomobject]@{Name=$name;LocalVersion=$(if($l){$l.Version}else{$null});ShareVersion=$(if($r){$r.Version}else{$null});LocalSHA256=$(if($l){$l.Hash}else{$null});ShareSHA256=$(if($r){$r.Hash}else{$null});Status=$status}
+    })
+    [pscustomobject]@{ComparedUtc=[datetime]::UtcNow.ToString('o');SharePath='\\SERVER\DeploymentShare';ShareStatus=$shareStatus;Items=[object[]]$items}
+}
+
 $updateServiceAuditing = Invoke-Collector -Name 'UpdateServiceRegistryAuditing' -ScriptBlock { Initialize-UpdateServiceRegistryAuditing }
 $healthBaseline  = Get-OptionalHealthBaseline
 $remoteAccess    = Invoke-Collector -Name 'RestrictedWinRM' -ScriptBlock { Initialize-RestrictedWinRM }
@@ -6154,6 +6470,10 @@ $edge            = Invoke-Collector -Name 'MicrosoftEdge'         -ScriptBlock {
 $softwareInventory = Invoke-Collector -Name 'InstalledSoftware'   -ScriptBlock {
     Get-InstalledSoftwareInventory -PolicyPath $SoftwareInventoryPolicyPath -SnapshotPath $SoftwareInventorySnapshotPath
 }
+
+$consoleDirectorySnapshot = Invoke-Collector -Name 'ConsoleDirectorySnapshot' -ScriptBlock { Get-ConsoleDirectorySnapshot -Storage $storage }
+$consoleObservation = Invoke-Collector -Name 'ConsoleObservation' -ScriptBlock { Get-ConsoleObservation }
+$consoleScriptInventory = Invoke-Collector -Name 'ConsoleScriptInventory' -ScriptBlock { Get-ConsoleScriptInventory }
 
 $summary = Get-HealthSummary
 Write-HealthSnapshotSummary -OperatingSystem $operatingSystem -Performance $performance -Storage $storage `
@@ -6321,6 +6641,9 @@ $event = [ordered]@{
     OperatingSystem = $operatingSystem
     Performance   = $performance
     StorageEvidenceSummary = $storageEvidence
+    ConsoleStorage = [ordered]@{ DiskUsageDiagnostic = $consoleDirectorySnapshot }
+    ConsoleObservation = $consoleObservation
+    ScriptInventory = $consoleScriptInventory
     Storage       = $storage
     DeviceManager = $deviceManager
     Security      = [ordered]@{
@@ -6391,6 +6714,7 @@ try {
         }
     }
     Publish-SelectedSystemErrors
+    Publish-CrashIncidents
     if (-not $InventoryOnly -and $identity) { Save-InventoryRefreshCache -Identity $identity }
 
     Write-Log -Message ("Endpoint snapshot completed. Health={0}; ExitCode={1}; CollectorsFailed={2}; FindingEvents={3}; RemediationCandidateEvents={4}" -f
@@ -6424,3 +6748,4 @@ if ($null -ne $script:LogSession) {
 $script:InventoryMutex.ReleaseMutex()
 $script:InventoryMutex.Dispose()
 exit $exitCode
+

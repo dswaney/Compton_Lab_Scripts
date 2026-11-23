@@ -1,7 +1,13 @@
+# TechConsoleForcePatch: 1.0.0
+# Changes v2.3.5 (2026-11-03): Select tar archive extraction for SYSTEM WinGet
+# runs using the settings path reported by winget --info; merge with backup.
+# Changes v2.3.2 (2026-11-02): Accept source-filtered WinGet tables without a
+# Source column; safely match truncated names by prefix plus installed version;
+# deduplicate IDs and report recognized rows and available-version evidence.
 # Changes v2.3.1 (2026-10-28): Firefox pending-update reporting; shared scheduled
 # task deadline; unlimited manual waits, including name-based installer retries.
-# ScriptVersion: 2.3.1
-# LastUpdated: 2026-10-28
+# ScriptVersion: 2.3.5
+# LastUpdated: 2026-11-03
 # Previous: v2.3.0 adds SYSTEM-aware WinGet preflight, native executable selection,
 #          numeric package version ordering, bounded execution and diagnostic telemetry.
 #          No user alias/PATH edits or automatic App Installer repairs.
@@ -30,6 +36,8 @@ param(
     [switch]$UpdateOffice = $true,
     [int]$OfficeWaitMinutes = 30,
     [string]$LogPath = "$env:SystemDrive\Logs\03_Weekend_Apps_Update.log"
+,
+    [switch]$Force
 )
 
 # Packages deliberately deferred from unattended targeted retries.
@@ -41,7 +49,7 @@ $SpecialHandlingPackageIds = @(
 
 $ErrorActionPreference = 'Stop'
 
-$ScriptVersion = '2.3.1'
+$ScriptVersion = '2.3.5'
 $ScriptName = '03_Weekend_Apps_Update.ps1'
 $ComputerName = $env:COMPUTERNAME
 $ExecutionStart = Get-Date
@@ -57,6 +65,7 @@ $script:WingetPreflightComplete = $false
 $script:WingetPreflight = [ordered]@{ Status='NotRun' }
 $script:WingetInvocations = New-Object System.Collections.Generic.List[object]
 $script:WingetExecutionBlocked = $false
+$script:WingetArchiveSettings = [ordered]@{ Status='NotRun' }
 $ApplicationResults = New-Object System.Collections.Generic.List[object]
 $TelemetryDirectory = Join-Path $env:SystemDrive 'Logs'
 $TelemetryNdjsonPath = Join-Path $TelemetryDirectory 'Maintenance-Telemetry.ndjson'
@@ -326,6 +335,136 @@ function Initialize-WingetPreflight {
     } catch { $script:WingetPreflight.AppInstallerStatus='Unavailable'; $script:WingetPreflight['AppInstallerError']=$_.Exception.Message }
     Write-Log "WinGet preflight: $($script:WingetPreflight.Status); SYSTEM=$($identity.IsSystem); selected=$($script:WingetPreflight.SelectedPath)" 'INFO'
     if ($script:WingetPreflight.Status -ne 'Ready') { throw "WinGet preflight failed: $($script:WingetPreflight.Status). See launch attempts in telemetry." }
+}
+
+# Converts JSON-with-comments/trailing-commas without treating URLs/string contents as comments.
+function ConvertFrom-WingetJsonC {
+    param([Parameter(Mandatory)][AllowEmptyString()][string]$Text)
+    $buffer=New-Object Text.StringBuilder
+    $quoted=$false;$escaped=$false;$lineComment=$false;$blockComment=$false
+    for($i=0;$i -lt $Text.Length;$i++) {
+        $c=$Text[$i];$next=if($i+1 -lt $Text.Length){$Text[$i+1]}else{[char]0}
+        if($lineComment){if($c -eq "`n" -or $c -eq "`r"){$lineComment=$false;[void]$buffer.Append($c)};continue}
+        if($blockComment){if($c -eq '*' -and $next -eq '/'){$blockComment=$false;$i++;[void]$buffer.Append(' ')};continue}
+        if($quoted){
+            [void]$buffer.Append($c)
+            if($escaped){$escaped=$false}elseif($c -eq '\'){$escaped=$true}elseif($c -eq '"'){$quoted=$false}
+            continue
+        }
+        if($c -eq '"'){$quoted=$true;[void]$buffer.Append($c);continue}
+        if($c -eq '/' -and $next -eq '/'){$lineComment=$true;$i++;[void]$buffer.Append(' ');continue}
+        if($c -eq '/' -and $next -eq '*'){$blockComment=$true;$i++;[void]$buffer.Append(' ');continue}
+        [void]$buffer.Append($c)
+    }
+    if($quoted -or $blockComment){throw 'Unterminated JSON string or comment in SYSTEM WinGet settings; original settings left untouched.'}
+    $clean=$buffer.ToString();$buffer=New-Object Text.StringBuilder;$quoted=$false;$escaped=$false
+    for($i=0;$i -lt $clean.Length;$i++) {
+        $c=$clean[$i]
+        if($quoted){[void]$buffer.Append($c);if($escaped){$escaped=$false}elseif($c -eq '\'){$escaped=$true}elseif($c -eq '"'){$quoted=$false};continue}
+        if($c -eq '"'){$quoted=$true}
+        if($c -eq ','){
+            $j=$i+1;while($j -lt $clean.Length -and [char]::IsWhiteSpace($clean[$j])){$j++}
+            if($j -lt $clean.Length -and $clean[$j] -in @('}',']')){continue}
+        }
+        [void]$buffer.Append($c)
+    }
+    $json=$buffer.ToString().Trim()
+    if(-not $json.StartsWith('{') -or -not $json.EndsWith('}')){throw 'SYSTEM WinGet settings must be a JSON object; original settings left untouched.'}
+    try{return ($json | ConvertFrom-Json -ErrorAction Stop)}catch{throw 'Could not parse existing SYSTEM WinGet settings; original settings left untouched.'}
+}
+
+function Merge-WingetTarSettings {
+    param([Parameter(Mandatory)][string]$Text)
+    $settings=ConvertFrom-WingetJsonC -Text $Text
+    $property=$settings.PSObject.Properties['installBehavior']
+    if($property -and $property.Name -cne 'installBehavior'){throw 'Unexpected installBehavior capitalization; original settings left untouched.'}
+    if($property -and $null -ne $property.Value -and $property.Value -isnot [pscustomobject]){throw 'Existing installBehavior is not an object; original settings left untouched.'}
+    if(-not $property){$settings | Add-Member NoteProperty installBehavior ([pscustomobject]@{})}
+    elseif($null -eq $property.Value){$settings.installBehavior=[pscustomobject]@{}}
+    $method=$settings.installBehavior.PSObject.Properties['archiveExtractionMethod']
+    if($method -and $method.Name -cne 'archiveExtractionMethod'){throw 'Unexpected archiveExtractionMethod capitalization; original settings left untouched.'}
+    if($method -and [string]$method.Value -ceq 'tar'){return [pscustomobject]@{Changed=$false;Text=$Text}}
+    $settings.installBehavior | Add-Member NoteProperty archiveExtractionMethod 'tar' -Force
+    return [pscustomobject]@{Changed=$true;Text=($settings | ConvertTo-Json -Depth 64)}
+}
+
+function Resolve-WingetSettingsPath {
+    param([Parameter(Mandatory)][AllowEmptyString()][AllowEmptyCollection()][string[]]$InfoLines)
+    $candidates=@(foreach($line in $InfoLines){
+        if([string]::IsNullOrWhiteSpace($line)){continue}
+        $plain=[regex]::Replace($line,([char]27+'\[[0-?]*[ -/]*[@-~]'),'')
+        foreach($match in [regex]::Matches($plain,'(?i)(?<![A-Z0-9])(?:[A-Z]:[\\/]|%[A-Z_][A-Z0-9_]*%[\\/]).*?[\\/]settings\.json')){
+            $candidate=[Environment]::ExpandEnvironmentVariables($match.Value)
+            if($candidate -match '%[^%]+%'){throw 'WinGet settings path contains an unresolved environment variable.'}
+            [IO.Path]::GetFullPath($candidate)
+        }
+    })
+    $paths=@($candidates | Select-Object -Unique)
+    if($paths.Count -ne 1){throw 'Could not resolve exactly one settings.json path from SYSTEM winget --info; no settings file changed.'}
+    return $paths[0]
+}
+
+function Set-WingetTarSettingsFile {
+    param([Parameter(Mandatory)][string]$Path)
+    $encoding=New-Object Text.UTF8Encoding($false,$true)
+    $existed=Test-Path -LiteralPath $Path -PathType Leaf
+    $before=if($existed){[IO.File]::ReadAllBytes($Path)}else{$null}
+    $text=if($existed){[IO.File]::ReadAllText($Path,$encoding)}else{'{}'}
+    $merged=Merge-WingetTarSettings -Text $text
+    if(-not $merged.Changed){return [pscustomobject]@{Status='AlreadyTar';SettingsPath=$Path;BackupPath=$null;Method='tar'}}
+    $parent=Split-Path -Parent $Path
+    if(-not(Test-Path -LiteralPath $parent)){New-Item -ItemType Directory -Path $parent -Force | Out-Null}
+    $backup=$null
+    if($existed){
+        $backup=$Path+'.before-compton-tar-'+[datetime]::UtcNow.ToString('yyyyMMddTHHmmssfffZ')+'.bak'
+        [IO.File]::WriteAllBytes($backup,$before)
+    }
+    $temporary=Join-Path $parent ('.compton-tar-'+[guid]::NewGuid().ToString('N')+'.tmp')
+    try{
+        [IO.File]::WriteAllText($temporary,$merged.Text,$encoding)
+        # Recheck concurrent changes before atomically replacing settings.
+        if($existed){
+            if(-not(Test-Path -LiteralPath $Path -PathType Leaf) -or [Convert]::ToBase64String([IO.File]::ReadAllBytes($Path)) -cne [Convert]::ToBase64String($before)){throw 'SYSTEM WinGet settings changed during preparation; no replacement made.'}
+            [IO.File]::Replace($temporary,$Path,[System.Management.Automation.Language.NullString]::Value)
+        }else{[IO.File]::Move($temporary,$Path)}
+    }finally{if(Test-Path -LiteralPath $temporary){Remove-Item -LiteralPath $temporary -Force -ErrorAction SilentlyContinue}}
+    return [pscustomobject]@{Status='ConfiguredTar';SettingsPath=$Path;BackupPath=$backup;Method='tar'}
+}
+
+function Test-WingetSystemIdentity {
+    return [Security.Principal.WindowsIdentity]::GetCurrent().IsSystem
+}
+
+function Get-SystemWingetTarPath {
+    if($env:PROCESSOR_ARCHITEW6432){return (Join-Path $env:WINDIR 'Sysnative\tar.exe')}
+    return (Join-Path $env:WINDIR 'System32\tar.exe')
+}
+
+function Initialize-SystemWingetArchiveExtractor {
+    $script:WingetArchiveSettings=[ordered]@{Status='NotRun';Method=$null;SettingsPath=$null;BackupPath=$null;TarPath=$null}
+    if(-not(Test-WingetSystemIdentity)){
+        $script:WingetArchiveSettings.Status='SkippedNonSystem'
+        Write-Log 'WinGet archive settings: non-SYSTEM execution; user settings unchanged.' 'INFO'
+        return
+    }
+    try{
+        $tar=Get-SystemWingetTarPath
+        $script:WingetArchiveSettings.TarPath=$tar
+        if(-not(Test-Path -LiteralPath $tar -PathType Leaf)){throw 'Native Windows tar.exe is missing; SYSTEM WinGet settings unchanged.'}
+        $winget=Get-WingetPath
+        if(-not $winget){throw 'WinGet executable not found; settings unchanged.'}
+        $info=Invoke-WingetNativeProcess -Path $winget -Arguments @('--info','--disable-interactivity') -TimeoutSeconds $WingetPreflightTimeoutSeconds
+        if($info.Status -ne 'Completed' -or $info.ExitCode -ne 0){throw 'SYSTEM winget --info failed; settings unchanged.'}
+        $path=Resolve-WingetSettingsPath -InfoLines @($info.RawOutput)
+        $result=Set-WingetTarSettingsFile -Path $path
+        foreach($key in @('Status','Method','SettingsPath','BackupPath')){$script:WingetArchiveSettings[$key]=$result.$key}
+        Write-Log ('SYSTEM WinGet archive extractor: '+$result.Method+'; '+$result.Status+'; settings='+$path) 'INFO'
+        if($result.BackupPath){Write-Log ('Previous WinGet settings backed up to: '+$result.BackupPath) 'INFO'}
+    }catch{
+        $script:WingetArchiveSettings.Status='Failed'
+        $script:WingetArchiveSettings['Error']=$_.Exception.Message
+        throw
+    }
 }
 
 # Filters out progress bars, separators, and other noisy winget output that does not help with logging or parsing.
@@ -895,33 +1034,86 @@ function Get-WingetVersion { return $script:WingetPreflight.Version }
 
 # Read-only inventory of installed desktop applications. A WinGet list match is
 # evidence of catalog recognition, not a promise of an available update.
+function ConvertFrom-WingetApplicationList {
+    param([AllowEmptyCollection()][string[]]$Lines)
+    $columns = $null
+    $rows = New-Object 'System.Collections.Generic.List[object]'
+    foreach ($line in $Lines) {
+        $raw = [string]$line
+        if ($raw -match '^Name\s+Id\s+Version(?:\s+Available)?(?:\s+Source)?\s*$') {
+            $idAt = $raw.IndexOf('Id', 4)
+            $versionAt = $raw.IndexOf('Version', $idAt + 2)
+            $availableAt = $raw.IndexOf('Available', $versionAt + 7)
+            $sourceAt = $raw.IndexOf('Source', $versionAt + 7)
+            $columns = @{Id=$idAt;Version=$versionAt;Available=$availableAt;Source=$sourceAt}
+            continue
+        }
+        if (-not $columns -or $raw.Length -le $columns.Version -or $raw.Trim() -match '^-{3,}') { continue }
+        $id = $raw.Substring($columns.Id, $columns.Version - $columns.Id).Trim()
+        $name = $raw.Substring(0, $columns.Id).Trim().Trim([char]0)
+        # This parser's caller always uses --source winget. The CLI can omit
+        # its Source column when all rows have the same selected source.
+        $source = 'winget'
+        if ($columns.Source -ge 0) {
+            $source = if ($raw.Length -gt $columns.Source) { $raw.Substring($columns.Source).Trim() } else { '' }
+        }
+        if (-not $name -or $source -ne 'winget' -or $id -notmatch '^[A-Za-z0-9][A-Za-z0-9+_.-]*\.[A-Za-z0-9+_.-]+$') { continue }
+        $versionEnd = $raw.Length
+        foreach ($offset in @($columns.Available, $columns.Source)) {
+            if ($offset -gt $columns.Version -and $offset -lt $versionEnd) { $versionEnd = $offset }
+        }
+        $version = $raw.Substring($columns.Version, $versionEnd - $columns.Version).Trim()
+        $available = $null
+        if ($columns.Available -ge 0 -and $raw.Length -gt $columns.Available) {
+            $availableEnd = if ($columns.Source -gt $columns.Available -and $columns.Source -lt $raw.Length) { $columns.Source } else { $raw.Length }
+            $candidate = $raw.Substring($columns.Available, $availableEnd - $columns.Available).Trim()
+            if ($candidate) { $available = $candidate }
+        }
+        $truncated = $name -match '(?:\u2026|\.\.\.)$'
+        $prefix = if ($truncated) { $name -replace '(?:\u2026|\.\.\.)$', '' } else { $name }
+        $rows.Add([pscustomobject]@{Name=$name;Id=$id;Version=$version;Available=$available;Truncated=$truncated;Prefix=$prefix})
+    }
+    [pscustomobject]@{
+        HeaderRecognized = ($null -ne $columns)
+        Rows = [object[]]$rows.ToArray()
+    }
+}
+
+function Find-WingetApplicationMatch {
+    param([string]$Name, [string]$Version, [AllowEmptyCollection()][object[]]$Rows)
+    $cleanName = $Name.Trim().Trim([char]0).Trim()
+    $matches = @($Rows | Where-Object { -not $_.Truncated -and $_.Name -ieq $cleanName })
+    $method = 'ExactName'
+    if ($matches.Count -eq 0 -and $Version) {
+        $matches = @($Rows | Where-Object {
+            $_.Truncated -and $_.Prefix -and $_.Version -eq $Version -and
+            $cleanName.StartsWith([string]$_.Prefix, [StringComparison]::OrdinalIgnoreCase)
+        })
+        $method = 'TruncatedNameAndVersion'
+    }
+    $ids = @($matches | Select-Object -ExpandProperty Id -Unique)
+    $id = if ($ids.Count -eq 1) { $ids[0] } else { $null }
+    $available = $null
+    if ($id) {
+        $versions = @($matches | Where-Object { $_.Id -eq $id -and $_.Version -eq $Version -and $_.Available } | Select-Object -ExpandProperty Available -Unique)
+        if ($versions.Count -eq 1) { $available = $versions[0] }
+    }
+    [pscustomobject]@{
+        Id=$id
+        AvailableVersion=$available
+        Method=$(if ($id) { $method } elseif ($ids.Count -gt 1) { 'Ambiguous' } else { 'NotMatched' })
+    }
+}
+
 function Get-ApplicationMaintenanceInventory {
-    $recognized = @{}
+    $wingetRows = @()
     $wingetStatus = 'Unavailable'
     try {
         $result = Invoke-Winget -Arguments @('list', '--source', 'winget', '--disable-interactivity') -IgnoreExitCode
         if ($result.ExitCode -eq 0) {
-            $columns = $null
-            foreach ($line in $result.Output) {
-                $raw = [string]$line
-                if ($raw -match '^Name\s+Id\s+Version(?:\s+Available)?(?:\s+Source)?\s*$') {
-                    $idAt = $raw.IndexOf('Id', 4)
-                    $versionAt = $raw.IndexOf('Version', $idAt + 2)
-                    $sourceAt = $raw.IndexOf('Source', $versionAt + 7)
-                    $columns = @($idAt, $versionAt, $sourceAt)
-                    continue
-                }
-                if (-not $columns -or $raw.Length -le $columns[1] -or $raw.Trim() -match '^-{3,}') { continue }
-                $id = $raw.Substring($columns[0], $columns[1] - $columns[0]).Trim()
-                $name = $raw.Substring(0, $columns[0]).Trim()
-                $source = if ($columns[2] -ge 0 -and $raw.Length -gt $columns[2]) { $raw.Substring($columns[2]).Trim() } else { '' }
-                if ($name -and $id -and $source -eq 'winget') {
-                    $key = $name.ToLowerInvariant()
-                    if (-not $recognized.ContainsKey($key)) { $recognized[$key] = @() }
-                    $recognized[$key] += $id
-                }
-            }
-            $wingetStatus = 'Completed'
+            $parsedInventory = ConvertFrom-WingetApplicationList -Lines $result.Output
+            $wingetRows = @($parsedInventory.Rows)
+            $wingetStatus = if (-not $parsedInventory.HeaderRecognized) { 'HeaderNotRecognized' } elseif ($wingetRows.Count -eq 0) { 'NoRecognizedRows' } else { 'Completed' }
         }
         else { $wingetStatus = "ExitCode:$($result.ExitCode)" }
     }
@@ -941,14 +1133,16 @@ function Get-ApplicationMaintenanceInventory {
                     $name = [string]$app.DisplayName
                     if ([string]::IsNullOrWhiteSpace($name) -or $app.SystemComponent -eq 1 -or
                         [string]$app.ReleaseType -match '^(Update|Hotfix|Security Update)$') { continue }
-                    $matchIds = if ($recognized.ContainsKey($name.ToLowerInvariant())) { @($recognized[$name.ToLowerInvariant()]) } else { @() }
+                    $wingetMatch = Find-WingetApplicationMatch -Name $name -Version ([string]$app.DisplayVersion) -Rows $wingetRows
                     $entries.Add([PSCustomObject]@{
                         Name = $name
                         Version = [string]$app.DisplayVersion
                         Publisher = [string]$app.Publisher
                         RegistryKey = [string]$key.Name
-                        WingetId = if ($matchIds.Count -eq 1) { $matchIds[0] } else { $null }
-                        MaintenanceStatus = if ($matchIds.Count -eq 1) { 'WinGetNameMatched' } else { 'ReviewUpdateMethod' }
+                        WingetId = $wingetMatch.Id
+                        WingetAvailableVersion = $wingetMatch.AvailableVersion
+                        WingetMatchMethod = $wingetMatch.Method
+                        MaintenanceStatus = if ($wingetMatch.Method -eq 'ExactName') { 'WinGetNameMatched' } elseif ($wingetMatch.Method -eq 'TruncatedNameAndVersion') { 'WinGetTruncatedNameAndVersionMatched' } else { 'ReviewUpdateMethod' }
                     }) | Out-Null
                 }
                 catch { Write-Log "Unable to inspect registry key $($key.Name): $($_.Exception.Message)" 'WARN' }
@@ -965,6 +1159,7 @@ function Get-ApplicationMaintenanceInventory {
         CollectedAt = (Get-Date).ToUniversalTime().ToString('o')
         RegistryStatus = $registryStatus
         WingetListStatus = $wingetStatus
+        WingetRecognizedRowCount = $wingetRows.Count
         Applications = [object[]]@(foreach ($entry in $entries) { $entry })
     }
 }
@@ -1038,9 +1233,11 @@ try {
     Initialize-ApplicationExecutionBudget
     Initialize-NetworkDefaults
     Write-Log "Initializing application update script..." 'INFO'
-    Write-Log "Script version: $ScriptVersion | Last updated: 2026-10-28" 'INFO'
+    Write-Log "Script version: $ScriptVersion | Last updated: 2026-11-03" 'INFO'
     Write-Log "Active staged text log path: $LogPath" 'INFO'
     Write-Log "Completed text log publish path: $PublishedLogPath" 'INFO'
+
+    Initialize-SystemWingetArchiveExtractor
 
     Write-Log "Refreshing WinGet sources..." 'INFO'
     $sourceResult = Invoke-Winget -Arguments @('source', 'update') -IgnoreExitCode
@@ -1295,6 +1492,7 @@ finally {
         }
         FirefoxUpdateState = $script:FirefoxUpdateState
         WingetPreflight           = $script:WingetPreflight
+        WingetArchiveSettings     = $script:WingetArchiveSettings
         WingetInvocations         = [object[]]@(foreach ($invocation in $script:WingetInvocations) { $invocation })
         WingetExecutionBlocked    = $script:WingetExecutionBlocked
         WingetAvailable           = [bool](Get-WingetPath)
@@ -1358,3 +1556,4 @@ finally {
 }
 
 exit $finalExitCode
+

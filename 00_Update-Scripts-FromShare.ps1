@@ -1,9 +1,13 @@
+# TechConsoleForcePatch: 1.0.0
 # Changes v4.12.3: deploy watchdog runtime files and reconcile its protected tasks via -Deploy.
 #requires -version 5.1
 # =====================================================================
 # ScriptName: 00_Update-Scripts-FromShare.ps1
-# ScriptVersion: 4.12.3
-# LastUpdated: 2026-10-12
+# ScriptVersion: 4.12.7
+# LastUpdated: 2026-11-23
+# Changes: v4.12.7 provisions WPA3-Personal and allows non-broadcast CC-IOT connections.
+# Changes: v4.12.6 identifies disconnected WLAN interfaces by interface type or medium.
+# Changes: v4.12.5 attempts CC-IOT when physical Ethernet is down.
 # Changes: v4.12.3 recognizes fixed launcher actions in post-registration verification.
 #          v4.12.1 approves manifest deployment of Script 15 Sunday update closeout.
 #          v4.12.0 verifies and runs the current share task registrar on every
@@ -38,15 +42,21 @@ param(
     [switch]$Relaunched,
     [string]$PreferredSourceRoot,
     [string]$FallbackSourceRoot
+,
+    [switch]$Force
 )
+
+# CC-IOT unattended fallback (WPA2-Personal/AES). Enter the passphrase between
+# the single quotes. Double any embedded single quote. Blank uses a saved profile.
+$CcIotPassword = ''
 
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 
 $ScriptName = '00_Update-Scripts-FromShare.ps1'
-$ScriptVersion = '4.12.3'
+$ScriptVersion = '4.12.7'
 $DefaultPreferredSourceRoot = '\\SERVER\DeploymentShare'
-$DefaultFallbackSourceRoot = '\\10.2.3.30\Labscripts'
+$DefaultFallbackSourceRoot = '\\FALLBACK-SERVER\DeploymentShare'
 $SourceConfigurationPath = Join-Path $env:ProgramData 'ComptonMaintenance\Updater.Source.json'
 $ManifestName = 'DeploymentManifest.json'
 $FrameworkName = 'Maintenance.Framework.psm1'
@@ -100,7 +110,6 @@ $SoftwareInventoryPolicyName = 'SoftwareInventory.Policy.json'
     'Maintenance.Policy.json',
     'SoftwareInventory.Policy.json',
     'Repair-MicrosoftEdgeUpdate.ps1',
-    'Repair-Windows-ComponentStore.ps1',
     'Register-Tasks_SYSTEM.ps1',
     'Watch-RebootRecovery.ps1',
     'RepairScreen.psm1',
@@ -328,6 +337,86 @@ function Get-ActiveSourceRoot {
     }
     $fallbackDisplay = if ([string]::IsNullOrWhiteSpace($FallbackSourceRoot)) { '<not configured>' } else { $FallbackSourceRoot }
     throw "No configured source share is available. Preferred: $PreferredSourceRoot | Fallback: $fallbackDisplay"
+}
+
+function Connect-UpdaterWirelessFallback {
+    try {
+        $adapters = @(Get-NetAdapter -ErrorAction Stop)
+        $wifiAdapters = @($adapters | Where-Object {
+            $_.Status -in @('Up','Disconnected') -and (
+                $_.InterfaceType -eq 71 -or $_.ifType -eq 71 -or
+                $_.NdisPhysicalMedium -in @(1,9,'Native 802.11','Wireless LAN','WirelessLan','Native802_11') -or
+                $_.PhysicalMediaType -match '802[._]11|Wireless LAN' -or
+                ($_.HardwareInterface -and "$($_.Name) $($_.InterfaceDescription)" -match 'Wi[- ]?Fi|WLAN|Wireless LAN|802[.]11')
+            )
+        } | Where-Object { -not $_.Virtual })
+        $wired = $adapters | Where-Object {
+            $_.HardwareInterface -and -not $_.Virtual -and $_.Status -eq 'Up' -and
+            $_.ifIndex -notin $wifiAdapters.ifIndex -and
+            ($_.InterfaceType -eq 6 -or $_.ifType -eq 6 -or $_.PhysicalMediaType -eq '802.3')
+        } | Select-Object -First 1
+        if ($wired) {
+            Write-UpdaterStatus "Ethernet link is up on $($wired.Name). Continuing with normal source selection."
+            return
+        }
+        $wifi = $wifiAdapters | Sort-Object @{Expression={ $_.Status -eq 'Up' }; Descending=$true}, ifIndex | Select-Object -First 1
+        if (-not $wifi) {
+            $details = ($adapters | ForEach-Object { "$($_.Name) [$($_.Status); type=$($_.InterfaceType); medium=$($_.PhysicalMediaType)]" }) -join ', '
+            Write-UpdaterStatus "No enabled Wi-Fi adapter identified for fallback. Adapters: $details" 'WARN'
+            return
+        }
+        if ($wifi.Status -eq 'Up') {
+            try {
+                $null = Get-ActiveSourceRoot
+                Write-UpdaterStatus 'Ethernet is down and a source share is already accessible.'
+                return
+            } catch { }
+        }
+        Start-Service -Name WlanSvc -ErrorAction Stop
+        $interface = "interface=$($wifi.Name)"
+        if ($CcIotPassword.Length -gt 0) {
+            if ($CcIotPassword.Length -lt 8 -or $CcIotPassword.Length -gt 63) {
+                Write-UpdaterStatus 'CC-IOT requires a WPA3 passphrase of 8 to 63 characters.' 'WARN'
+                return
+            }
+            $escapedKey = [Security.SecurityElement]::Escape($CcIotPassword)
+            $xml = @"
+<WLANProfile xmlns="http://www.microsoft.com/networking/WLAN/profile/v1">
+  <name>CC-IOT</name>
+  <SSIDConfig><SSID><name>CC-IOT</name></SSID><nonBroadcast>true</nonBroadcast></SSIDConfig>
+  <connectionType>ESS</connectionType>
+  <connectionMode>manual</connectionMode>
+  <MSM><security><authEncryption><authentication>WPA3SAE</authentication><encryption>AES</encryption><useOneX>false</useOneX></authEncryption>
+  <sharedKey><keyType>passPhrase</keyType><protected>false</protected><keyMaterial>$escapedKey</keyMaterial></sharedKey></security></MSM>
+</WLANProfile>
+"@
+            $profileFile = [IO.Path]::GetTempFileName()
+            try {
+                [IO.File]::WriteAllText($profileFile, $xml)
+                & netsh.exe wlan add profile "filename=$profileFile" $interface user=all | Out-Null
+                if ($LASTEXITCODE -ne 0) {
+                    Write-UpdaterStatus 'Windows could not install the CC-IOT profile.' 'WARN'
+                    return
+                }
+            } finally { Remove-Item -LiteralPath $profileFile -Force }
+        }
+        Write-UpdaterStatus "Ethernet is down. Requesting CC-IOT on $($wifi.Name)." 'ACTION'
+        & netsh.exe wlan connect name=CC-IOT ssid=CC-IOT $interface | Out-Null
+        if ($LASTEXITCODE -ne 0) {
+            Write-UpdaterStatus 'CC-IOT connection request failed. Check the adapter and all-user profile.' 'WARN'
+            return
+        }
+        $deadline = [datetime]::UtcNow.AddSeconds(60)
+        do {
+            Start-Sleep -Seconds 3
+            try { $null = Get-ActiveSourceRoot } catch { continue }
+            Write-UpdaterStatus 'Source share accessible after CC-IOT connection request.' 'OK'
+            return
+        } while ([datetime]::UtcNow -lt $deadline)
+        Write-UpdaterStatus 'Source share still unavailable after the CC-IOT connection request.' 'WARN'
+    } catch {
+        Write-UpdaterStatus 'Wireless fallback check failed. Continuing with normal source selection.' 'WARN'
+    }
 }
 
 function Read-DeploymentManifest {
@@ -691,29 +780,25 @@ function Invoke-TaskReconciliation {
     $process = Start-Process -FilePath $PowerShellExe -ArgumentList $arguments -Wait -PassThru -WindowStyle Hidden
     if ($process.ExitCode -ne 0) { throw "Task reconciliation returned exit code $($process.ExitCode). Review the registrar log in C:\Temp." }
 
-    $requiredScripts = @(
-        [pscustomobject]@{ Script=$ScriptName; ActionId='UpdateScripts' },
-        [pscustomobject]@{ Script=$CombinedSundayScriptName; ActionId='SundayLabApplicationMaintenance' },
-        [pscustomobject]@{ Script='14_Endpoint_Health_Inventory.ps1'; ActionId='EndpointHealthInventory' },
-        [pscustomobject]@{ Script='15_Sunday_Update_Closeout.ps1'; ActionId='SundayUpdateCloseoutPass' },
-        [pscustomobject]@{ Script='15_Sunday_Update_Closeout.ps1'; ActionId='SundayUpdateCloseoutVerify' }
-    )
+    $requiredScripts = @($ScriptName, $CombinedSundayScriptName, '14_Endpoint_Health_Inventory.ps1')
     $tasks = @(Get-ScheduledTask -TaskPath '\' -ErrorAction Stop)
-    foreach ($definition in $requiredScripts) {
-        $requiredScript = $definition.Script
-        $launcherPath = Join-Path $LocalRoot 'Invoke-MaintenanceScript.ps1'
+    foreach ($requiredScript in $requiredScripts) {
         $expectedPath = Join-Path $LocalRoot $requiredScript
+        $launcherPath = Join-Path $LocalRoot 'Invoke-MaintenanceScript.ps1'
+        $expectedActionId = switch ($requiredScript) {
+            '00_Update-Scripts-FromShare.ps1' { 'UpdateScripts' }
+            '04_Sunday_Lab_Application_Maintenance.ps1' { 'SundayLabApplicationMaintenance' }
+            '14_Endpoint_Health_Inventory.ps1' { 'EndpointHealthInventory' }
+            default { throw "No task verification action is defined for $requiredScript." }
+        }
+        $directPattern = '(?i)-File\s+"' + [regex]::Escape($expectedPath) + '"(?:\s|$)'
+        $launcherPattern = '(?i)-File\s+"' + [regex]::Escape($launcherPath) + '"\s+-ActionId\s+"' + [regex]::Escape($expectedActionId) + '"\s*$'
         $matches = @($tasks | Where-Object {
             $task = $_
             $correctActions = @($task.Actions | Where-Object {
                 ([string]$_.Execute -ieq $PowerShellExe) -and
-                (
-                    ([string]$_.Arguments -match ('(?i)-File\s+"' + [regex]::Escape($expectedPath) + '"(?:\s|$)')) -or
-                    (
-                        ([string]$_.Arguments -match ('(?i)-File\s+"' + [regex]::Escape($launcherPath) + '"(?:\s|$)')) -and
-                        ([string]$_.Arguments -match ('(?i)-ActionId\s+"?' + [regex]::Escape($definition.ActionId) + '"?(?:\s|$)'))
-                    )
-                )
+                (([string]$_.Arguments -match $directPattern) -or
+                 ([string]$_.Arguments -match $launcherPattern))
             })
             $task.Settings.Enabled -and $correctActions.Count -gt 0
         })
@@ -779,6 +864,7 @@ try {
     Write-UpdaterStatus "Starting manifest-driven update. RunId: $RunId" 'INFO'
 
     Resolve-UpdaterSourceConfiguration
+    Connect-UpdaterWirelessFallback
     $sourceRoot = Get-ActiveSourceRoot
     Save-UpdaterSourceConfiguration -LastWorkingSourceRoot $sourceRoot
     Write-UpdaterStatus "Using source share: $sourceRoot" 'OK'

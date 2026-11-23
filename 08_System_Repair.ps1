@@ -1,8 +1,12 @@
+# TechConsoleForcePatch: 1.0.0
 # =====================================================================
 # ScriptName: 08_System_Repair.ps1
-# ScriptVersion: 4.14.0
-# LastUpdated: 2026-10-28
-# Changes: v4.14.0 adds >75% utilization findings and single-pass pre-cleanup disk diagnostics.
+# ScriptVersion: 4.14.2
+# LastUpdated: 2026-11-09
+# Changes: v4.14.2 adds guarded PNRP key-access permission detection/repair,
+#          ACL backup/rollback, Deep Freeze gating and structured telemetry.
+#          Repair requires -AutoRepairOnDetection; disabled services are untouched.
+# Previous: v4.14.0 adds >75% utilization findings and single-pass pre-cleanup disk diagnostics.
 # Previous: v4.13.0 adds read-only shell handler/server validation, thumbnail
 #          and preview inventories, and Explorer fault-module correlation.
 #          Machine registry scope and unavailable/truncated checks are explicit.
@@ -118,12 +122,14 @@ param(
     [int]$SoftwareDistributionFolderJobTimeoutMinutes = 15,
     [string]$SoftwareDistributionCleanupStatePath = 'C:\ProgramData\SystemRepair\SoftwareDistributionCleanupState.json',
     [string]$LogDirectory = 'C:\Logs'
+,
+    [switch]$Force
 )
 
 $ErrorActionPreference = 'Stop'
 
 $script:ScriptName = '08_System_Repair.ps1'
-$script:ScriptVersion = '4.14.0'
+$script:ScriptVersion = '4.14.2'
 $script:RunId = [guid]::NewGuid().Guid
 $script:TelemetryNdjsonPath = Join-Path $LogDirectory 'Maintenance-Telemetry.ndjson'
 $script:LatestTelemetryPath = Join-Path $LogDirectory '08_System_Repair.latest.json'
@@ -3018,6 +3024,169 @@ function Get-SystemRepairDeepFreezeState {
     $reason = if ($installed) { 'Deep Freeze detected, but DFC.exe was not available in a supported local path.' } elseif (-not $reliable) { $reasons -join ' ' } else { 'No Deep Freeze service, driver, installation file or DFC was detected.' }
     return [pscustomobject]@{Installed=$installed;State=$state;DfcPath=$null;ExitCode=$null;Reason=$reason}
 }
+
+function Invoke-PnrpKeyAccessRepair {
+    # Bounded repair for the failure confirmed on IB2-224-AV. No key deletion,
+    # startup-type change, reboot, service dependency restart or ACL reset.
+    $data = [ordered]@{
+        Outcome='NotChecked'; ServiceName='PNRPsvc'; ExitCodeBefore=$null
+        ExitCodeAfter=$null; EventRecordId=$null; EventTime=$null
+        DeepFreezeState='NotChecked'; MissingCreateFiles=$false
+        MissingCreatorOwner=$false; BackupPath=$null; Rollback='NotNeeded'
+    }
+    $folder = Join-Path $env:ProgramData 'Microsoft\Crypto\RSA\MachineKeys'
+    $originalSddl = $null
+    $mutationAttempted = $false
+    try {
+        $service = Get-CimInstance Win32_Service -Filter "Name='PNRPsvc'" -ErrorAction Stop
+        if ($null -eq $service) { $data.Outcome='NotInstalled'; return }
+        $data.ExitCodeBefore = [string]$service.ExitCode
+        if ($service.StartMode -eq 'Disabled') { $data.Outcome='SkippedDisabled'; return }
+        if ($service.State -eq 'Running') { $data.Outcome='Healthy'; return }
+        if ($service.State -ne 'Stopped' -or [string]$service.ExitCode -ne '2153972227') {
+            $data.Outcome='SkippedDifferentFailure'; return
+        }
+        if ($service.StartName -notin @('NT AUTHORITY\LocalService','NT AUTHORITY\LOCAL SERVICE')) {
+            $data.Outcome='SkippedDifferentAccount'; return
+        }
+
+        # Event XML avoids reliance on a localized rendered error message.
+        $eventErrors = @()
+        $events = @(Get-WinEvent -FilterHashtable @{
+            LogName='System'; ProviderName='Service Control Manager'; Id=7023
+            StartTime=(Get-Date).AddDays(-$DiagnosticDaysBack)
+        } -ErrorAction SilentlyContinue -ErrorVariable eventErrors)
+        foreach ($eventError in $eventErrors) {
+            if ($eventError.FullyQualifiedErrorId -notlike 'NoMatchingEventsFound*') {
+                throw "Cannot validate recent PNRP events: $eventError"
+            }
+        }
+        $matchingEvent = $events | Where-Object {
+            [xml]$xml = $_.ToXml()
+            $values = @($xml.Event.EventData.Data | ForEach-Object { $_.InnerText })
+            $values -contains [string]$service.DisplayName -or
+                $values -contains 'PNRPsvc' -or
+                [string]$xml.Event.EventData.Binary -eq '50004E00520050007300760063000000'
+        } | Select-Object -First 1
+        if ($null -eq $matchingEvent) { $data.Outcome='SkippedNoRecentEvent'; return }
+        $data.EventRecordId = [string]$matchingEvent.RecordId
+        $data.EventTime = $matchingEvent.TimeCreated.ToUniversalTime().ToString('o')
+
+        $acl = Get-Acl -LiteralPath $folder -ErrorAction Stop
+        $rules = @($acl.GetAccessRules($true,$true,[System.Security.Principal.SecurityIdentifier]))
+        # Do not override intentional deny rules or attempt to reconstruct custom ACLs.
+        if (@($rules | Where-Object { $_.AccessControlType -eq 'Deny' }).Count -gt 0) {
+            $data.Outcome='SkippedDenyRule'; return
+        }
+        $create = [System.Security.AccessControl.FileSystemRights]::CreateFiles
+        $full = [System.Security.AccessControl.FileSystemRights]::FullControl
+        $oi = [System.Security.AccessControl.InheritanceFlags]::ObjectInherit
+        $io = [System.Security.AccessControl.PropagationFlags]::InheritOnly
+        $np = [System.Security.AccessControl.PropagationFlags]::NoPropagateInherit
+        $createRights = 0
+        $creatorRights = 0
+        foreach ($rule in $rules) {
+            $sid = $rule.IdentityReference.Value
+            if ($rule.AccessControlType -ne 'Allow') { continue }
+            if ($sid -in @('S-1-5-19','S-1-1-0','S-1-5-11') -and
+                ($rule.PropagationFlags -band $io) -eq 0) {
+                $createRights = $createRights -bor [int]$rule.FileSystemRights
+            }
+            if ($sid -eq 'S-1-3-0' -and ($rule.InheritanceFlags -band $oi) -ne 0 -and
+                ($rule.PropagationFlags -band $np) -eq 0) {
+                $creatorRights = $creatorRights -bor [int]$rule.FileSystemRights
+            }
+        }
+        $data.MissingCreateFiles = (($createRights -band [int]$create) -ne [int]$create)
+        $data.MissingCreatorOwner = (($creatorRights -band [int]$full) -ne [int]$full)
+        if (-not $data.MissingCreateFiles -and -not $data.MissingCreatorOwner) {
+            $data.Outcome='SkippedPermissionsAlreadyPresent'; return
+        }
+        if (-not $AutoRepairOnDetection) { $data.Outcome='DetectedRepairDisabled'; return }
+        $freeze = Get-SystemRepairDeepFreezeState
+        $data.DeepFreezeState = [string]$freeze.State
+        if ($freeze.State -notin @('NotInstalled','Thawed')) {
+            $data.Outcome='DeferredDeepFreeze'; return
+        }
+
+        # Check again immediately before writing in case another action started/disabled it.
+        $service = Get-CimInstance Win32_Service -Filter "Name='PNRPsvc'" -ErrorAction Stop
+        if ($service.State -ne 'Stopped' -or $service.StartMode -eq 'Disabled' -or
+            [string]$service.ExitCode -ne '2153972227') {
+            $data.Outcome='SkippedServiceChanged'; return
+        }
+        $originalSddl = $acl.GetSecurityDescriptorSddlForm(
+            [System.Security.AccessControl.AccessControlSections]::Access)
+        # Keep ACL backups outside routine C:\Logs retention cleanup.
+        $backupDirectory = Join-Path $env:ProgramData 'Compton\SystemRepair\PermissionBackups'
+        New-Item -ItemType Directory -Path $backupDirectory -Force -ErrorAction Stop | Out-Null
+        $data.BackupPath = Join-Path $backupDirectory ("MachineKeys-PNRP-{0}.json" -f $script:RunId)
+        [ordered]@{
+            ComputerName=$env:COMPUTERNAME; TimestampUtc=[datetime]::UtcNow.ToString('o')
+            Path=$folder; DaclSddl=$originalSddl; RunId=$script:RunId
+        } | ConvertTo-Json | Set-Content -LiteralPath $data.BackupPath -Encoding UTF8 -ErrorAction Stop
+        if ($data.MissingCreateFiles) {
+            $rule = [System.Security.AccessControl.FileSystemAccessRule]::new(
+                [System.Security.Principal.SecurityIdentifier]::new('S-1-5-19'),$create,
+                [System.Security.AccessControl.InheritanceFlags]::None,
+                [System.Security.AccessControl.PropagationFlags]::None,
+                [System.Security.AccessControl.AccessControlType]::Allow)
+            $acl.AddAccessRule($rule)
+        }
+        if ($data.MissingCreatorOwner) {
+            # Files only. Existing files with unprotected DACLs may also inherit
+            # owner access; protected file DACLs are never reset by this repair.
+            $rule = [System.Security.AccessControl.FileSystemAccessRule]::new(
+                [System.Security.Principal.SecurityIdentifier]::new('S-1-3-0'),$full,$oi,$io,
+                [System.Security.AccessControl.AccessControlType]::Allow)
+            $acl.AddAccessRule($rule)
+        }
+        Add-RepairAttempt 'PNRP MachineKeys key-access permissions repair'
+        $mutationAttempted = $true
+        Set-Acl -LiteralPath $folder -AclObject $acl -ErrorAction Stop
+        # One bounded start request; WaitForStatus verifies the resulting state.
+        $controller = Get-Service -Name PNRPsvc -ErrorAction Stop
+        try {
+            $controller.Start()
+            $controller.WaitForStatus([System.ServiceProcess.ServiceControllerStatus]::Running,
+                [timespan]::FromSeconds(30))
+        }
+        finally { $controller.Dispose() }
+        $after = Get-CimInstance Win32_Service -Filter "Name='PNRPsvc'" -ErrorAction Stop
+        $data.ExitCodeAfter = [string]$after.ExitCode
+        if ($after.State -ne 'Running' -or [string]$after.ExitCode -ne '0') {
+            throw "PNRP verification failed: State=$($after.State); ExitCode=$($after.ExitCode)"
+        }
+        $data.Outcome='Repaired'
+    }
+    catch {
+        $data.Outcome='Failed'
+        $data['Error'] = $_.Exception.Message
+        if ($mutationAttempted -and $originalSddl) {
+            try {
+                $restore = Get-Acl -LiteralPath $folder -ErrorAction Stop
+                $restore.SetSecurityDescriptorSddlForm($originalSddl,
+                    [System.Security.AccessControl.AccessControlSections]::Access)
+                Set-Acl -LiteralPath $folder -AclObject $restore -ErrorAction Stop
+                $data.Rollback='FolderDaclRestored'
+                # Rollback does not delete generated keys or reset protected child ACLs.
+            }
+            catch { $data.Rollback='Failed'; $data['RollbackError']=$_.Exception.Message }
+        }
+        Fail-Step -Name 'PnrpKeyAccessRepair' -Reason $data.Error
+    }
+    finally {
+        $unresolved = $data.Outcome -notin @('Healthy','NotInstalled','SkippedDisabled','Repaired','SkippedDifferentFailure')
+        $level = if ($data.Outcome -eq 'Failed') { 'ERROR' } elseif ($unresolved) { 'WARN' } else { 'INFO' }
+        if ($unresolved -and $data.Outcome -ne 'Failed') {
+            Warn-Step -Name 'PnrpKeyAccessRepair' -Reason $data.Outcome
+        }
+        Write-Log ("PNRP_KEY_ACCESS|" + ($data | ConvertTo-Json -Compress)) $level
+        Add-DetailedResult -Step 'PnrpKeyAccessRepair:Outcome' -Status $data.Outcome `
+            -Message "PNRP key-access check: $($data.Outcome)" -Data $data
+    }
+}
+
 
 function Test-SystemRepairDiskOperationAllowed {
     [CmdletBinding()]
@@ -6464,6 +6633,7 @@ function New-SystemRepairTelemetryEvent {
                 WindowsUpdateResetStepResults = @(Get-StepSummaryTelemetry -StepPattern 'WindowsUpdate*')
                 ExplorerStepResults = @(Get-StepSummaryTelemetry -StepPattern 'Explorer*')
                 RpcStepResults = @(Get-StepSummaryTelemetry -StepPattern 'Rpc*')
+                PnrpStepResults = @(Get-StepSummaryTelemetry -StepPattern 'Pnrp*')
                 DefenderStepResults = @(Get-StepSummaryTelemetry -StepPattern 'Defender*')
                 Notes = $notes
             }
@@ -6634,6 +6804,7 @@ try {
     Invoke-Safely -Name 'ScheduledTaskHealthCheck' -ScriptBlock { Invoke-ScheduledTaskHealthCheck } -WarnOnly | Out-Null
     Invoke-Safely -Name 'RpcDiagnostics' -ScriptBlock { Invoke-RpcDiagnostics } -WarnOnly | Out-Null
     Invoke-Safely -Name 'EventLogSummary' -ScriptBlock { Invoke-EventLogSummary } -WarnOnly | Out-Null
+    Invoke-Safely -Name 'PnrpKeyAccessCheck' -ScriptBlock { Invoke-PnrpKeyAccessRepair } -WarnOnly | Out-Null
     Invoke-Safely -Name 'ExplorerHealthDiagnostics' -ScriptBlock { Invoke-ExplorerHealthDiagnostics } -WarnOnly | Out-Null
     Invoke-Safely -Name 'DefenderStatusCheck' -ScriptBlock { Invoke-DefenderStatusCheck } -WarnOnly | Out-Null
 
